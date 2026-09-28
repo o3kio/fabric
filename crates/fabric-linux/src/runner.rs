@@ -143,6 +143,9 @@ pub struct RecordingRunner {
     calls: Vec<CommandCall>,
     netns: std::collections::BTreeSet<String>,
     links: BTreeMap<String, FakeLink>,
+    /// Forwarding-table entries: (device, mac, dst) triples. Flood entries
+    /// share the all-zeros MAC with one row per remote.
+    fdb: std::collections::BTreeSet<(String, String, String)>,
     failures: Vec<String>,
 }
 
@@ -153,6 +156,7 @@ impl RecordingRunner {
             calls: Vec::new(),
             netns: std::collections::BTreeSet::new(),
             links: BTreeMap::new(),
+            fdb: std::collections::BTreeSet::new(),
             failures: Vec::new(),
         }
     }
@@ -190,6 +194,86 @@ impl RecordingRunner {
     /// True when the fake kernel currently holds a namespace named `ns`.
     pub fn has_netns(&self, ns: &str) -> bool {
         self.netns.contains(ns)
+    }
+
+    /// True when the fake kernel holds the forwarding-table entry
+    /// `(dev, mac, dst)`.
+    pub fn has_fdb_entry(&self, dev: &str, mac: &str, dst: &str) -> bool {
+        self.fdb
+            .contains(&(dev.to_string(), mac.to_string(), dst.to_string()))
+    }
+
+    /// Interpret `bridge` arguments starting at `rest` (after any
+    /// `netns exec NS` prefix already stripped).
+    ///
+    /// Models the kernel's forwarding-table rules closely enough to catch
+    /// verb-level mistakes a real kernel rejects: `replace` is refused for
+    /// non-unicast entries (the kernel error that motivated the provider's
+    /// use of `append` for HER flood lists), `append` is idempotent per
+    /// (dev, mac, dst), and `del` of a missing entry fails.
+    fn bridge(&mut self, rest: &[&str]) -> CommandOutput {
+        if rest.first() != Some(&"fdb") {
+            return CommandOutput::ok();
+        }
+        let op = rest.get(1).copied().unwrap_or("");
+        if op == "show" {
+            let stdout = self
+                .fdb
+                .iter()
+                .map(|(dev, mac, dst)| format!("{mac} dev {dev} dst {dst} self permanent"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return CommandOutput {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            };
+        }
+        // fdb <op> <mac> dev <dev> [dst <ip>]
+        let mac = rest.get(2).copied().unwrap_or("");
+        let dev = arg_after(rest, "dev").unwrap_or("");
+        let dst = arg_after(rest, "dst").unwrap_or("");
+        if dev.is_empty() {
+            return command_error("bridge: insufficient arguments");
+        }
+        let Some(link) = self.links.get(dev) else {
+            return command_error("Cannot find device");
+        };
+        if link.kind != "vxlan" {
+            return command_error("Operation not supported: fdb with dst requires a vxlan device");
+        }
+        if !is_unicast_mac(mac) && op == "replace" {
+            return command_error("Cannot replace non-unicast fdb entries.");
+        }
+        let entry = (dev.to_string(), mac.to_string(), dst.to_string());
+        match op {
+            "append" => {
+                self.fdb.insert(entry);
+                CommandOutput::ok()
+            }
+            "add" => {
+                if self.fdb.contains(&entry) {
+                    command_error("RTNETLINK answers: File exists")
+                } else {
+                    self.fdb.insert(entry);
+                    CommandOutput::ok()
+                }
+            }
+            "del" => {
+                if self.fdb.remove(&entry) {
+                    CommandOutput::ok()
+                } else {
+                    command_error("RTNETLINK answers: No such file or directory")
+                }
+            }
+            "replace" => {
+                let mac_owned = mac.to_string();
+                self.fdb.retain(|(d, m, _)| !(d == dev && *m == mac_owned));
+                self.fdb.insert(entry);
+                CommandOutput::ok()
+            }
+            _ => command_error("bridge: unknown fdb operation"),
+        }
     }
 
     fn record(&mut self, program: &str, args: &[&str], stdin: Option<&str>) {
@@ -252,10 +336,12 @@ impl RecordingRunner {
             self.links.insert(name.to_string(), link);
             return CommandOutput::ok();
         }
-        // link del NAME
+        // link del NAME (deleting a device drops its forwarding entries,
+        // as the kernel does)
         if rest.first() == Some(&"link") && matches!(rest.get(1), Some(&"del") | Some(&"delete")) {
             if let Some(name) = rest.get(2) {
                 self.links.remove(*name);
+                self.fdb.retain(|(dev, _, _)| dev != name);
             }
             return CommandOutput::ok();
         }
@@ -332,6 +418,28 @@ fn parse_u32(raw: &str) -> Option<u32> {
     raw.parse::<u32>().ok()
 }
 
+/// The argument that follows `flag` in `args`, if present.
+fn arg_after<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| *a == flag)
+        .and_then(|i| args.get(i + 1).copied())
+}
+
+/// True for a unicast MAC: not all-zeros, not broadcast, and without the
+/// multicast bit set in the first octet.
+fn is_unicast_mac(mac: &str) -> bool {
+    let Some(first) = mac.split(':').next() else {
+        return false;
+    };
+    let Ok(first) = u8::from_str_radix(first, 16) else {
+        return false;
+    };
+    if first & 0x01 != 0 {
+        return false;
+    }
+    !mac.split(':').all(|octet| octet == "00")
+}
+
 /// A failed command with a stderr message, like the real `ip`.
 fn command_error(message: &str) -> CommandOutput {
     CommandOutput {
@@ -374,6 +482,16 @@ fn is_observation(args: &[String]) -> bool {
     {
         return true;
     }
+    // `bridge fdb show ...` (namespaced: `ip netns exec NS bridge fdb show`;
+    // bare: program `bridge`, args starting `fdb show`)
+    if (ip_args.first().map(String::as_str) == Some("bridge")
+        && ip_args.get(1).map(String::as_str) == Some("fdb")
+        && ip_args.get(2).map(String::as_str) == Some("show"))
+        || (ip_args.first().map(String::as_str) == Some("fdb")
+            && ip_args.get(1).map(String::as_str) == Some("show"))
+    {
+        return true;
+    }
     false
 }
 
@@ -399,6 +517,7 @@ impl FabricCommand for RecordingRunner {
                 if args.first() == Some(&"netns") && args.get(1) == Some(&"exec") {
                     match args.get(3) {
                         Some(&"ip") => return Ok(self.ip(&args[4..])),
+                        Some(&"bridge") => return Ok(self.bridge(&args[4..])),
                         _ => return Ok(CommandOutput::ok()),
                     }
                 }
@@ -439,6 +558,7 @@ impl FabricCommand for RecordingRunner {
                 }
                 Ok(CommandOutput::ok())
             }
+            "bridge" => Ok(self.bridge(args)),
             _ => Ok(CommandOutput::ok()),
         }
     }
@@ -459,5 +579,113 @@ impl FabricCommand for RecordingRunner {
             });
         }
         Ok(CommandOutput::ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Convert a command result into an output, turning transport errors
+    /// into failed outputs (unwrap/expect/panic are denied by the lints).
+    fn ok_or_err_out(res: Result<CommandOutput, FabricError>) -> CommandOutput {
+        match res {
+            Ok(out) => out,
+            Err(e) => CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: format!("command error: {e}"),
+            },
+        }
+    }
+
+    fn vxlan(runner: &mut RecordingRunner) {
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "link", "add", "vx0", "type", "vxlan", "id", "4711", "dstport", "4789",
+            ],
+        ));
+        assert!(out.success, "vxlan creation failed: {}", out.stderr);
+    }
+
+    fn fdb(runner: &mut RecordingRunner, op: &str, dst: &str) -> CommandOutput {
+        ok_or_err_out(runner.run(
+            "bridge",
+            &["fdb", op, "00:00:00:00:00:00", "dev", "vx0", "dst", dst],
+        ))
+    }
+
+    #[test]
+    fn fdb_replace_on_non_unicast_is_rejected_like_the_kernel() {
+        let mut runner = RecordingRunner::new();
+        vxlan(&mut runner);
+        let out = fdb(&mut runner, "replace", "198.18.0.2");
+        assert!(!out.success, "kernel rejects replace on non-unicast MACs");
+        assert!(
+            out.stderr
+                .contains("Cannot replace non-unicast fdb entries")
+        );
+        assert!(!runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+    }
+
+    #[test]
+    fn fdb_append_is_idempotent_and_del_removes() {
+        let mut runner = RecordingRunner::new();
+        vxlan(&mut runner);
+        assert!(fdb(&mut runner, "append", "198.18.0.2").success);
+        assert!(fdb(&mut runner, "append", "198.18.0.2").success);
+        assert!(runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+        assert!(fdb(&mut runner, "append", "198.18.0.3").success);
+        assert!(runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.3"));
+        assert!(fdb(&mut runner, "del", "198.18.0.2").success);
+        assert!(!runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+        let out = fdb(&mut runner, "del", "198.18.0.2");
+        assert!(!out.success, "deleting a missing entry must fail");
+    }
+
+    #[test]
+    fn fdb_add_existing_fails_but_append_does_not() {
+        let mut runner = RecordingRunner::new();
+        vxlan(&mut runner);
+        assert!(fdb(&mut runner, "add", "198.18.0.2").success);
+        let out = fdb(&mut runner, "add", "198.18.0.2");
+        assert!(!out.success);
+        assert!(out.stderr.contains("File exists"));
+        assert!(fdb(&mut runner, "append", "198.18.0.2").success);
+    }
+
+    #[test]
+    fn fdb_requires_an_existing_vxlan_device() {
+        let mut runner = RecordingRunner::new();
+        let out = fdb(&mut runner, "append", "198.18.0.2");
+        assert!(!out.success);
+        assert!(out.stderr.contains("Cannot find device"));
+        // A non-vxlan device refuses remote entries.
+        let out = ok_or_err_out(runner.run("ip", &["link", "add", "eth9", "type", "dummy"]));
+        assert!(out.success, "dummy link creation failed: {}", out.stderr);
+        let out = ok_or_err_out(runner.run(
+            "bridge",
+            &[
+                "fdb",
+                "append",
+                "00:00:00:00:00:00",
+                "dev",
+                "eth9",
+                "dst",
+                "198.18.0.2",
+            ],
+        ));
+        assert!(!out.success);
+    }
+
+    #[test]
+    fn link_deletion_drops_its_fdb_entries() {
+        let mut runner = RecordingRunner::new();
+        vxlan(&mut runner);
+        assert!(fdb(&mut runner, "append", "198.18.0.2").success);
+        let out = ok_or_err_out(runner.run("ip", &["link", "del", "vx0"]));
+        assert!(out.success, "link deletion failed: {}", out.stderr);
+        assert!(!runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
     }
 }

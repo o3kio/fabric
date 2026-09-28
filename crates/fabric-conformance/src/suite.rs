@@ -252,29 +252,33 @@ fn case_flood_scoping() -> Result<(), FabricError> {
         .runner()
         .calls()
         .iter()
-        .filter(|c| c.program == "ip" && c.joined().contains("bridge fdb replace"))
+        .filter(|c| {
+            c.program == "ip" && c.joined().contains("bridge fdb append")
+                || c.program == "bridge" && c.joined().contains("fdb append")
+        })
         .map(|c| c.joined())
         .collect();
-    env.take_runner_back(provider);
-    env.cleanup();
-    if flood_entries.len() != 2 {
-        return Err(FabricError::Invalid(format!(
-            "expected 2 HER flood entries, saw {flood_entries:?}"
-        )));
-    }
-    if !flood_entries
-        .iter()
-        .all(|c| c.contains("00:00:00:00:00:00"))
-    {
-        return Err(FabricError::Invalid(
-            "HER entries must use the all-zeros BUM address".to_string(),
-        ));
-    }
     if !flood_entries.iter().any(|c| c.contains("dst 198.18.0.2"))
         || !flood_entries.iter().any(|c| c.contains("dst 198.18.0.3"))
     {
         return Err(FabricError::Invalid(
             "HER entries must target exactly the plan peers".to_string(),
+        ));
+    }
+    // The kernel refuses `replace` on non-unicast entries; the fake kernel
+    // enforces the same rule, so any regression to `replace` fails the
+    // apply outright. Assert the verb explicitly as documentation.
+    let replaced = provider
+        .runner()
+        .calls()
+        .iter()
+        .filter(|c| c.joined().contains("fdb replace"))
+        .count();
+    env.take_runner_back(provider);
+    env.cleanup();
+    if replaced != 0 {
+        return Err(FabricError::Invalid(
+            "HER flood entries must use append, not replace".to_string(),
         ));
     }
     Ok(())

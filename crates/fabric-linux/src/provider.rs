@@ -572,6 +572,9 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         }
 
         // Bounded head-end replication flood list (diffed for idempotency).
+        // Flood entries share the all-zeros (non-unicast) MAC, so adds MUST
+        // use `append` — the kernel rejects `replace` on non-unicast entries,
+        // and replace semantics would in any case clobber the other remotes.
         let desired: BTreeSet<Ipv4Addr> = plan.flood_list();
         let current: BTreeSet<Ipv4Addr> = self
             .ownership
@@ -580,7 +583,7 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             .map(|entry| entry.flood_peers.iter().copied().collect())
             .unwrap_or_default();
         for ip in desired.difference(&current) {
-            self.ns_fdb(&ns, "replace", &vxlan, ip)?;
+            self.ns_fdb(&ns, "append", &vxlan, ip)?;
         }
         for ip in current.difference(&desired) {
             self.ns_fdb(&ns, "del", &vxlan, ip)?;

@@ -44,7 +44,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN="$REPO_ROOT/target/release/fabric-evidence"
+BIN="$REPO_ROOT/target/x86_64-unknown-linux-musl/release/fabric-evidence"
 EVIDENCE_DIR="$REPO_ROOT/evidence"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -127,19 +127,19 @@ PY
 }
 
 fev() { # fev HOST ARGS... — fabric-evidence inside container HOST
-  "$DOCKER" exec "fev-$1" fabric-evidence "${@:2}"
+  "${DOCKER[@]}" exec "fev-$1" fabric-evidence "${@:2}"
 }
 hexec() { # hexec HOST ARGS... — arbitrary command inside container HOST
-  "$DOCKER" exec "fev-$1" "${@:2}"
+  "${DOCKER[@]}" exec "fev-$1" "${@:2}"
 }
 
 cleanup() {
   local rc=$?
   if [[ "$KEEP" != "1" ]]; then
     for h in "${HOSTS[@]}"; do
-      "$DOCKER" rm -f "fev-$h" >/dev/null 2>&1 || true
+      "${DOCKER[@]}" rm -f "fev-$h" >/dev/null 2>&1 || true
     done
-    "$DOCKER" network rm "$NET_NAME" >/dev/null 2>&1 || true
+    "${DOCKER[@]}" network rm "$NET_NAME" >/dev/null 2>&1 || true
   else
     log "KEEP=1: containers (fev-h1..h3) and network $NET_NAME left running"
   fi
@@ -152,11 +152,13 @@ trap cleanup EXIT
 # --------------------------------------------------------------------------
 # 1. build (as the invoking user, outside sudo when possible)
 # --------------------------------------------------------------------------
-log "1/9 building fabric-evidence (release)"
+# Static musl build: the binary must run inside the containers regardless
+# of the orchestrator's glibc version.
+log "1/9 building fabric-evidence (release, static musl)"
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v runuser >/dev/null 2>&1; then
-  runuser -u "$SUDO_USER" -- cargo build --release -p fabric-evidence
+  runuser -u "$SUDO_USER" -- cargo build --release --target x86_64-unknown-linux-musl -p fabric-evidence
 else
-  cargo build --release -p fabric-evidence
+  cargo build --release --target x86_64-unknown-linux-musl -p fabric-evidence
 fi
 [[ -x "$BIN" ]] || { echo "fabric-evidence: binary missing at $BIN" >&2; exit 1; }
 
@@ -164,8 +166,8 @@ fi
 # 2. docker network + image + three privileged containers
 # --------------------------------------------------------------------------
 log "2/9 creating docker network $NET_NAME ($NET_SUBNET) and containers"
-if ! "$DOCKER" network inspect "$NET_NAME" >/dev/null 2>&1; then
-  "$DOCKER" network create --subnet "$NET_SUBNET" "$NET_NAME" >/dev/null
+if ! "${DOCKER[@]}" network inspect "$NET_NAME" >/dev/null 2>&1; then
+  "${DOCKER[@]}" network create --subnet "$NET_SUBNET" "$NET_NAME" >/dev/null
 fi
 
 BUILD_DIR="$(mktemp -d /tmp/fabric-ev-build-XXXXXX)"
@@ -182,13 +184,13 @@ RUN apt-get update \
       procps \
  && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
-"$DOCKER" build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
+"${DOCKER[@]}" build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
 rm -rf "$BUILD_DIR"
 
 for h in "${HOSTS[@]}"; do
-  "$DOCKER" rm -f "fev-$h" >/dev/null 2>&1 || true
+  "${DOCKER[@]}" rm -f "fev-$h" >/dev/null 2>&1 || true
   # One shared workdir mount; each host uses its own state root /work/<h>.
-  "$DOCKER" run -d --name "fev-$h" \
+  "${DOCKER[@]}" run -d --name "fev-$h" \
     --privileged \
     --network "$NET_NAME" \
     --hostname "$h" \
@@ -229,7 +231,7 @@ for h in "${HOSTS[@]}"; do
 done
 
 ip_of() {
-  "$DOCKER" inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "fev-$1"
+  "${DOCKER[@]}" inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "fev-$1"
 }
 declare -A CONN_IP
 for h in "${HOSTS[@]}"; do
@@ -387,7 +389,7 @@ fi
 
 # 7d. encryption evidence.
 # Binary capture: WireGuard UDP on h2's underlay (pcap stays in the workdir).
-"$DOCKER" exec fev-h2 timeout 20 tcpdump -i eth0 -c 200 -w /work/capture-h2.pcap udp \
+"${DOCKER[@]}" exec fev-h2 timeout 20 tcpdump -i eth0 -c 200 -w /work/capture-h2.pcap udp \
   >/dev/null 2>&1 &
 TCPDUMP_PID=$!
 fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 50 --deadline 15 \
@@ -404,7 +406,7 @@ fi
 hexec h1 ping -c 1 -w 2 "${CONN_IP[h2]}" >/dev/null 2>&1 || true
 
 # Text capture 1: WireGuard UDP must be visible on the underlay.
-"$DOCKER" exec fev-h2 timeout 10 tcpdump -i eth0 -c 20 -l -n udp port "$WG_PORT" \
+"${DOCKER[@]}" exec fev-h2 timeout 10 tcpdump -i eth0 -c 20 -l -n udp port "$WG_PORT" \
   >"$RESULTS_DIR/tcpdump-wg-udp.txt" 2>/dev/null &
 UDP_PID=$!
 fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 5 --deadline 8 >/dev/null || true
@@ -418,7 +420,7 @@ fi
 # Text capture 2: plaintext ARP/ICMP on the underlay. The fabric's tenant
 # traffic (10.42.0.0/24) must NEVER appear in cleartext; underlay control
 # ARP from the docker bridge (172.31.250.0/24) is not tenant leakage.
-"$DOCKER" exec fev-h2 timeout 10 tcpdump -i eth0 -c 10 -n 'arp or icmp' \
+"${DOCKER[@]}" exec fev-h2 timeout 10 tcpdump -i eth0 -c 10 -n 'arp or icmp' \
   >"$RESULTS_DIR/tcpdump-cleartext.txt" 2>/dev/null &
 CLEAR_PID=$!
 fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 5 --deadline 8 >/dev/null || true
