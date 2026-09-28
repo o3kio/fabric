@@ -55,6 +55,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-evidence"
+version = "0.1.0"
+dependencies = [
+ "fabric-linux",
+ "fabric-plan",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "fabric-linux"
 version = "0.1.0"
 dependencies = [

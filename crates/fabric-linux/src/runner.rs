@@ -131,6 +131,7 @@ struct FakeLink {
     kind: String,
     vni: Option<u32>,
     dstport: Option<u16>,
+    mtu: Option<u32>,
 }
 
 /// An in-memory fake kernel plus call journal.
@@ -178,6 +179,12 @@ impl RecordingRunner {
     /// True when the fake kernel currently holds a link named `name`.
     pub fn has_link(&self, name: &str) -> bool {
         self.links.contains_key(name)
+    }
+
+    /// The fake kernel's current MTU for a link, when the link exists and
+    /// an MTU was set on it (links start at the generic default of 1500).
+    pub fn link_mtu(&self, name: &str) -> Option<u32> {
+        self.links.get(name).and_then(|link| link.mtu)
     }
 
     /// True when the fake kernel currently holds a namespace named `ns`.
@@ -232,6 +239,13 @@ impl RecordingRunner {
                         }
                         i += 2;
                     }
+                    "peer" => {
+                        // `peer name <name>`: a veth pair creates both ends.
+                        if let (Some(&"name"), Some(peer)) = (rest.get(i + 1), rest.get(i + 2)) {
+                            self.links.insert((*peer).to_string(), FakeLink::default());
+                        }
+                        i += 1;
+                    }
                     _ => i += 1,
                 }
             }
@@ -245,14 +259,47 @@ impl RecordingRunner {
             }
             return CommandOutput::ok();
         }
+        // link set NAME mtu N | link set NAME name NEW
+        if rest.first() == Some(&"link") && rest.get(1) == Some(&"set") {
+            if let (Some(name), Some(op)) = (rest.get(2), rest.get(3)) {
+                match *op {
+                    "mtu" => {
+                        let value = rest.get(4).copied().and_then(parse_u32);
+                        return match (self.links.get_mut(*name), value) {
+                            (Some(link), Some(mtu)) => {
+                                link.mtu = Some(mtu);
+                                CommandOutput::ok()
+                            }
+                            (Some(_), None) => {
+                                command_error(&format!("invalid MTU value for \"{name}\""))
+                            }
+                            (None, _) => missing_device(name),
+                        };
+                    }
+                    "name" => {
+                        if let (Some(new_name), Some(link)) =
+                            (rest.get(4), self.links.remove(*name))
+                        {
+                            self.links.insert((*new_name).to_string(), link);
+                            return CommandOutput::ok();
+                        }
+                        return missing_device(name);
+                    }
+                    // up/down/netns/master/addr: accepted, not modeled.
+                    _ => {}
+                }
+            }
+            return CommandOutput::ok();
+        }
         // link show [-d] NAME
         if rest.first() == Some(&"link") && rest.get(1) == Some(&"show") {
             if let (Some(name), Some(link)) =
                 (rest.get(2), rest.get(2).and_then(|n| self.links.get(*n)))
             {
                 let mut stdout = format!(
-                    "{}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n",
-                    name
+                    "{}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu {} state UP\n",
+                    name,
+                    link.mtu.unwrap_or(1500)
                 );
                 if detail {
                     match link.kind.as_str() {
@@ -274,11 +321,7 @@ impl RecordingRunner {
                 };
             }
             if let Some(name) = rest.get(2) {
-                return CommandOutput {
-                    success: false,
-                    stdout: String::new(),
-                    stderr: format!("Device \"{name}\" does not exist."),
-                };
+                return missing_device(name);
             }
         }
         CommandOutput::ok()
@@ -287,6 +330,20 @@ impl RecordingRunner {
 
 fn parse_u32(raw: &str) -> Option<u32> {
     raw.parse::<u32>().ok()
+}
+
+/// A failed command with a stderr message, like the real `ip`.
+fn command_error(message: &str) -> CommandOutput {
+    CommandOutput {
+        success: false,
+        stdout: String::new(),
+        stderr: message.to_string(),
+    }
+}
+
+/// The `ip` "device does not exist" failure.
+fn missing_device(name: &str) -> CommandOutput {
+    command_error(&format!("Device \"{name}\" does not exist."))
 }
 
 fn is_observation(args: &[String]) -> bool {

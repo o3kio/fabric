@@ -124,6 +124,10 @@ fn cases() -> Vec<(String, Case)> {
             "fabric_removal_requires_no_networks".to_string(),
             case_fabric_removal,
         ),
+        (
+            "wireguard_mtu_follows_max_fabric_mtu".to_string(),
+            case_wireguard_mtu,
+        ),
     ]
 }
 
@@ -423,6 +427,56 @@ fn case_fabric_removal() -> Result<(), FabricError> {
         return Err(FabricError::Invalid(
             "WireGuard private key must survive fabric teardown".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn case_wireguard_mtu() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("wg-mtu")?;
+    // Default plan: tenant 1380 / fabric 1440 — VXLAN egress frames of up
+    // to 1430 bytes exceed the kernel-default WireGuard MTU of 1420.
+    let mut small = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    small.tenant_mtu = 1380;
+    small.fabric_mtu = 1440;
+    let mut provider = env.provider()?;
+    provider.apply_plan(&small)?;
+
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let wg = names.wireguard_interface();
+    let expected_cmd = format!(
+        "ip netns exec {} ip link set {wg} mtu 1440",
+        names.fabric_namespace()
+    );
+    let command_seen = provider
+        .runner()
+        .calls()
+        .iter()
+        .any(|call| call.joined() == expected_cmd);
+    let state_after_small = provider.runner().link_mtu(&wg);
+
+    // A second, larger plan must raise the shared WireGuard MTU to the new
+    // maximum across live plans.
+    let mut larger = plan_for(200, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    larger.tenant_mtu = 1410;
+    larger.fabric_mtu = 1460;
+    provider.apply_plan(&larger)?;
+    let state_after_large = provider.runner().link_mtu(&wg);
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if !command_seen || state_after_small != Some(1440) {
+        return Err(FabricError::Invalid(format!(
+            "WireGuard MTU not set to fabric_mtu 1440 (command_seen={command_seen}, \
+             fake-kernel mtu={state_after_small:?})"
+        )));
+    }
+    if state_after_large != Some(1460) {
+        return Err(FabricError::Invalid(format!(
+            "WireGuard MTU must follow the maximum fabric_mtu across live plans, \
+             expected 1460, saw {state_after_large:?}"
+        )));
     }
     Ok(())
 }

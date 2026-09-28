@@ -4,6 +4,7 @@ members = [
     "crates/fabric-plan",
     "crates/fabric-linux",
     "crates/fabric-conformance",
+    "crates/fabric-evidence",
 ]
 
 [workspace.package]

@@ -43,6 +43,25 @@ attachment, VNI binding allocation, placement, FIPs, lifecycle.
 3. MTU layering is mandatory and validated: `tenant_mtu + 50 ≤ fabric_mtu`
    (VXLAN overhead), and the control plane is responsible for
    `fabric_mtu ≤ underlay_mtu − WireGuard overhead` at enrollment time.
+   The provider sets the shared WireGuard interface's MTU, on **every
+   apply**, to the **maximum `fabric_mtu` across all live plans** (the plan
+   being applied included, because the plan journal is persisted before any
+   mutation). `ip link add <if> type wireguard` alone leaves the
+   kernel-default MTU (1420) in place, which validated plans may exceed;
+   without this re-assert, large tenant packets fail with EMSGSIZE or
+   fragment on the underlay. Re-setting an identical MTU is a benign
+   re-assert (like `ip addr replace`). Teardown never shrinks the WireGuard
+   MTU — a conservatively larger value is always safe — and the next apply
+   re-converges to the true maximum.
+
+   **Host prerequisites (operator responsibility, not provider-managed):**
+   the *root* network namespace must have `net.ipv4.ip_forward=1` — the
+   provider enables forwarding only inside the fabric namespace, while
+   forwarding between the host underlay veth and the physical underlay
+   happens in the root namespace — and the underlay device must tolerate
+   the fabric's asymmetric return path (`net.ipv4.conf.<underlay_dev>.rp_filter`
+   set to loose or off), since fabric replies leave through a different
+   veth than the underlay traffic arrives on.
 4. Private keys are not representable in a plan. Only public keys travel in
    control-plane state.
 

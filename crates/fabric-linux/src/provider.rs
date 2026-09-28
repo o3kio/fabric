@@ -2,7 +2,8 @@
 //!
 //! Realization order (see `contracts/fabric-provider-v1.md`):
 //! validate plan -> journal plan -> ensure fabric (netns/WireGuard/underlay)
-//! -> configure peers (union over live plans) -> ensure network (VXLAN +
+//! -> configure peers (union over live plans) -> re-assert the WireGuard MTU
+//! (maximum fabric_mtu across live plans) -> ensure network (VXLAN +
 //! learning bridge + attachment veth + bounded HER flood list) -> save
 //! ownership. Teardown runs in reverse dependency order and preserves the
 //! WireGuard private key.
@@ -76,6 +77,10 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
 
         let fabric_report = self.ensure_fabric(plan)?;
         self.configure_peers()?;
+        // Re-assert the WireGuard MTU on every apply: the kernel default
+        // (1420) is below what validated plans may push through the VXLAN
+        // devices (tenant_mtu + 50 bytes of VXLAN overhead).
+        self.enforce_wireguard_mtu()?;
         let created_network = self.ensure_network(plan, &fingerprint)?;
 
         self.ownership.save(&self.config.ownership_path())?;
@@ -425,6 +430,35 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         Ok(())
     }
 
+    /// Re-assert the WireGuard interface MTU as the maximum `fabric_mtu`
+    /// across all live plans.
+    ///
+    /// `ip link add <if> type wireguard` comes up with the kernel-default
+    /// MTU of 1420. VXLAN egress frames can be up to `tenant_mtu + 50`
+    /// bytes and plan validation only guarantees `tenant_mtu + 50 <=
+    /// fabric_mtu`, so the WireGuard MTU must cover the largest live plan
+    /// or large tenant packets fail with EMSGSIZE (or fragment on the
+    /// underlay). This runs on every apply: the plan journal is persisted
+    /// before `ensure_fabric`, so `live_plans()` already includes the plan
+    /// being applied. Re-setting an identical MTU is a benign re-assert,
+    /// exactly like `ip addr replace`.
+    ///
+    /// `remove_network` deliberately does NOT recompute the MTU: a
+    /// conservatively larger WireGuard MTU is always safe (it only admits
+    /// frames that no live plan emits), while shrinking on teardown would
+    /// add a failure mode for zero benefit. The next apply re-converges to
+    /// the true maximum over the remaining live plans.
+    fn enforce_wireguard_mtu(&mut self) -> Result<(), FabricError> {
+        let names = config_names(&self.config)?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let Some(max_mtu) = self.live_plans()?.iter().map(|plan| plan.fabric_mtu).max() else {
+            return Ok(());
+        };
+        let mtu = max_mtu.to_string();
+        self.ns_run_checked(&ns, "ip", &["link", "set", &wg, "mtu", mtu.as_str()])
+    }
+
     // ---- per-network ----------------------------------------------------
 
     fn ensure_network(
@@ -695,4 +729,168 @@ fn verify_vxlan_identity(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner::RecordingRunner;
+    use fabric_plan::{FabricPeer, PlanError, PublicKey, UnderlayEndpoint, Vni};
+    use std::path::PathBuf;
+
+    fn test_plan(
+        network_id: &str,
+        vni: u32,
+        tenant_mtu: u32,
+        fabric_mtu: u32,
+    ) -> Result<StretchedL2Plan, PlanError> {
+        Ok(StretchedL2Plan {
+            fabric_domain_id: "fab-1".to_string(),
+            local_host_id: "host-01".to_string(),
+            local_transport_ip: Ipv4Addr::new(198, 18, 0, 1),
+            network_id: network_id.to_string(),
+            vni: Vni::new(vni)?,
+            binding_generation: 1,
+            tenant_mtu,
+            fabric_mtu,
+            peers: vec![FabricPeer {
+                host_id: "host-02".to_string(),
+                public_key: PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=")?,
+                underlay_endpoint: UnderlayEndpoint::parse("198.51.100.10:65001")?,
+                fabric_transport_ip: Ipv4Addr::new(198, 18, 0, 2),
+            }],
+            plan_generation: 1,
+        })
+    }
+
+    fn test_root(tag: &str) -> std::io::Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!(
+            "fabric-provider-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    fn plan_error(e: PlanError) -> FabricError {
+        FabricError::Invalid(e.to_string())
+    }
+
+    #[test]
+    fn apply_sets_wireguard_mtu_to_plan_fabric_mtu() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("wg-mtu")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        let expected_cmd = format!(
+            "ip netns exec {} ip link set {} mtu 1440",
+            names.fabric_namespace(),
+            names.wireguard_interface()
+        );
+        let command_seen = provider
+            .runner()
+            .calls()
+            .iter()
+            .any(|call| call.joined() == expected_cmd);
+        let state_mtu = provider.runner().link_mtu(&names.wireguard_interface());
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            command_seen,
+            "apply must set the WireGuard MTU via: {expected_cmd}"
+        );
+        assert_eq!(state_mtu, Some(1440));
+        Ok(())
+    }
+
+    #[test]
+    fn wireguard_mtu_follows_maximum_fabric_mtu_across_live_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("wg-mtu-max")?;
+        let config = FabricLinuxConfig::new(&root);
+        let small = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let large = test_plan("net-b", 200, 1410, 1460).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&small)?;
+        assert_eq!(
+            provider.runner().link_mtu(&names.wireguard_interface()),
+            Some(1440)
+        );
+        // Applying a second plan with a larger fabric_mtu raises the shared
+        // WireGuard MTU to the new maximum.
+        provider.apply_plan(&large)?;
+        let raised = provider.runner().link_mtu(&names.wireguard_interface());
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert_eq!(raised, Some(1460));
+        Ok(())
+    }
+
+    #[test]
+    fn wireguard_mtu_does_not_shrink_on_network_removal() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("wg-mtu-keep")?;
+        let config = FabricLinuxConfig::new(&root);
+        let small = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let large = test_plan("net-b", 200, 1410, 1460).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&small)?;
+        provider.apply_plan(&large)?;
+        provider.remove_network("net-b")?;
+        // remove_network deliberately keeps the (conservatively larger)
+        // WireGuard MTU; the next apply re-converges to the true maximum.
+        let kept = provider.runner().link_mtu(&names.wireguard_interface());
+        provider.apply_plan(&small)?;
+        let converged = provider.runner().link_mtu(&names.wireguard_interface());
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert_eq!(kept, Some(1460));
+        assert_eq!(converged, Some(1440));
+        Ok(())
+    }
+
+    #[test]
+    fn wireguard_mtu_is_reasserted_on_idempotent_replay() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("wg-mtu-replay")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        provider.apply_plan(&plan)?;
+        let mtu_sets = provider
+            .runner()
+            .calls()
+            .iter()
+            .filter(|call| {
+                let wg = names.wireguard_interface();
+                call.joined()
+                    .contains(&format!("ip link set {wg} mtu 1440"))
+            })
+            .count();
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert_eq!(
+            mtu_sets, 2,
+            "every apply re-asserts the WireGuard MTU (benign, like addr replace)"
+        );
+        Ok(())
+    }
 }
