@@ -175,6 +175,17 @@ pub struct RecordingRunner {
     /// Links keyed by `(name, netns)` — per-namespace name tables, like
     /// the real kernel.
     links: BTreeMap<(String, Option<String>), FakeLink>,
+    /// FOREIGN UDP listeners, keyed by `(namespace, port)` (`None` =
+    /// root namespace) — processes unrelated to the fabric that happen
+    /// to bind a port in a namespace, INDEPENDENT of any wg link.
+    /// Seeded explicitly (see [`Self::add_foreign_udp_listener`]) so a
+    /// test can place a listener on the configured WireGuard port in
+    /// either namespace and exercise the provider's three-way
+    /// socket-placement discriminator in its unattributable case: a
+    /// foreign listener coexisting with our own (wherever ours is
+    /// bound). `ss -uln` answers from this set as well as from the
+    /// wg-link socket-placement model.
+    foreign_udp_listeners: std::collections::BTreeSet<(Option<String>, u16)>,
     /// Routing-table entries (destination strings; the fake kernel models
     /// one global table, which is sufficient because the provider only
     /// manages routes inside the fabric namespace).
@@ -204,6 +215,7 @@ impl RecordingRunner {
             calls: Vec::new(),
             netns: std::collections::BTreeSet::new(),
             links: BTreeMap::new(),
+            foreign_udp_listeners: std::collections::BTreeSet::new(),
             routes: std::collections::BTreeSet::new(),
             iptables: BTreeMap::new(),
             fdb: BTreeMap::new(),
@@ -220,7 +232,7 @@ impl RecordingRunner {
     pub fn mutating_calls(&self) -> Vec<CommandCall> {
         self.calls
             .iter()
-            .filter(|call| !is_observation(&call.args))
+            .filter(|call| !is_observation(&call.program, &call.args))
             .cloned()
             .collect()
     }
@@ -228,6 +240,19 @@ impl RecordingRunner {
     /// Inject a failure for any command whose joined line contains `pattern`.
     pub fn fail_on(&mut self, pattern: impl Into<String>) {
         self.failures.push(pattern.into());
+    }
+
+    /// Seed a FOREIGN UDP listener on `port` in `netns` (`None` = the
+    /// root namespace): a process unrelated to the fabric — not a wg
+    /// link — that happens to bind that port there. Independent of any
+    /// link state, so the provider's three-way socket-placement
+    /// discriminator can be exercised in its unattributable case (a
+    /// foreign listener in one namespace coexisting with our own socket
+    /// in the other). Observable through `ss -uln` in the seeding
+    /// namespace only.
+    pub fn add_foreign_udp_listener(&mut self, netns: Option<&str>, port: u16) {
+        self.foreign_udp_listeners
+            .insert((netns.map(str::to_string), port));
     }
 
     /// True when the fake kernel currently holds a link named `name` in
@@ -811,7 +836,8 @@ impl RecordingRunner {
 
     /// `ss -uln` (listening UDP sockets, numeric) executed in namespace
     /// `ns` (`None` = root): one line per WireGuard listener whose
-    /// socket is bound in that namespace.
+    /// socket is bound in that namespace, plus one per FOREIGN listener
+    /// seeded there (see [`Self::add_foreign_udp_listener`]).
     ///
     /// Answered from the socket-placement model: a WireGuard socket
     /// binds in the namespace the link was CREATED in (`creating_netns`)
@@ -848,6 +874,13 @@ impl RecordingRunner {
             let Some(port) = link.listen_port else {
                 continue;
             };
+            stdout.push_str(&format!("UNCONN 0      0      0.0.0.0:{port} 0.0.0.0:*\n"));
+            stdout.push_str(&format!("UNCONN 0      0      [::]:{port} [::]:*\n"));
+        }
+        for (netns, port) in &self.foreign_udp_listeners {
+            if netns.as_deref() != ns {
+                continue;
+            }
             stdout.push_str(&format!("UNCONN 0      0      0.0.0.0:{port} 0.0.0.0:*\n"));
             stdout.push_str(&format!("UNCONN 0      0      [::]:{port} [::]:*\n"));
         }
@@ -907,7 +940,13 @@ fn cannot_find_device(name: &str) -> CommandOutput {
     command_error(&format!("Cannot find device \"{name}\""))
 }
 
-fn is_observation(args: &[String]) -> bool {
+fn is_observation(program: &str, args: &[String]) -> bool {
+    // A bare `ss ...` invocation (the root-namespace leg of the
+    // socket-placement discriminator) is always an observation — the
+    // provider only ever runs `ss` to look, never to mutate.
+    if program == "ss" {
+        return true;
+    }
     // `ip [netns exec NS] (ip) ([-d]) link show ...` and `ip netns list`
     let mut rest: &[String] = args;
     if rest.first().map(String::as_str) == Some("netns")
@@ -1533,6 +1572,87 @@ mod tests {
             ns_ss.stdout.lines().count(),
             3, // header + the one ns-bound listener x 2 address forms
             "only configured wireguard listeners appear: {}",
+            ns_ss.stdout
+        );
+    }
+
+    /// FOREIGN UDP listeners (round-7) are observable per namespace,
+    /// independent of any wg link: a listener seeded in one namespace
+    /// appears in that namespace's `ss -uln` dump only, never in
+    /// another's and never tied to link state. This is the seeding
+    /// primitive for the provider's three-way socket-placement
+    /// discriminator tests.
+    #[test]
+    fn foreign_udp_listeners_appear_only_in_their_seeded_namespace() {
+        let mut runner = RecordingRunner::new();
+        assert!(ok_or_err_out(runner.run("ip", &["netns", "add", "nsx"])).success);
+        // A foreign listener on 65001 INSIDE the namespace — no wg link
+        // involved at all.
+        runner.add_foreign_udp_listener(Some("nsx"), 65001);
+        // ...and one on 65002 in the root namespace.
+        runner.add_foreign_udp_listener(None, 65002);
+
+        let ns_ss = ok_or_err_out(runner.run("ip", &["netns", "exec", "nsx", "ss", "-uln"]));
+        assert!(ns_ss.success);
+        assert!(
+            ns_ss.stdout.contains(":65001"),
+            "the foreign ns listener must be observable in its namespace: {}",
+            ns_ss.stdout
+        );
+        assert!(
+            !ns_ss.stdout.contains(":65002"),
+            "a foreign root listener must NOT leak into the ns dump: {}",
+            ns_ss.stdout
+        );
+        let root_ss = ok_or_err_out(runner.run("ss", &["-uln"]));
+        assert!(root_ss.success);
+        assert!(
+            root_ss.stdout.contains(":65002"),
+            "the foreign root listener must be observable in the root ns: {}",
+            root_ss.stdout
+        );
+        assert!(
+            !root_ss.stdout.contains(":65001"),
+            "a foreign ns listener must NOT leak into the root dump: {}",
+            root_ss.stdout
+        );
+
+        // The combined unattributable case is representable: our own
+        // root-created, moved-in wg (socket root-side) PLUS a foreign
+        // listener on the same port inside the namespace — both dumps
+        // show the port.
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "add", "wgroot", "type", "wireguard"]))
+                .success
+        );
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "set", "wgroot", "netns", "nsx"])).success
+        );
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                "nsx",
+                "wg",
+                "set",
+                "wgroot",
+                "listen-port",
+                "65001",
+            ],
+        ));
+        assert!(out.success, "wg set listen-port failed: {}", out.stderr);
+        runner.add_foreign_udp_listener(None, 65001);
+        let root_ss = ok_or_err_out(runner.run("ss", &["-uln"]));
+        assert!(
+            root_ss.stdout.contains(":65001"),
+            "our own root-bound socket must be observable: {}",
+            root_ss.stdout
+        );
+        let ns_ss = ok_or_err_out(runner.run("ip", &["netns", "exec", "nsx", "ss", "-uln"]));
+        assert!(
+            ns_ss.stdout.contains(":65001"),
+            "the foreign ns listener coexists observably: {}",
             ns_ss.stdout
         );
     }

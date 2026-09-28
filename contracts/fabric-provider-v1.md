@@ -261,13 +261,30 @@ case, so the rule deletions are unconditional and idempotent. Because
 the exact-spec deletes can silently miss operator-installed
 **variants** of the legacy rules (a DNAT with `-i eth0` instead of
 `! -i <prefix>-u`, a different address inside 169.254.253.0/30, ...),
-the nat table is LISTED after the deletes (`iptables -t nat -S`) and
-the apply **fails closed** on any residue rule that still references
-the legacy underlay signature — the 169.254.253 subnet, the
-`<prefix>-u` veth, or a DNAT targeting the WireGuard port — naming the
-residue. Residue NAT state on the transport is exactly the postmortem's
-silent-death mode; a delete that silently missed must not pass as
-cleaned. The veth deletion is likewise **ownership-gated** (the same
+the nat table is LISTED (`iptables -t nat -S`, read-only) at the
+**start of every apply — before any destructive action on any path**
+(before the heal's WireGuard and recorded-VXLAN deletions, before the
+root stray sweep, before the tolerant deletes themselves), and the
+apply **fails closed** on any residue rule matching the legacy
+underlay signature, so a hit leaves every kernel object in place. The
+signature is deliberately **broad**, and each arm carries its
+rationale:
+
+- any nat-table rule referencing the **169.254.253/24 prefix** — the
+  whole /24, not just the legacy /30 or its exact `.2`/`.0/30` forms:
+  a missed variant of residue NAT on the WireGuard transport is silent
+  death (the postmortem failure mode), while a false positive is loud
+  and operator-remediable;
+- any rule naming the legacy host-veth (`<prefix>-u`) as a token;
+- any **DNAT matching the WireGuard listen port** (`--dport <port>` in
+  a `-j DNAT` rule), with no address tie: any DNAT on the transport
+  port is black-hole state for inbound flows, wherever it points.
+
+The only tolerance is exactly ONE instance of each exact v0.1.1 rule
+specification — the tolerant deletes are guaranteed to remove those,
+so they are this provider's own convergent legacy state, not foreign
+variants; a second instance of either, or any variant, fails closed.
+The veth deletion is likewise **ownership-gated** (the same
 discipline as the stray sweep below): on a fresh host whose journal
 owns no fabric state, a root-ns link colliding with the deterministic
 `<prefix>-u` name is foreign state and is never deleted — the veth is
@@ -327,22 +344,54 @@ flag reading false: a round-3..5 host crashed between the ns-side
 re-creation and the end-of-apply journal save, and an operator-created
 ns-born WireGuard (which no journal scheme can represent). So on every
 apply where the interface exists in the fabric namespace and no heal
-is pending, the provider verifies the placement from the kernel:
-`ip netns exec <fabric-ns> ss -uln` must NOT list a UDP listener on
-the configured WireGuard port (the match is on the port exactly —
-`0.0.0.0:<port>`, `[::]:<port>`, `*:<port>` — so a listener on 6500
-never matches a configured 65001). A listener there is positive
-evidence that the socket is ns-bound, and triggers the full heal above
-with the journal flag written BEFORE the first deletion, so every
-interruption slice of the runtime-triggered heal converges through the
-same flag path. The heal-by-deletion stays ownership-gated: on a host
-whose journal owns no fabric state, a listener on the configured port
-inside the fabric namespace is foreign state and fails closed — never
-healed by deletion. The port being absent is the healthy case (no
-heal, no state churn — a spurious heal would cost a WireGuard session
-drop); a hard failure of the `ss` command itself is NOT "port absent"
-and fails the apply closed (iproute2, which provides `ss`, is already
-a hard dependency of the provider).
+is pending, the provider verifies the placement from the kernel with a
+**three-way discriminator** over `ss -uln` dumps (the match is on the
+port exactly — `0.0.0.0:<port>`, `[::]:<port>`, `*:<port>` — so a
+listener on 6500 never matches a configured 65001):
+
+1. The fabric-namespace dump shows the port **absent** → healthy: no
+   heal, no error, no state churn (a spurious heal would cost a
+   WireGuard session drop).
+2. The fabric-namespace dump shows the port **present** and the
+   root-namespace dump (taken only now — one extra command, only in
+   this rare case, through the same runner and exact-port parse)
+   shows it **absent** → the socket is genuinely ns-bound → the full
+   heal above, with the journal flag written BEFORE the first
+   deletion, so every interruption slice of the runtime-triggered
+   heal converges through the same flag path.
+3. **Both** dumps show the port → **unattributable**: our socket could
+   be the root one (a healthy root-created transport plus a FOREIGN
+   listener inside the fabric namespace — namespace socket tables are
+   separate, so that listener does not break the root-bound
+   transport), or the fabric one (an ns-born, dead transport plus a
+   FOREIGN root-namespace listener). The provider MUST fail the apply
+   closed with a specific error naming both observations, the
+   configured port, and the remediation (inspect both namespaces'
+   listeners on that port and remove the foreign one), and MUST NOT
+   delete anything or change any journal state. Healing on the
+   fabric-namespace observation alone would destroy a healthy
+   transport and never converge — the healed interface plus the
+   surviving foreign listener reproduces the same observation on
+   every apply, an endless delete/recreate session-drop loop. Refusing
+   to heal whenever the root dump is non-quiet would silently keep a
+   dead transport in the mirrored case — the exact class this
+   contract forbids. Fail closed on ambiguity: never silently keep a
+   dead transport, never destroy a healthy one; both underlying
+   causes converge to a good state once the operator removes the
+   foreign listener, and an apply failing this way leaves the existing
+   datapath unaffected.
+
+The two `ss` observations are not atomic, but both are read-only, both
+precede any mutation, and the discriminator runs only on the healthy
+path (a pending heal is flag-driven and skips it): a concurrent
+external mutation between the two observations can at worst turn a
+would-be case 2 into case 3 — fail closed — never produce a wrongful
+heal. The heal itself stays ownership-gated: on a host whose journal
+owns no fabric state, a listener on the configured port inside the
+fabric namespace is foreign state and fails closed — never healed by
+deletion. A hard failure of either `ss` command itself is NOT "port
+absent" and fails the apply closed (iproute2, which provides `ss`, is
+already a hard dependency of the provider).
 
 If an interface of the WireGuard name exists in **both** the root and
 the fabric namespace while the journal claims a healthy fabric, the
@@ -359,7 +408,9 @@ underlay cleanup (exact-spec rule deletions plus the veth pair) on every
 apply, the born-in-fabric-namespace journal healing to the root-creation
 sequence, runtime socket-placement verification healing an unflagged
 ns-born WireGuard (an `ss -uln` listener on the transport port inside
-the fabric namespace, journal flag false, journal owned), flood-list
+the fabric namespace, journal flag false, journal owned), the
+three-way socket-placement discriminator failing closed on the
+unattributable two-namespace listener case without healing, flood-list
 reconciliation without duplicates after repeated
 replays, flood-list scoping, foreign-state rejection (including
 prefix-VNI rejection), teardown cleanliness, key non-leakage, peer
@@ -372,7 +423,8 @@ semantics (missing devices, duplicate names, missing namespaces, missing
 fdb/route entries with real kernel error strings, per-namespace link
 placement and name tables, per-namespace link-creation records — the
 WireGuard socket placement — the per-namespace listening-socket dumps of
-`ss -uln`, the `Bad rule` wording of a non-matching
+`ss -uln`, including seedable foreign per-namespace UDP listeners, the
+`Bad rule` wording of a non-matching
 `iptables -D`, and counting fdb entries), so a permissive provider flow
 fails the suite rather than silently passing.
 

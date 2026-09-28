@@ -106,6 +106,14 @@ fail() {
 # 169.254.253.0/30 in this dump is itself a regression signal; conntrack
 # shows the tuple classification. Captured into the results dir on every
 # failure for post-mortem analysis.
+#
+# Every capture command is `|| true`-wrapped: the script runs under
+# `set -euo pipefail`, and diagnostics must never abort (or be aborted
+# mid-file) — a half-empty diagnostics file after a test failure is a
+# second, masking failure. The host-bridge file is ALWAYS written: if
+# the docker network can no longer be inspected (already torn down,
+# docker error, ...) the inspect failure is recorded IN the file and
+# the name-independent host captures still run.
 capture_diagnostics() {
   local triggering="$1"
   for h in "${HOSTS[@]}"; do
@@ -113,41 +121,55 @@ capture_diagnostics() {
     {
       echo "# diagnostics after failure: $triggering"
       echo "## iptables -t nat -L -n -v (root ns)"
-      "${DOCKER[@]}" exec "fev-$h" iptables -t nat -L -n -v 2>&1
+      "${DOCKER[@]}" exec "fev-$h" iptables -t nat -L -n -v 2>&1 || true
       echo "## wg show (fabric ns)"
-      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" wg show 2>&1
+      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" wg show 2>&1 || true
       echo "## conntrack entries for the fabric port (root ns view)"
-      "${DOCKER[@]}" exec "fev-$h" sh -c "grep $WG_PORT /proc/net/nf_conntrack 2>/dev/null || true" 2>&1
+      "${DOCKER[@]}" exec "fev-$h" sh -c "grep $WG_PORT /proc/net/nf_conntrack 2>/dev/null || true" 2>&1 || true
       echo "## ip -s link (root ns)"
-      "${DOCKER[@]}" exec "fev-$h" ip -s link 2>&1
+      "${DOCKER[@]}" exec "fev-$h" ip -s link 2>&1 || true
       echo "## ip neigh show (root ns)"
-      "${DOCKER[@]}" exec "fev-$h" ip neigh show 2>&1
+      "${DOCKER[@]}" exec "fev-$h" ip neigh show 2>&1 || true
       echo "## /proc/net/arp (root ns)"
-      "${DOCKER[@]}" exec "fev-$h" cat /proc/net/arp 2>&1
+      "${DOCKER[@]}" exec "fev-$h" cat /proc/net/arp 2>&1 || true
       echo "## ip neigh show (fabric ns)"
-      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" ip neigh show 2>&1
+      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" ip neigh show 2>&1 || true
       echo "## 3s ARP watch on eth0 (requests and replies from this vantage)"
-      "${DOCKER[@]}" exec "fev-$h" timeout 3 tcpdump -i eth0 -n -c 40 arp 2>&1
+      "${DOCKER[@]}" exec "fev-$h" timeout 3 tcpdump -i eth0 -n -c 40 arp 2>&1 || true
     } >"$out" 2>&1
   done
   # Host-side view of the docker bridge: counters, FDB and port states —
   # distinguishes "the request never left the container" from "the bridge
   # never delivered it". Requires the script's sudo/root context.
-  local bridge_id bridge_name
-  bridge_id="$("${DOCKER[@]}" network inspect -f '{{.Id}}' "$NET_NAME" 2>/dev/null || true)"
-  if [[ -n "$bridge_id" ]]; then
+  # Resolve the bridge name best-effort; the file is written either way.
+  local bridge_id="" bridge_name="" inspect_err=""
+  if ! bridge_id="$("${DOCKER[@]}" network inspect -f '{{.Id}}' "$NET_NAME" 2>&1)"; then
+    inspect_err="$bridge_id"
+    bridge_id=""
+  else
     bridge_name="br-${bridge_id:0:12}"
-    {
-      echo "## host bridge $bridge_name link stats"
-      ip -s link show "$bridge_name" 2>&1
-      echo "## host bridge $bridge_name fdb"
-      bridge fdb show dev "$bridge_name" 2>&1
-      echo "## host bridge ports"
-      bridge link show 2>&1
-      echo "## host neigh (container subnet)"
-      ip neigh show 2>&1
-    } >"$RESULTS_DIR/diag-host-bridge.txt" 2>&1
   fi
+  {
+    echo "# host bridge diagnostics after failure: $triggering"
+    if [[ -n "$bridge_name" ]]; then
+      echo "## network $NET_NAME bridge $bridge_name (id $bridge_id)"
+      echo "## host bridge $bridge_name link stats"
+      ip -s link show "$bridge_name" 2>&1 || true
+      echo "## host bridge $bridge_name fdb"
+      bridge fdb show dev "$bridge_name" 2>&1 || true
+    else
+      echo "## ERROR: could not resolve the bridge for docker network '$NET_NAME'"
+      echo "## ERROR: docker network inspect said: $inspect_err"
+      echo "## ERROR: the per-bridge captures below are skipped; the"
+      echo "## ERROR: name-independent host captures still follow."
+    fi
+    echo "## host bridge ports (name-independent)"
+    bridge link show 2>&1 || true
+    echo "## host links (name-independent)"
+    ip -s link 2>&1 || true
+    echo "## host neigh (name-independent)"
+    ip neigh show 2>&1 || true
+  } >"$RESULTS_DIR/diag-host-bridge.txt" 2>&1
 }
 
 # docker, with sudo fallback (the script may run as a user without the

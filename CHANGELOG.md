@@ -63,6 +63,68 @@
   prerequisites: under the NAT-free underlay the root namespace terminates
   the WG transport socket and never forwards fabric packets.
 
+### Fixed (review round 7)
+- **Three-way socket-placement discriminator (MAJOR).** The round-6
+  runtime verification healed whenever `ss -uln` inside the fabric
+  namespace showed a listener on the configured WG port. That
+  observation alone is not attributable: a FOREIGN process binding the
+  port inside the fabric namespace (namespace socket tables are
+  separate, so the root-bound transport keeps working) triggered the
+  destructive heal on every apply — a permanent, non-convergent loop,
+  each iteration dropping the WG session. The discriminator is now
+  three-way: (1) fabric-ns port absent → healthy, unchanged;
+  (2) fabric-ns port present and root-ns port absent → genuinely
+  ns-bound → the same ownership-gated, flag-first heal as before;
+  (3) BOTH namespaces show the port → unattributable → the apply fails
+  closed with a specific error naming both observations, the port, and
+  the remediation (inspect both namespaces' listeners, remove the
+  foreign one), deleting nothing and changing no journal state. The
+  mirrored hole — healing only when the root dump is quiet — would
+  silently keep a dead ns-born transport under a foreign root-ns
+  listener, which is the exact failure class this design forbids, so
+  ambiguity fails closed in both directions. The root-ns `ss` runs only
+  when the fabric-ns observation is positive (nothing extra on the
+  healthy fast path), through the same runner and exact-port parse, and
+  a hard failure of either `ss` fails the apply closed. The two
+  observations are read-only and precede any mutation; a concurrent
+  external change between them can at worst produce case 3 (fail
+  closed), never a wrongful heal. Contract §3.10 updated; the fake
+  kernel can seed foreign UDP listeners per namespace
+  (`add_foreign_udp_listener`), and the conformance suite gains
+  `socket_listener_ambiguity_fails_closed_without_healing`.
+- **Nat-residue verification hoisted before all destruction (NIT).**
+  The residue check (`iptables -t nat -S` + signature match) now runs
+  at the START of every apply, before any destructive action on any
+  path — previously it ran inside the legacy cleanup, AFTER the heal
+  path had already deleted the wg and the recorded VXLANs, so a
+  residue hit failed closed over a destroyed transport. The tolerant
+  exact-spec deletes stay where they are (they can only remove rules,
+  never create residue). Exactly ONE instance of each exact v0.1.1
+  rule specification is tolerated by the verification — those are the
+  provider's own convergent legacy rules that the deletes are
+  guaranteed to remove — while a second instance or any variant fails
+  closed with every kernel object still in place.
+- **Residue signature breadth documented truthfully (MINOR, docs).**
+  Contract §3.10 and the error text now state the signature the code
+  actually matches: any nat-table rule referencing the 169.254.253/24
+  prefix (not just the legacy /30 or its exact forms), naming the
+  legacy `<prefix>-u` veth, or any DNAT matching the WG port (no
+  address tie). The breadth is deliberate and kept: a missed variant
+  of residue NAT on the transport is silent death (the postmortem
+  failure mode), while a false positive is loud and
+  operator-remediable. No behavior change; a table-driven test pins
+  the documented breadth (a 169.254.253.77 rule matches; a
+  169.254.99.x rule does not).
+- **Evidence failure diagnostics never silently skip (hardening).**
+  `capture_diagnostics` in `evidence/run-multinode.sh` now always
+  writes `diag-host-bridge.txt`: a failed `docker network inspect`
+  (or an unresolvable bridge name) is recorded IN the file together
+  with the name-independent host captures (`bridge link show`,
+  `ip -s link`, `ip neigh`), and every diagnostic command is
+  `||`-wrapped so one failure cannot abort the rest under `set -e`.
+  In the failed evidence run this file was never produced — the
+  inspect guard skipped the whole capture silently.
+
 ### Fixed (review round 6)
 - **Runtime socket-placement verification (MAJOR).** The journal can only
   record intent; the kernel is the ground truth. On every apply where the

@@ -123,6 +123,10 @@ fn cases() -> Vec<(String, Case)> {
             case_runtime_socket_placement_heals_unflagged_ns_born_wg,
         ),
         (
+            "socket_listener_ambiguity_fails_closed_without_healing".to_string(),
+            case_socket_listener_ambiguity_fails_closed,
+        ),
+        (
             "flood_list_has_no_duplicates_after_replays".to_string(),
             case_flood_no_duplicates_after_replays,
         ),
@@ -875,6 +879,78 @@ fn case_runtime_socket_placement_heals_unflagged_ns_born_wg() -> Result<(), Fabr
     if created_in != Some(None) {
         return Err(FabricError::Invalid(format!(
             "the healed wg socket must bind in the ROOT namespace, saw {created_in:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Round-7 MAJOR: the socket-placement discriminator is THREE-WAY. A
+/// foreign UDP listener on the configured port inside the fabric
+/// namespace, coexisting with our own healthy root-bound socket (which
+/// the root-namespace dump shows), is UNATTRIBUTABLE: healing on the
+/// fabric-ns observation alone would destroy a healthy transport and
+/// loop forever (the healed wg plus the surviving foreign listener
+/// reproduces the observation on every apply), while refusing to heal
+/// whenever the root dump is non-quiet would silently keep a dead
+/// ns-born transport in the mirrored case. The apply must fail closed,
+/// name both observations, and delete nothing. Pre-fix code (round-6)
+/// ran the destructive heal and returned Ok.
+fn case_socket_listener_ambiguity_fails_closed() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("ambiguity")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let wg = names.wireguard_interface();
+    let vxlan = names.vxlan(&plan.network_id);
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    env.take_runner_back(provider);
+
+    // A foreign process binds the WG port inside the fabric ns while
+    // our own root-created wg keeps its root-bound listener: both
+    // namespaces' `ss -uln` dumps show the port.
+    env.runner
+        .add_foreign_udp_listener(Some(&ns), env.config.wireguard_port());
+
+    let before = env.runner.calls().len();
+    let mut provider = env.provider()?;
+    let result = provider.apply_plan(&plan);
+    let wg_kept = provider.runner().has_link_in(&wg, Some(&ns));
+    let vxlan_kept = provider.runner().has_link(&vxlan);
+    let deletions = provider
+        .runner()
+        .calls()
+        .iter()
+        .skip(before)
+        .filter(|call| call.joined().contains(" link del "))
+        .count();
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    match result {
+        Err(FabricError::ForeignState { observed, .. }) => {
+            if !observed.contains("unattributable") {
+                return Err(FabricError::Invalid(format!(
+                    "the error must name the unattributable observation: {observed}"
+                )));
+            }
+        }
+        other => {
+            return Err(FabricError::Invalid(format!(
+                "the unattributable listener pair must fail the apply closed, got {other:?}"
+            )));
+        }
+    }
+    if !wg_kept || !vxlan_kept {
+        return Err(FabricError::Invalid(
+            "the ambiguity failure must leave the wg and the recorded vxlan untouched".to_string(),
+        ));
+    }
+    if deletions != 0 {
+        return Err(FabricError::Invalid(format!(
+            "the ambiguity failure must issue no deletions, saw {deletions}"
         )));
     }
     Ok(())
