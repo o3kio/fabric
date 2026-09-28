@@ -99,18 +99,23 @@ JSON, `wg show`, tcpdump text captures) plus a binary pcap in the workdir
   real-internet path MTU behavior. Cross-machine runs over real networks
   remain the final production gate; this harness is the prerequisite for
   it, not a substitute.
-- **One captured-but-unresolved ARP anomaly.** In 44 acceptance-loop runs
-  (2026-09-28), exactly one run showed root-namespace ARP resolution for
-  peer underlay IPs failing for ~30s (requests left the host, replies never
-  arrived; artifacts: `evidence/results/20260928T175355Z/`). It did not
-  reproduce in 20 instrumented runs across idle and loaded host conditions,
-  host resources were clean, and no mechanism was identified. Since commit
-  4d3575c the harness permanently records per-host ARP timelines
-  (`arp-monitor-h*.txt`), neighbor tables in both namespaces, and
-  host-side bridge state on failure — any recurrence is dissectable from
-  the results dir alone. The fabric's underlay depends on root-ns ARP for
-  peers, as does any host networking; this anomaly is tracked, not
-  explained.
+- **Concurrent host-network mutations invalidate a run (root-caused).** The
+  orchestrator host is shared with other workloads; on 2026-09-28 a parallel
+  CHV qualification session's cleanup deleted every host bridge matching
+  `chvbr0|br-*` — which includes docker's per-network bridges — mid-run,
+  twice. Both affected evidence runs (17:54:06 and 18:50:33) failed with an
+  identical signature: all bridge ports `entered disabled state` in the
+  kernel journal at the same second, after which every host's root-ns ARP
+  for its peers went unanswered (requests leave each container, nothing
+  arrives anywhere — captured per-host by `arp-monitor-h*.txt`). This is
+  external interference, not a fabric defect: the fabric's underlay depends
+  on host bridge forwarding, as does any container networking. Attribution
+  recipe for a failed run: check the kernel journal for `bridge ... entered
+  disabled state` events inside the run window (they must only appear at
+  container bring-up and teardown), and the ARP monitors for the
+  requests-without-replies blackout signature. The evidence environment
+  must be quiesced (no parallel bridge lifecycle churn) for a run to count
+  toward acceptance; cross-machine runs remain the final production gate.
 - **Underlay housekeeping ARP.** The docker bridge itself occasionally
   emits ARP for container management (172.31.250.0/24). The cleartext
   check therefore asserts on the absence of *tenant-addressed*
