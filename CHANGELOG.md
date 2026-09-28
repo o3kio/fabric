@@ -88,7 +88,11 @@
   (fails against 4e246c3: pre-fix teardown returned `Ok(true)` and
   orphaned the variant) and
   `teardown_on_legacy_host_with_exact_rules_converges` (forward pin
-  for the tolerance semantics — it also passes pre-fix, by design).
+  for the tolerance semantics — it also passes pre-fix, by design);
+  round-9 added
+  `teardown_with_duplicated_exact_rule_fails_closed_state_preserved`
+  (fails against 4e246c3 the same way: a duplicated exact spec was
+  orphaned by the unguarded tolerant delete).
 - **Honest note on the `-S` token-identity assumption (MINOR,
   docs).** Contract §3.10 now states that the one-instance tolerance —
   and the round-6 tolerant deletes — compare `iptables -t nat -S`

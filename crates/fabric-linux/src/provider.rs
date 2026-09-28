@@ -5015,11 +5015,9 @@ UNCONN 0      0      0.0.0.0:53         0.0.0.0:*\n";
     /// the same logic). Against 4e246c3 (pre-round-9) this fails: the
     /// teardown ran no residue verification at all, the tolerant delete
     /// removed one instance, and teardown returned Ok(true) with the
-    /// duplicate silently orphaned — the same mechanism the round-8
-    /// the same logic). Verified empirically against 4e246c3 in a
-    /// throwaway worktree (test-only splice): teardown returned
-    /// Ok(true) and the duplicate was silently orphaned — every
-    /// assertion below fails against that behavior.
+    /// duplicate silently orphaned — every assertion below fails
+    /// against that behavior (verified empirically against 4e246c3 in
+    /// a throwaway worktree, test-only splice).
     #[test]
     fn teardown_with_duplicated_exact_rule_fails_closed_state_preserved()
     -> Result<(), Box<dyn std::error::Error>> {
