@@ -6,8 +6,16 @@ the one codebase that both [O3K](https://github.com/o3kio/o3k) and
 locations to the same VLAN: VMs in one network ARP and ping each other with
 real MACs, identically on the same hypervisor and across hypervisors.
 
-Status: **Phase 1 skeleton** — compiling, tested provider core + conformance
-kit. Not yet consumed by either product; not yet proven on real hosts.
+Status: **hardened provider, NAT-free underlay, green multi-host evidence
+gate.** The fake-kernel conformance suite and the 35-assertion multi-host
+evidence run (three real host instances — privileged containers on one
+physical kernel: real ARP/ICMP with real MACs, encrypted underlay,
+zero-leak teardown, WG socket in the root netns — the interface is
+created root-side and moved in, so its transport socket binds where the
+host's normal routing and the peers' inbound flows both reach it) pass at
+HEAD. Consumed by O3K and CHV via git tag. Cross-machine runs over real
+networks remain the final production gate (see `evidence/README.md` →
+Limitations).
 
 ## Design (one paragraph)
 
@@ -51,9 +59,11 @@ those stay per-product. O3K consumes this via `crates/o3k-network`; CHV via
         │
     vxlan <prefix>-x-<hash8>  (id <VNI>, learning ON, HER via
         │                     00:00:00:00:00:00 fdb entries → peer transport IPs)
-    wg <prefix>-wg  (transport /32s only in AllowedIPs, UDP <port>)
-        │
- underlay veth 169.254.253.1/30 ↔ .2/30 + MASQUERADE/DNAT
+    wg <prefix>-wg  (transport /32s only in AllowedIPs, UDP <port>;
+        │             created in the ROOT ns, moved into the fabric ns —
+        │             its UDP socket binds root-side, NAT-free: outbound
+        │             via the host's normal routing, inbound direct)
+ host underlay routing (root ns)
 ```
 
 ## Usage sketch
@@ -86,6 +96,14 @@ cross-host ARP/ping with real MACs, encrypted-underlay capture, zero-leak
 teardown) lives in [`evidence/`](evidence/README.md) — see
 `evidence/run-multinode.sh`. It is required before any production evidence
 claim.
+
+## Releasing
+
+Tags are lightweight and point at the **merge commit on `main`** of the PR
+being released. A release MUST bump the workspace `version` in `Cargo.toml`
+(and commit the regenerated `Cargo.lock`) and add a `CHANGELOG.md` entry in
+the same PR — v0.1.0/v0.1.1 were tagged without manifest bumps and are
+indistinguishable to version-keyed tooling; do not repeat that.
 
 ## Provenance
 

@@ -15,10 +15,15 @@
 #      VXLAN-over-WireGuard encapsulation — regression evidence for the
 #      WireGuard-MTU provider fix (contract §2.3).
 #   4. Encryption: only WireGuard UDP (port 65001) is visible on the
-#      underlay; a capture filtered for plaintext ARP/ICMP sees no
-#      tenant-addressed packets while tenant traffic flows.
+#      underlay; one combined capture in a single traffic window shows
+#      both that WG UDP flowed and that no tenant-addressed (10.42.0.0/24)
+#      packets appear in cleartext.
 #   5. Idempotent re-apply, zero-leak teardown in every host, and survival
 #      of the host keypair across fabric teardown (by design).
+#   6. WireGuard socket placement: the WG UDP socket listens in the ROOT
+#      namespace — never inside the fabric namespace (contract §3.10,
+#      the NAT-free underlay: the interface is created root-side and
+#      moved in, and the socket binds in the creating namespace).
 #
 # PREREQUISITES (orchestrator machine):
 #   - Linux with the wireguard and vxlan kernel modules available (the
@@ -78,7 +83,7 @@ log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 # record NAME true|false DETAIL — one assertion line (tsv + stdout).
 record() {
-  local name="$1" ok="$2" detail="$3"
+  local name="$1" ok="$2" detail="${3//$'\n'/ | }"
   printf '%s\t%s\t%s\n' "$name" "$ok" "$detail" >>"$RESULTS_DIR/assertions.tsv"
   if [[ "$ok" == "true" ]]; then
     log "PASS  $name — $detail"
@@ -89,7 +94,83 @@ record() {
   return 0
 }
 pass() { record "$1" true "$2"; }
-fail() { record "$1" false "$2"; }
+fail() {
+  record "$1" false "$2"
+  capture_diagnostics "$1"
+}
+
+# Post-failure diagnostics. Under the NAT-free underlay (contract §3.10)
+# the provider installs NO nat rules of its own, so the nat table's
+# packet counters are expected to show only the container runtime's own
+# chains (e.g. docker's MASQUERADE) — any rule referencing port 65001 or
+# 169.254.253.0/30 in this dump is itself a regression signal; conntrack
+# shows the tuple classification. Captured into the results dir on every
+# failure for post-mortem analysis.
+#
+# Every capture command is `|| true`-wrapped: the script runs under
+# `set -euo pipefail`, and diagnostics must never abort (or be aborted
+# mid-file) — a half-empty diagnostics file after a test failure is a
+# second, masking failure. The host-bridge file is ALWAYS written: if
+# the docker network can no longer be inspected (already torn down,
+# docker error, ...) the inspect failure is recorded IN the file and
+# the name-independent host captures still run.
+capture_diagnostics() {
+  local triggering="$1"
+  for h in "${HOSTS[@]}"; do
+    local out="$RESULTS_DIR/diag-$h.txt"
+    {
+      echo "# diagnostics after failure: $triggering"
+      echo "## iptables -t nat -L -n -v (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" iptables -t nat -L -n -v 2>&1 || true
+      echo "## wg show (fabric ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" wg show 2>&1 || true
+      echo "## conntrack entries for the fabric port (root ns view)"
+      "${DOCKER[@]}" exec "fev-$h" sh -c "grep $WG_PORT /proc/net/nf_conntrack 2>/dev/null || true" 2>&1 || true
+      echo "## ip -s link (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip -s link 2>&1 || true
+      echo "## ip neigh show (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip neigh show 2>&1 || true
+      echo "## /proc/net/arp (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" cat /proc/net/arp 2>&1 || true
+      echo "## ip neigh show (fabric ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" ip neigh show 2>&1 || true
+      echo "## 3s ARP watch on eth0 (requests and replies from this vantage)"
+      "${DOCKER[@]}" exec "fev-$h" timeout 3 tcpdump -i eth0 -n -c 40 arp 2>&1 || true
+    } >"$out" 2>&1
+  done
+  # Host-side view of the docker bridge: counters, FDB and port states —
+  # distinguishes "the request never left the container" from "the bridge
+  # never delivered it". Requires the script's sudo/root context.
+  # Resolve the bridge name best-effort; the file is written either way.
+  local bridge_id="" bridge_name="" inspect_err=""
+  if ! bridge_id="$("${DOCKER[@]}" network inspect -f '{{.Id}}' "$NET_NAME" 2>&1)"; then
+    inspect_err="$bridge_id"
+    bridge_id=""
+  else
+    bridge_name="br-${bridge_id:0:12}"
+  fi
+  {
+    echo "# host bridge diagnostics after failure: $triggering"
+    if [[ -n "$bridge_name" ]]; then
+      echo "## network $NET_NAME bridge $bridge_name (id $bridge_id)"
+      echo "## host bridge $bridge_name link stats"
+      ip -s link show "$bridge_name" 2>&1 || true
+      echo "## host bridge $bridge_name fdb"
+      bridge fdb show dev "$bridge_name" 2>&1 || true
+    else
+      echo "## ERROR: could not resolve the bridge for docker network '$NET_NAME'"
+      echo "## ERROR: docker network inspect said: $inspect_err"
+      echo "## ERROR: the per-bridge captures below are skipped; the"
+      echo "## ERROR: name-independent host captures still follow."
+    fi
+    echo "## host bridge ports (name-independent)"
+    bridge link show 2>&1 || true
+    echo "## host links (name-independent)"
+    ip -s link 2>&1 || true
+    echo "## host neigh (name-independent)"
+    ip neigh show 2>&1 || true
+  } >"$RESULTS_DIR/diag-host-bridge.txt" 2>&1
+}
 
 # docker, with sudo fallback (the script may run as a user without the
 # docker group or via `sudo bash`).
@@ -154,9 +235,18 @@ trap cleanup EXIT
 # --------------------------------------------------------------------------
 # Static musl build: the binary must run inside the containers regardless
 # of the orchestrator's glibc version.
-log "1/9 building fabric-evidence (release, static musl)"
+log "1/8 building fabric-evidence (release, static musl)"
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v runuser >/dev/null 2>&1; then
-  runuser -u "$SUDO_USER" -- cargo build --release --target x86_64-unknown-linux-musl -p fabric-evidence
+  # Root's PATH does not carry the invoking user's rustup toolchain
+  # (~/.cargo/bin), and runuser does not start a login shell: resolve
+  # cargo through a login shell of the build user and invoke it by
+  # absolute path.
+  CARGO_BIN="$(runuser -u "$SUDO_USER" -- sh -lc 'command -v cargo')" || CARGO_BIN=""
+  [[ -n "$CARGO_BIN" ]] || {
+    echo "cargo not on PATH for build user $SUDO_USER" >&2
+    exit 1
+  }
+  runuser -u "$SUDO_USER" -- "$CARGO_BIN" build --release --target x86_64-unknown-linux-musl -p fabric-evidence
 else
   cargo build --release --target x86_64-unknown-linux-musl -p fabric-evidence
 fi
@@ -165,7 +255,7 @@ fi
 # --------------------------------------------------------------------------
 # 2. docker network + image + three privileged containers
 # --------------------------------------------------------------------------
-log "2/9 creating docker network $NET_NAME ($NET_SUBNET) and containers"
+log "2/8 creating docker network $NET_NAME ($NET_SUBNET) and containers"
 if ! "${DOCKER[@]}" network inspect "$NET_NAME" >/dev/null 2>&1; then
   "${DOCKER[@]}" network create --subnet "$NET_SUBNET" "$NET_NAME" >/dev/null
 fi
@@ -190,11 +280,14 @@ rm -rf "$BUILD_DIR"
 for h in "${HOSTS[@]}"; do
   "${DOCKER[@]}" rm -f "fev-$h" >/dev/null 2>&1 || true
   # One shared workdir mount; each host uses its own state root /work/<h>.
+  # No ip_forward/rp_filter sysctls: under the NAT-free underlay the
+  # root namespace terminates the WG transport socket and hands packets
+  # to the container's normal routing — it never forwards fabric
+  # packets (contract §2.3).
   "${DOCKER[@]}" run -d --name "fev-$h" \
     --privileged \
     --network "$NET_NAME" \
     --hostname "$h" \
-    --sysctl net.ipv4.ip_forward=1 \
     -v "$BIN:/usr/local/bin/fabric-evidence:ro" \
     -v "$WORK_DIR:/work" \
     "$IMAGE" sleep infinity >/dev/null
@@ -202,23 +295,9 @@ for h in "${HOSTS[@]}"; do
 done
 
 # --------------------------------------------------------------------------
-# 3. root-namespace prerequisites in every container
+# 3. identities (public keys only — never private material)
 # --------------------------------------------------------------------------
-log "3/9 applying root-ns prerequisites (ip_forward, rp_filter)"
-for h in "${HOSTS[@]}"; do
-  # Contract §2.3 host prerequisites: forwarding between the host underlay
-  # veth and the container's external underlay happens in the root ns
-  # (the provider enables it only inside the fabric ns), and the fabric's
-  # asymmetric return path needs rp_filter tolerance.
-  hexec "$h" sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  hexec "$h" sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
-  hexec "$h" sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
-done
-
-# --------------------------------------------------------------------------
-# 4. identities (public keys only — never private material)
-# --------------------------------------------------------------------------
-log "4/9 collecting host identities"
+log "3/8 collecting host identities"
 declare -A PUBKEY
 for h in "${HOSTS[@]}"; do
   fev "$h" identity --root "/work/$h" --prefix "$PREFIX" >"$RESULTS_DIR/identity-$h.json"
@@ -240,9 +319,9 @@ done
 log "container underlay IPs: h1=${CONN_IP[h1]} h2=${CONN_IP[h2]} h3=${CONN_IP[h3]}"
 
 # --------------------------------------------------------------------------
-# 5. plan generation (on the orchestrator)
+# 4. plan generation (on the orchestrator)
 # --------------------------------------------------------------------------
-log "5/9 generating plans (vni $VNI, tenant_mtu $TENANT_MTU, fabric_mtu $FABRIC_MTU)"
+log "4/8 generating plans (vni $VNI, tenant_mtu $TENANT_MTU, fabric_mtu $FABRIC_MTU)"
 python3 - "$WORK_DIR" "$WG_PORT" "$VNI" "$NETWORK_ID" "$TENANT_MTU" "$FABRIC_MTU" \
   "${CONN_IP[h1]}" "${CONN_IP[h2]}" "${CONN_IP[h3]}" \
   "${PUBKEY[h1]}" "${PUBKEY[h2]}" "${PUBKEY[h3]}" <<'PY'
@@ -283,9 +362,9 @@ for host_id, conn_ip, pubkey, transport_ip in hosts:
 PY
 
 # --------------------------------------------------------------------------
-# 6. apply + tenant-up on every host
+# 5. apply + tenant-up on every host
 # --------------------------------------------------------------------------
-log "6/9 applying plans and bringing tenants up"
+log "5/8 applying plans and bringing tenants up"
 for h in "${HOSTS[@]}"; do
   if fev "$h" apply --root "/work/$h" --prefix "$PREFIX" --plan "/work/plan-$h.json" \
       >"$RESULTS_DIR/apply-$h.json" 2>"$RESULTS_DIR/apply-$h.stderr"; then
@@ -300,6 +379,52 @@ for h in "${HOSTS[@]}"; do
     fail "apply_$h" "fabric-evidence apply failed: $(cat "$RESULTS_DIR/apply-$h.stderr")"
     log "aborting: apply failed on $h"
     exit 1
+  fi
+done
+
+# WireGuard socket placement (regression evidence for the NAT-free
+# underlay, contract §3.10): the WG UDP socket must live in the ROOT
+# namespace — never inside the fabric namespace. A WireGuard socket
+# binds in the netns where the interface is CREATED and never follows a
+# later `ip link set netns`; the provider therefore creates the
+# interface root-side and moves it in, so the socket binds in the root
+# namespace, where outbound encrypted packets take the host's normal
+# routing (dynamic source selection, no NAT rewriting the port) and
+# inbound flows to <host-ip>:<port> reach the listener directly. ss(8)
+# lists listening UDP sockets per network namespace, so the root-ns
+# side of the invariant is directly observable; and because ss alone
+# proves only "a listener", `wg show <wg>` inside the fabric namespace
+# is additionally required to succeed and report the configured listen
+# port, proving the device (which lives in the fabric ns) owns the
+# root-ns listener.
+for h in "${HOSTS[@]}"; do
+  ns_ss="$(hexec "$h" ip netns exec "$PREFIX-fabric" ss -uln)"
+  root_ss="$(hexec "$h" ss -uln)"
+  printf '%s\n' "$ns_ss" >"$RESULTS_DIR/ss-fabric-ns-$h.txt"
+  printf '%s\n' "$root_ss" >"$RESULTS_DIR/ss-root-ns-$h.txt"
+  ns_listening="$(printf '%s\n' "$ns_ss" | grep -E ":${WG_PORT}\b" || true)"
+  root_listening="$(printf '%s\n' "$root_ss" | grep -E ":${WG_PORT}\b" || true)"
+  # ss(8) alone proves only "a listener on the port in the root
+  # namespace" — not that the listener belongs to OUR WireGuard device.
+  # Prove ownership from the device side: `wg show <wg>` inside the
+  # fabric namespace (where the device lives) must succeed and report
+  # the configured listen port.
+  wg_ns_show=""
+  if wg_ns_show="$(hexec "$h" ip netns exec "$PREFIX-fabric" wg show "$PREFIX-wg" 2>&1)"; then
+    printf '%s\n' "$wg_ns_show" >"$RESULTS_DIR/wg-show-fabric-ns-$h.txt"
+  else
+    wg_show_rc=$?
+    printf 'wg show %s exited %s\n' "$PREFIX-wg" "$wg_show_rc" \
+      >"$RESULTS_DIR/wg-show-fabric-ns-$h.txt"
+  fi
+  wg_port_reported="$(printf '%s\n' "$wg_ns_show" \
+    | grep -E "listening port: ${WG_PORT}$" || true)"
+  if [[ -z "$ns_listening" && -n "$root_listening" && -n "$wg_port_reported" ]]; then
+    pass "wg_socket_in_root_ns_$h" \
+      "WG device $PREFIX-wg reports listen port $WG_PORT in $PREFIX-fabric ns; UDP $WG_PORT listens in the root ns, not in the fabric ns"
+  else
+    fail "wg_socket_in_root_ns_$h" \
+      "root match: '${root_listening:-<none>}', ns match: '${ns_listening:-<none>}', wg-reported port: '${wg_port_reported:-<none>}'"
   fi
 done
 
@@ -318,9 +443,33 @@ for h in "${HOSTS[@]}"; do
 done
 
 # --------------------------------------------------------------------------
-# 7. evidence collection
+# 6. evidence collection
 # --------------------------------------------------------------------------
-log "7/9 collecting evidence"
+log "6/8 collecting evidence"
+
+# Continuous ARP monitor per host (root-ns eth0): the full ARP timeline —
+# requests AND replies from each vantage — is the decisive instrument for
+# underlay flap diagnosis. A snapshot cannot show whether a request ever
+# arrived at the peer or whether a reply left it. Bounded by timeout; the
+# cleanup path removes the containers (and with them the captures).
+for h in "${HOSTS[@]}"; do
+  "${DOCKER[@]}" exec "fev-$h" timeout 300 tcpdump -i eth0 -n -l arp \
+    >"$RESULTS_DIR/arp-monitor-$h.txt" 2>/dev/null &
+done
+
+# Always record neighbor (ARP) state per host: the underlay depends on
+# root-ns neighbor resolution for the WG endpoints; pass/fail comparison
+# of these tables is a primary discriminator for underlay flaps.
+for h in "${HOSTS[@]}"; do
+  {
+    echo "## ip neigh show (root ns)"
+    hexec "$h" ip neigh show 2>&1
+    echo "## /proc/net/arp (root ns)"
+    hexec "$h" cat /proc/net/arp 2>&1
+    echo "## ip neigh show (fabric ns)"
+    hexec "$h" ip netns exec "$PREFIX-fabric" ip neigh show 2>&1
+  } >"$RESULTS_DIR/neigh-$h.txt" 2>&1
+done
 
 # 7a. WireGuard handshakes (lazy: appear after first traffic — warm up).
 fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 2 --deadline 10 \
@@ -401,38 +550,38 @@ else
   fail "wg_udp_captured" "no udp packets captured on h2's underlay"
 fi
 
-# Warm h1's underlay ARP entry for h2 so the cleartext check below is not
-# polluted by docker-bridge housekeeping ARP (172.31.250.0/24).
+# Warm h1's underlay ARP entry for h2 so the capture below is not polluted
+# by docker-bridge housekeeping ARP (172.31.250.0/24).
 hexec h1 ping -c 1 -w 2 "${CONN_IP[h2]}" >/dev/null 2>&1 || true
 
-# Text capture 1: WireGuard UDP must be visible on the underlay.
-"${DOCKER[@]}" exec fev-h2 timeout 10 tcpdump -i eth0 -c 20 -l -n udp port "$WG_PORT" \
-  >"$RESULTS_DIR/tcpdump-wg-udp.txt" 2>/dev/null &
-UDP_PID=$!
-fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 5 --deadline 8 >/dev/null || true
-wait "$UDP_PID" || true
-if [[ -s "$RESULTS_DIR/tcpdump-wg-udp.txt" ]]; then
-  pass "wg_udp_visible_on_underlay" "encrypted WG UDP $WG_PORT observed on the wire"
+# Combined capture in ONE traffic window: the same packets must show
+# WireGuard UDP (port $WG_PORT) AND no tenant-addressed (10.42.0.0/24)
+# cleartext. Two separate captures could pass vacuously — the cleartext
+# capture might simply have missed the traffic window and seen nothing at
+# all. The full capture is recorded in the results dir.
+"${DOCKER[@]}" exec fev-h2 timeout 15 tcpdump -i eth0 -c 40 -l -n \
+  "udp port $WG_PORT or arp or icmp" \
+  >"$RESULTS_DIR/tcpdump-underlay-combined.txt" 2>/dev/null &
+COMBINED_PID=$!
+fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 10 --deadline 10 >/dev/null || true
+wait "$COMBINED_PID" || true
+CAPTURE="$RESULTS_DIR/tcpdump-underlay-combined.txt"
+# tcpdump line format: "... 172.31.250.x.port > 172.31.250.y.port: UDP ..."
+wg_lines="$(grep -Ec "\.${WG_PORT}:" "$CAPTURE" || true)"
+tenant_leak="$(grep -c '10\.42\.' "$CAPTURE" || true)"
+if [[ "$wg_lines" -ge 1 ]]; then
+  pass "wg_udp_visible_on_underlay" \
+    "encrypted WG UDP $WG_PORT observed on the underlay ($wg_lines capture lines)"
 else
-  fail "wg_udp_visible_on_underlay" "no WG UDP $WG_PORT seen on h2's underlay"
+  fail "wg_udp_visible_on_underlay" \
+    "no WG UDP $WG_PORT seen on h2's underlay: $(cat "$CAPTURE")"
 fi
-
-# Text capture 2: plaintext ARP/ICMP on the underlay. The fabric's tenant
-# traffic (10.42.0.0/24) must NEVER appear in cleartext; underlay control
-# ARP from the docker bridge (172.31.250.0/24) is not tenant leakage.
-"${DOCKER[@]}" exec fev-h2 timeout 10 tcpdump -i eth0 -c 10 -n 'arp or icmp' \
-  >"$RESULTS_DIR/tcpdump-cleartext.txt" 2>/dev/null &
-CLEAR_PID=$!
-fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 5 --deadline 8 >/dev/null || true
-wait "$CLEAR_PID" || true
-tenant_leak="$(grep -c '10\.42\.' "$RESULTS_DIR/tcpdump-cleartext.txt" || true)"
-total_lines="$(grep -c . "$RESULTS_DIR/tcpdump-cleartext.txt" || true)"
 if [[ "$tenant_leak" -eq 0 ]]; then
   pass "no_cleartext_tenant_traffic" \
-    "zero tenant-addressed arp/icmp packets on the underlay (capture lines: $total_lines)"
+    "zero tenant-addressed packets in the combined capture (wg lines: $wg_lines)"
 else
   fail "no_cleartext_tenant_traffic" \
-    "$tenant_leak plaintext tenant packets captured: $(cat "$RESULTS_DIR/tcpdump-cleartext.txt")"
+    "$tenant_leak plaintext tenant packets captured: $(cat "$CAPTURE")"
 fi
 
 # 7e. idempotency: replaying the same plan must create nothing.
@@ -501,16 +650,19 @@ for h in "${HOSTS[@]}"; do
 done
 
 # --------------------------------------------------------------------------
-# 8. summary
+# 7. summary
 # --------------------------------------------------------------------------
-log "8/9 writing summary"
+log "7/8 writing summary"
 python3 - "$RESULTS_DIR" <<'PY' >"$RESULTS_DIR/summary.json"
 import json, sys
 results = sys.argv[1]
 cases = []
 with open(f"{results}/assertions.tsv") as handle:
     for line in handle:
-        name, ok, detail = line.rstrip("\n").split("\t", 2)
+        parts = line.rstrip("\n").split("\t", 2)
+        if len(parts) != 3:
+            continue
+        name, ok, detail = parts
         cases.append({"name": name, "pass": ok == "true", "detail": detail})
 summary = {
     "passed": sum(1 for c in cases if c["pass"]),
@@ -520,7 +672,7 @@ summary = {
 print(json.dumps(summary, indent=2))
 PY
 
-log "9/9 assertion table"
+log "8/8 assertion table"
 echo "=================================================================="
 while IFS=$'\t' read -r name ok detail; do
   if [[ "$ok" == "true" ]]; then status="PASS"; else status="FAIL"; fi

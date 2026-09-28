@@ -54,12 +54,18 @@ impl Names {
         format!("{}-wg", self.prefix)
     }
 
-    /// The host-side underlay veth.
+    /// The legacy (v0.1.0/v0.1.1) host-side underlay veth. Never created
+    /// anymore; the name survives only for the tolerant legacy cleanup
+    /// (`ip link del <prefix>-u` — deleting the root end removes the
+    /// pair), re-rendered from the current configuration like the other
+    /// shared-fabric names.
     pub fn host_underlay_veth(&self) -> String {
         format!("{}-u", self.prefix)
     }
 
-    /// The fabric-side underlay veth.
+    /// The legacy (v0.1.0/v0.1.1) fabric-side underlay veth. Never
+    /// created anymore; deleting the host-side end removes it with the
+    /// pair, so the cleanup never names it directly.
     pub fn fabric_underlay_veth(&self) -> String {
         format!("{}-v", self.prefix)
     }

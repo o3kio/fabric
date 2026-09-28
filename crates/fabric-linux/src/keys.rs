@@ -11,9 +11,9 @@
 //!   argv;
 //! - intentionally survives fabric teardown.
 
-use std::fs::{self, File, Permissions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use fabric_plan::PublicKey;
@@ -74,19 +74,42 @@ pub fn derive_public_key(
         .map_err(|e| FabricError::Invalid(format!("derived public key is invalid: {e}")))
 }
 
-/// Atomic private write: temp file, fsync, chmod 0600, rename.
+/// Atomic private write.
+///
+/// The temp file is created with `O_CREAT|O_EXCL` and mode 0600 in one
+/// step, so it never exists with a permissive mode and cannot be
+/// pre-created (or pre-planted as a symlink) by anyone else. A stale temp
+/// left by an earlier crash is removed and the create is retried once.
+/// The file is fsynced before, and the parent directory after, the rename.
 fn atomic_write_private(path: &Path, contents: &str) -> Result<(), FabricError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    fs::set_permissions(&tmp, Permissions::from_mode(PRIVATE_KEY_MODE))?;
+    let open_exclusive = || {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_KEY_MODE)
+            .open(&tmp)
+    };
+    let mut file = match open_exclusive() {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Stale temp from an interrupted run: drop it and retry once.
+            fs::remove_file(&tmp)?;
+            open_exclusive()?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)?;
+        dir.sync_all()?;
+    }
     Ok(())
 }
 
@@ -94,6 +117,7 @@ fn atomic_write_private(path: &Path, contents: &str) -> Result<(), FabricError> 
 mod tests {
     use super::*;
     use crate::runner::RecordingRunner;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn generates_key_once_and_adopts_existing() -> Result<(), Box<dyn std::error::Error>> {
@@ -123,11 +147,51 @@ mod tests {
                 .any(|c| c.program == "wg" && c.args.first().map(String::as_str) == Some("genkey"))
         );
 
-        // Permissions are 0600.
+        // Permissions are 0600 and no temp file remains.
         let mode = fs::metadata(&key_path)?.permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        let leftovers = stale_temp_files(&root)?;
+        assert!(
+            leftovers.is_empty(),
+            "no temp files may remain: {leftovers:?}"
+        );
         cleanup(&root);
         Ok(())
+    }
+
+    #[test]
+    fn stale_temp_file_is_removed_and_write_retried() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("stale-tmp")?;
+        let key_path = root.join("wireguard-private.key");
+        // A stale temp from an interrupted run (possibly a pre-planted
+        // symlink or world-readable file) must not wedge key creation.
+        let tmp = key_path.with_extension("tmp");
+        fs::write(&tmp, "stale bytes")?;
+
+        let mut runner = RecordingRunner::new();
+        let path = ensure_private_key(&key_path, &mut runner)?;
+        assert!(path.exists());
+        assert_eq!(
+            fs::read_to_string(&key_path)?.trim(),
+            "fabric-test-private-key-material"
+        );
+        let mode = fs::metadata(&key_path)?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!tmp.exists(), "the stale temp must be gone");
+        assert!(stale_temp_files(&root)?.is_empty());
+        cleanup(&root);
+        Ok(())
+    }
+
+    fn stale_temp_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|ext| ext == "tmp") {
+                found.push(entry.path());
+            }
+        }
+        Ok(found)
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::{
 
 /// One network's stretched-L2 realization intent for one host.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StretchedL2Plan {
     /// Fabric domain this plan belongs to.
     pub fabric_domain_id: String,
@@ -91,6 +92,7 @@ impl StretchedL2Plan {
 
         let mut host_ids = BTreeSet::new();
         let mut transport_ips = BTreeSet::new();
+        let mut public_keys = BTreeSet::new();
         for peer in &self.peers {
             peer.validate()?;
             if peer.host_id == self.local_host_id {
@@ -112,6 +114,13 @@ impl StretchedL2Plan {
             if !transport_ips.insert(peer.fabric_transport_ip) {
                 return Err(PlanError::Invalid(
                     "peer list contains a duplicate fabric transport IP".to_string(),
+                ));
+            }
+            // Peers are keyed by public key during realization; a duplicate
+            // would silently drop one peer from the WireGuard set.
+            if !public_keys.insert(peer.public_key.clone()) {
+                return Err(PlanError::Invalid(
+                    "peer list contains a duplicate public key".to_string(),
                 ));
             }
         }
@@ -160,13 +169,20 @@ pub fn validate_public_key(raw: &str) -> Result<PublicKey, PlanError> {
 mod tests {
     use super::*;
 
-    fn peer(host: &str, ip: [u8; 4]) -> Result<FabricPeer, PlanError> {
+    const KEY_A: &str = "K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=";
+    const KEY_B: &str = "K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kN=";
+
+    fn peer_with_key(host: &str, ip: [u8; 4], key: &str) -> Result<FabricPeer, PlanError> {
         Ok(FabricPeer {
             host_id: host.to_string(),
-            public_key: PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=")?,
+            public_key: PublicKey::new(key)?,
             underlay_endpoint: UnderlayEndpoint::parse("198.51.100.1:65001")?,
             fabric_transport_ip: Ipv4Addr::from(ip),
         })
+    }
+
+    fn peer(host: &str, ip: [u8; 4]) -> Result<FabricPeer, PlanError> {
+        peer_with_key(host, ip, KEY_A)
     }
 
     fn plan() -> Result<StretchedL2Plan, PlanError> {
@@ -211,8 +227,40 @@ mod tests {
     #[test]
     fn rejects_duplicate_transport_ips() -> Result<(), PlanError> {
         let mut p = plan()?;
-        p.peers.push(peer("host-03", [198, 18, 0, 2])?);
+        // Distinct keys: only the transport IP is duplicated.
+        p.peers
+            .push(peer_with_key("host-03", [198, 18, 0, 2], KEY_B)?);
         assert!(p.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_public_keys() -> Result<(), PlanError> {
+        let mut p = plan()?;
+        // Distinct host and transport IP: only the public key is duplicated.
+        // Realization keys peers by public key, so a duplicate would
+        // silently drop a peer from the WireGuard set.
+        p.peers.push(peer("host-03", [198, 18, 0, 3])?);
+        assert!(p.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_json_with_unknown_field_is_rejected() -> Result<(), PlanError> {
+        let p = plan()?;
+        let mut value =
+            serde_json::to_value(&p).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        value["surprise"] = serde_json::json!(true);
+        let raw = value.to_string();
+        // Sanity: the unmodified serialization still round-trips.
+        let clean = serde_json::to_string(&p).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        let round: StretchedL2Plan =
+            serde_json::from_str(&clean).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        assert!(round == p, "plan must round-trip through JSON");
+        assert!(
+            serde_json::from_str::<StretchedL2Plan>(&raw).is_err(),
+            "plans with unknown fields must fail to deserialize"
+        );
         Ok(())
     }
 

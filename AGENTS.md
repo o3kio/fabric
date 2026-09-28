@@ -40,6 +40,6 @@ the product repos; the executable contract lives here:
 - Unit + conformance tests here run unprivileged against the recorded fake
   kernel (`RecordingRunner`).
 - Privileged multi-host evidence (three real hosts, real WireGuard
-  handshakes, cleartext-underlay capture, zero-leak teardown) is a separate
-  planned harness in this repo. It is required before any production
+  handshakes, cleartext-underlay capture, zero-leak teardown) lives in
+  `evidence/run-multinode.sh`. It is required before any production
   evidence claim; do not fake it.

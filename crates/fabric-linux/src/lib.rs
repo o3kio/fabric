@@ -1,10 +1,11 @@
 //! Linux provider for the Kubedo stretched-L2 edge fabric.
 //!
 //! This crate realizes [`fabric_plan::StretchedL2Plan`] on Linux hosts using
-//! kernel primitives only: WireGuard (authenticated/encrypted host transport),
+//! kernel primitives only: WireGuard (authenticated/encrypted host
+//! transport, created in the root namespace and moved into the fabric
+//! namespace so its UDP socket binds root-side — a NAT-free underlay),
 //! VXLAN with head-end replication and kernel MAC learning (per-network
-//! stretched L2), network namespaces, veth pairs, and bounded nftables-free
-//! host NAT rules for the underlay attachment.
+//! stretched L2), network namespaces, and veth pairs.
 //!
 //! Design properties (normative: `contracts/fabric-provider-v1.md`):
 //!
