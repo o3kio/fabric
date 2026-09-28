@@ -81,7 +81,7 @@ log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 # record NAME true|false DETAIL — one assertion line (tsv + stdout).
 record() {
-  local name="$1" ok="$2" detail="$3"
+  local name="$1" ok="$2" detail="${3//$'\n'/ | }"
   printf '%s\t%s\t%s\n' "$name" "$ok" "$detail" >>"$RESULTS_DIR/assertions.tsv"
   if [[ "$ok" == "true" ]]; then
     log "PASS  $name — $detail"
@@ -116,8 +116,34 @@ capture_diagnostics() {
       "${DOCKER[@]}" exec "fev-$h" sh -c "grep $WG_PORT /proc/net/nf_conntrack 2>/dev/null || true" 2>&1
       echo "## ip -s link (root ns)"
       "${DOCKER[@]}" exec "fev-$h" ip -s link 2>&1
+      echo "## ip neigh show (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip neigh show 2>&1
+      echo "## /proc/net/arp (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" cat /proc/net/arp 2>&1
+      echo "## ip neigh show (fabric ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" ip neigh show 2>&1
+      echo "## 3s ARP watch on eth0 (requests and replies from this vantage)"
+      "${DOCKER[@]}" exec "fev-$h" timeout 3 tcpdump -i eth0 -n -c 40 arp 2>&1
     } >"$out" 2>&1
   done
+  # Host-side view of the docker bridge: counters, FDB and port states —
+  # distinguishes "the request never left the container" from "the bridge
+  # never delivered it". Requires the script's sudo/root context.
+  local bridge_id bridge_name
+  bridge_id="$("${DOCKER[@]}" network inspect -f '{{.Id}}' "$NET_NAME" 2>/dev/null || true)"
+  if [[ -n "$bridge_id" ]]; then
+    bridge_name="br-${bridge_id:0:12}"
+    {
+      echo "## host bridge $bridge_name link stats"
+      ip -s link show "$bridge_name" 2>&1
+      echo "## host bridge $bridge_name fdb"
+      bridge fdb show dev "$bridge_name" 2>&1
+      echo "## host bridge ports"
+      bridge link show 2>&1
+      echo "## host neigh (container subnet)"
+      ip neigh show 2>&1
+    } >"$RESULTS_DIR/diag-host-bridge.txt" 2>&1
+  fi
 }
 
 # docker, with sudo fallback (the script may run as a user without the
@@ -404,6 +430,30 @@ done
 # --------------------------------------------------------------------------
 log "7/9 collecting evidence"
 
+# Continuous ARP monitor per host (root-ns eth0): the full ARP timeline —
+# requests AND replies from each vantage — is the decisive instrument for
+# underlay flap diagnosis. A snapshot cannot show whether a request ever
+# arrived at the peer or whether a reply left it. Bounded by timeout; the
+# cleanup path removes the containers (and with them the captures).
+for h in "${HOSTS[@]}"; do
+  "${DOCKER[@]}" exec "fev-$h" timeout 300 tcpdump -i eth0 -n -l arp \
+    >"$RESULTS_DIR/arp-monitor-$h.txt" 2>/dev/null &
+done
+
+# Always record neighbor (ARP) state per host: the underlay depends on
+# root-ns neighbor resolution for the WG endpoints; pass/fail comparison
+# of these tables is a primary discriminator for underlay flaps.
+for h in "${HOSTS[@]}"; do
+  {
+    echo "## ip neigh show (root ns)"
+    hexec "$h" ip neigh show 2>&1
+    echo "## /proc/net/arp (root ns)"
+    hexec "$h" cat /proc/net/arp 2>&1
+    echo "## ip neigh show (fabric ns)"
+    hexec "$h" ip netns exec "$PREFIX-fabric" ip neigh show 2>&1
+  } >"$RESULTS_DIR/neigh-$h.txt" 2>&1
+done
+
 # 7a. WireGuard handshakes (lazy: appear after first traffic — warm up).
 fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 2 --deadline 10 \
   >"$RESULTS_DIR/probe-warmup.json" || true
@@ -592,7 +642,10 @@ results = sys.argv[1]
 cases = []
 with open(f"{results}/assertions.tsv") as handle:
     for line in handle:
-        name, ok, detail = line.rstrip("\n").split("\t", 2)
+        parts = line.rstrip("\n").split("\t", 2)
+        if len(parts) != 3:
+            continue
+        name, ok, detail = parts
         cases.append({"name": name, "pass": ok == "true", "detail": detail})
 summary = {
     "passed": sum(1 for c in cases if c["pass"]),
