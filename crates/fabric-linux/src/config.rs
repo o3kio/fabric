@@ -22,6 +22,12 @@ pub const DEFAULT_UNDERLAY_FABRIC_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 253, 2)
 /// The legacy underlay attachment /30 (the MASQUERADE source operand of
 /// the v0.1.0/v0.1.1 rule the cleanup deletes).
 pub const UNDERLAY_PREFIX: &str = "169.254.253.0/30";
+/// The legacy underlay subnet signature (the /30's common prefix). Any
+/// nat-table rule referencing it is legacy underlay residue — the
+/// post-cleanup residue verification fails closed on it, because
+/// residue NAT state on the WireGuard transport is exactly the
+/// silent-death mode of the v0.1.2 postmortem.
+pub const UNDERLAY_SUBNET_TOKEN: &str = "169.254.253";
 
 /// Configuration for the Linux fabric provider.
 #[derive(Clone, Debug)]

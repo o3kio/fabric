@@ -119,6 +119,10 @@ fn cases() -> Vec<(String, Case)> {
             case_born_in_ns_journal_heals,
         ),
         (
+            "runtime_socket_placement_heals_unflagged_ns_born_wg".to_string(),
+            case_runtime_socket_placement_heals_unflagged_ns_born_wg,
+        ),
+        (
             "flood_list_has_no_duplicates_after_replays".to_string(),
             case_flood_no_duplicates_after_replays,
         ),
@@ -739,6 +743,138 @@ fn case_born_in_ns_journal_heals() -> Result<(), FabricError> {
     if flood_after != 1 {
         return Err(FabricError::Invalid(format!(
             "post-heal replays must not duplicate flood entries (saw {flood_after})"
+        )));
+    }
+    Ok(())
+}
+
+/// MAJOR-1: the socket-placement check must be a RUNTIME observation,
+/// not a journal inference. A deployment crashed between the ns-side wg
+/// re-creation and the flag write (or a hand-repaired node) presents an
+/// ns-born wg — its UDP socket bound in the fabric namespace — while
+/// the journal's `wireguard_born_in_fabric_ns` flag reads FALSE and the
+/// rest of the journal is ours. Re-apply must verify the placement from
+/// the kernel (`ss -uln` in the fabric namespace) and heal to the
+/// root-creation sequence. Pre-fix code trusted the journal flag alone
+/// and passed green over the dead ns-bound socket.
+fn case_runtime_socket_placement_heals_unflagged_ns_born_wg() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("runtime-heal")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let wg = names.wireguard_interface();
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    env.take_runner_back(provider);
+
+    // The crash residue: the wg is reborn INSIDE the namespace (socket
+    // bound there) with a listen port configured from inside — the
+    // observable listener — while the journal's born-in-ns flag stays
+    // FALSE (the crash lost the flag write).
+    let out = env
+        .runner
+        .run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
+    if !out.success {
+        env.cleanup();
+        return Err(FabricError::Command(format!(
+            "could not drop the moved wg for the case: {}",
+            out.stderr.trim()
+        )));
+    }
+    let out = env.runner.run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &ns,
+            "ip",
+            "link",
+            "add",
+            &wg,
+            "type",
+            "wireguard",
+        ],
+    )?;
+    if !out.success {
+        env.cleanup();
+        return Err(FabricError::Command(format!(
+            "could not re-create the wg inside the namespace: {}",
+            out.stderr.trim()
+        )));
+    }
+    let port = env.config.wireguard_port().to_string();
+    let out = env.runner.run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &ns,
+            "wg",
+            "set",
+            &wg,
+            "listen-port",
+            port.as_str(),
+        ],
+    )?;
+    if !out.success {
+        env.cleanup();
+        return Err(FabricError::Command(format!(
+            "could not configure the ns-born wg's listen port: {}",
+            out.stderr.trim()
+        )));
+    }
+    let flag_set = {
+        let ownership = fabric_linux::ownership::FabricOwnership::load_or_default(
+            &env.config.ownership_path(),
+        )?;
+        ownership.wireguard_born_in_fabric_ns
+    };
+    if flag_set {
+        env.cleanup();
+        return Err(FabricError::Invalid(
+            "case seeding sanity: the born-in-ns flag must be FALSE here".to_string(),
+        ));
+    }
+
+    // The healing apply, driven by the runtime observation.
+    let before = env.runner.calls().len();
+    let mut provider = env.provider()?;
+    let report = provider.apply_plan(&plan)?;
+    let flag = provider.ownership().wireguard_born_in_fabric_ns;
+    let heal_slice: Vec<String> = provider
+        .runner()
+        .calls()
+        .iter()
+        .skip(before)
+        .map(|call| call.joined())
+        .collect();
+    let created_in = provider.runner().link_created_in(&wg);
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if !heal_slice
+        .iter()
+        .any(|line| line == &format!("ip netns exec {ns} ss -uln"))
+    {
+        return Err(FabricError::Invalid(
+            "the apply must verify the socket placement from the kernel".to_string(),
+        ));
+    }
+    if !report.created_fabric {
+        return Err(FabricError::Invalid(
+            "the runtime-verified heal must re-create the WireGuard interface".to_string(),
+        ));
+    }
+    if flag {
+        return Err(FabricError::Invalid(
+            "a completed runtime-verified heal must clear the born-in-ns claim".to_string(),
+        ));
+    }
+    if created_in != Some(None) {
+        return Err(FabricError::Invalid(format!(
+            "the healed wg socket must bind in the ROOT namespace, saw {created_in:?}"
         )));
     }
     Ok(())

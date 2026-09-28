@@ -257,7 +257,21 @@ by the port collision instead).
 every apply** — rules first, with EXACTLY the rule specifications the
 old code installed (`iptables -t nat -D` only matches spec-for-spec),
 then the veth pair via its root end. Absence is this design's normal
-case, so the deletions are unconditional and idempotent. Journals
+case, so the rule deletions are unconditional and idempotent. Because
+the exact-spec deletes can silently miss operator-installed
+**variants** of the legacy rules (a DNAT with `-i eth0` instead of
+`! -i <prefix>-u`, a different address inside 169.254.253.0/30, ...),
+the nat table is LISTED after the deletes (`iptables -t nat -S`) and
+the apply **fails closed** on any residue rule that still references
+the legacy underlay signature — the 169.254.253 subnet, the
+`<prefix>-u` veth, or a DNAT targeting the WireGuard port — naming the
+residue. Residue NAT state on the transport is exactly the postmortem's
+silent-death mode; a delete that silently missed must not pass as
+cleaned. The veth deletion is likewise **ownership-gated** (the same
+discipline as the stray sweep below): on a fresh host whose journal
+owns no fabric state, a root-ns link colliding with the deterministic
+`<prefix>-u` name is foreign state and is never deleted — the veth is
+inert under this design, so not deleting it is safe. Journals
 written by v0.1.0/v0.1.1 (the `wireguard_born_in_fabric_ns` field
 absent, deserialized as `false`) already describe a root-created and
 moved WireGuard — exactly the placement mandated here — so no heal
@@ -269,32 +283,66 @@ healed by a one-time, idempotent, full procedure:
 
 1. A stray root-namespace interface of the same name is swept
    tolerantly — but **only when the journal shows the provider owns
-   (or owned) fabric state** (journal-before-mutate means a genuine
-   crash stray implies such a journal; the same gate covers this
-   design's own add→move crash window). On a fresh host (no journal) a
-   colliding root-namespace link is foreign state and is never
-   deleted; the root-side `ip link add` fails closed on the name
-   instead. One exception wedges fail-closed by design: the released
-   v0.1.0/v0.1.1 code saved the ownership journal only at the end of
-   apply, so a crash on the very first apply in the add→move window
-   leaves a stray with an empty journal — manual cleanup is the remedy
-   (no worse than the released baseline, which also wedged).
+   (or owned) fabric state**. This design closes its OWN add→move
+   crash window with a journal claim: the field
+   `fabric_creation_claimed` is persisted BEFORE the root
+   `ip link add` (journal-before-mutate), so both crash slices of the
+   create-then-move sequence converge on the next apply — a crash
+   after the claim but before the add finds the sweep gated open with
+   no stray to delete; a crash after the add but before the move finds
+   the sweep deleting our own stray. The released v0.1.0/v0.1.1 code
+   saved the ownership journal only at the end of apply, so a crash on
+   the very first apply in the add→move window still leaves a stray
+   with an empty journal — that state wedges fail-closed by design
+   (manual cleanup is the remedy; no worse than the released baseline,
+   which also wedged). On a fresh host (no journal) a colliding
+   root-namespace link is foreign state and is never deleted; the
+   root-side `ip link add` fails closed on the name instead — and the
+   fail-closed check fires BEFORE the claim is persisted, so retries
+   stay fail-closed rather than flipping into an authorized deletion.
 2. Every VXLAN recorded in the ownership journal is deleted **before**
    the namespace-scoped interface (their `dev <wg>` underlay binding
    dies with the old interface, and identity verification cannot see
    that — §3.3; each network fully heals on its own next apply). This
-   order makes every interruption slice convergent: interrupted before
-   the interface deletion, the next apply re-enters the heal and
-   finishes; interrupted after it, the next apply takes the
-   WireGuard-absent path, which recreates the interface root-side and —
-   while the flag is still set and the journal still records networks —
-   also tolerantly deletes the recorded VXLANs, the same way.
+   order makes every interruption slice of the heal convergent:
+   interrupted before any VXLAN deletion, mid-way through the VXLAN
+   deletions, after the VXLANs but before the wg deletion, after the
+   wg deletion, after the root-side re-creation, or after the
+   key/port configuration but before the flag clear — each slice
+   re-enters the heal (or the WireGuard-absent path, which recreates
+   the interface root-side and, while the flag is still set and the
+   journal still records networks, tolerantly deletes the recorded
+   VXLANs the same way) and finishes it.
 3. The namespace-scoped interface is deleted, the legacy underlay
    machinery is cleaned up, and the interface is re-created in the
    ROOT namespace, moved in, and configured with the private key and
    listen port forced.
 4. The journal flag is cleared only after the key/port configuration
    succeeds, so a crash anywhere in the heal simply re-runs it.
+
+**Runtime socket-placement verification.** The heal above triggers on
+the journal flag, but the journal can only record intent — the kernel
+is the ground truth, and two states leave an ns-bound socket with the
+flag reading false: a round-3..5 host crashed between the ns-side
+re-creation and the end-of-apply journal save, and an operator-created
+ns-born WireGuard (which no journal scheme can represent). So on every
+apply where the interface exists in the fabric namespace and no heal
+is pending, the provider verifies the placement from the kernel:
+`ip netns exec <fabric-ns> ss -uln` must NOT list a UDP listener on
+the configured WireGuard port (the match is on the port exactly —
+`0.0.0.0:<port>`, `[::]:<port>`, `*:<port>` — so a listener on 6500
+never matches a configured 65001). A listener there is positive
+evidence that the socket is ns-bound, and triggers the full heal above
+with the journal flag written BEFORE the first deletion, so every
+interruption slice of the runtime-triggered heal converges through the
+same flag path. The heal-by-deletion stays ownership-gated: on a host
+whose journal owns no fabric state, a listener on the configured port
+inside the fabric namespace is foreign state and fails closed — never
+healed by deletion. The port being absent is the healthy case (no
+heal, no state churn — a spurious heal would cost a WireGuard session
+drop); a hard failure of the `ss` command itself is NOT "port absent"
+and fails the apply closed (iproute2, which provides `ss`, is already
+a hard dependency of the provider).
 
 If an interface of the WireGuard name exists in **both** the root and
 the fabric namespace while the journal claims a healthy fabric, the
@@ -309,18 +357,22 @@ replay, WireGuard creation in the root namespace with the move into the
 fabric namespace, absence of any NAT rule for the transport, legacy
 underlay cleanup (exact-spec rule deletions plus the veth pair) on every
 apply, the born-in-fabric-namespace journal healing to the root-creation
-sequence, flood-list reconciliation without duplicates after repeated
+sequence, runtime socket-placement verification healing an unflagged
+ns-born WireGuard (an `ss -uln` listener on the transport port inside
+the fabric namespace, journal flag false, journal owned), flood-list
+reconciliation without duplicates after repeated
 replays, flood-list scoping, foreign-state rejection (including
 prefix-VNI rejection), teardown cleanliness, key non-leakage, peer
 withdrawal, and fabric-removal fencing — plus the hardening cases:
 teardown convergence after a simulated kernel restart, re-apply healing
 of partial state, flood-list shrinking, duplicate flood-entry
 convergence, and MTU/addressing re-assertion. The fake kernel
-models the real `ip`/`bridge`/`wg`/`iptables` failure and placement
+models the real `ip`/`bridge`/`wg`/`ss`/`iptables` failure and placement
 semantics (missing devices, duplicate names, missing namespaces, missing
 fdb/route entries with real kernel error strings, per-namespace link
 placement and name tables, per-namespace link-creation records — the
-WireGuard socket placement — the `Bad rule` wording of a non-matching
+WireGuard socket placement — the per-namespace listening-socket dumps of
+`ss -uln`, the `Bad rule` wording of a non-matching
 `iptables -D`, and counting fdb entries), so a permissive provider flow
 fails the suite rather than silently passing.
 

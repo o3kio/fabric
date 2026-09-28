@@ -50,29 +50,55 @@ pub struct FabricOwnership {
     /// Journal format version.
     pub state_version: u32,
     /// True once the shared fabric (netns, WireGuard) has been
-    /// configured on this host.
+    /// configured on this host. Set only AFTER the key/port
+    /// configuration succeeds (it is the create/configure flag that
+    /// guards re-forcing the private key and listen port) and saved at
+    /// the latest by the end-of-apply save — never before the
+    /// mutations it describes.
     pub fabric_configured: bool,
-    /// True while the fabric's WireGuard interface was created INSIDE
-    /// the fabric namespace — the placement the v0.1.2 underlay
-    /// redesign eliminated (a WireGuard interface's UDP socket binds
-    /// in the namespace the interface was created in and never follows
-    /// the interface; under the redesign the socket must live in the
-    /// ROOT namespace, so the interface is created root-side and moved
-    /// in). Only the unpushed round-3..5 code ever created the
-    /// interface ns-side and set this flag; such journals (dev
-    /// environments only) trigger the one-time full heal that deletes
-    /// and re-creates the interface via the root-creation sequence.
-    /// The flag is cleared once the replacement interface exists and
-    /// is fully configured (key + listen port), so a heal interrupted
-    /// anywhere simply re-runs. Journals written by v0.1.0/v0.1.1
-    /// (field absent) and by the current code parse as `false` — the
-    /// healthy value: their interfaces were already created in the
-    /// root namespace and moved in. The field is additive, so READING
-    /// is compatible in both directions (serde ignores the unknown
-    /// field in old code, `serde(default)` fills the absent field in
-    /// new code) — but round-trips through OLD code are not
-    /// format-preserving: old code parsing a new journal silently
-    /// strips the unknown flag on its next save.
+    /// True once the provider has claimed the shared fabric's
+    /// root-side WireGuard creation — written BEFORE the root
+    /// `ip link add <wg> type wireguard` (journal-before-mutate for
+    /// the creation itself). This closes this design's own add→move
+    /// crash window: a crash after the root add leaves a journal that
+    /// authorizes the root-namespace stray sweep on the next apply, so
+    /// the window converges instead of wedging on `ip link add` (name
+    /// in use). Cleared only by fabric teardown. Distinct from
+    /// `fabric_configured` on purpose: the claim marks creation INTENT
+    /// (safe to assert before the add), while `fabric_configured`
+    /// marks completed configuration (the key/port re-forcing guard —
+    /// setting it before the add would silence the recovery from a
+    /// crash between the move and the `wg set listen-port`). The field
+    /// is additive with `serde(default)`: journals written by older
+    /// code parse as `false`, and older code reading a journal that
+    /// carries it ignores (then strips) the unknown field — never a
+    /// format break.
+    #[serde(default)]
+    pub fabric_creation_claimed: bool,
+    /// True while a full WireGuard heal is pending: the fabric's
+    /// WireGuard interface was (or is positively observed to be)
+    /// created INSIDE the fabric namespace — the placement the v0.1.2
+    /// underlay redesign eliminated (a WireGuard interface's UDP
+    /// socket binds in the namespace the interface was created in and
+    /// never follows the interface; under the redesign the socket must
+    /// live in the ROOT namespace, so the interface is created
+    /// root-side and moved in). Two writers set it: the unpushed
+    /// round-3..5 code (at ns-side creation; such journals are dev
+    /// environments only) and the current code's runtime
+    /// socket-placement verification, which journals the flag BEFORE
+    /// it starts deleting an interface it has positively observed to
+    /// be ns-bound (contract §3.10) — so every interruption slice of
+    /// either heal converges. The flag is cleared once the replacement
+    /// interface exists and is fully configured (key + listen port);
+    /// a heal interrupted anywhere simply re-runs. Journals written by
+    /// v0.1.0/v0.1.1 (field absent) and by the current code parse as
+    /// `false` — the healthy value: their interfaces were already
+    /// created in the root namespace and moved in. The field is
+    /// additive, so READING is compatible in both directions (serde
+    /// ignores the unknown field in old code, `serde(default)` fills
+    /// the absent field in new code) — but round-trips through OLD
+    /// code are not format-preserving: old code parsing a new journal
+    /// silently strips the unknown flag on its next save.
     #[serde(default)]
     pub wireguard_born_in_fabric_ns: bool,
     /// WireGuard peers currently configured (union over live plans).
@@ -86,6 +112,7 @@ impl Default for FabricOwnership {
         Self {
             state_version: STATE_VERSION,
             fabric_configured: false,
+            fabric_creation_claimed: false,
             wireguard_born_in_fabric_ns: false,
             peers: Vec::new(),
             networks: BTreeMap::new(),
@@ -218,13 +245,22 @@ mod tests {
             "an old journal must parse as healthy (root-created wg placement, \
              no born-in-fabric-ns heal pending)"
         );
-        // Round-trip rewrites the journal WITH the new field (serde's
-        // default only affects deserialization), keeping the value.
+        assert!(
+            !loaded.fabric_creation_claimed,
+            "an old journal must parse with no creation claim (the claim is \
+             written only by the pre-add journal-before-mutate save)"
+        );
+        // Round-trip rewrites the journal WITH the new fields (serde's
+        // default only affects deserialization), keeping the values.
         loaded.save(&path)?;
         let raw = fs::read_to_string(&path)?;
         assert!(
             raw.contains("wireguard_born_in_fabric_ns"),
             "a saved journal must carry the new field: {raw}"
+        );
+        assert!(
+            raw.contains("fabric_creation_claimed"),
+            "a saved journal must carry the claim field: {raw}"
         );
         let reloaded = FabricOwnership::load_or_default(&path)?;
         assert!(!reloaded.wireguard_born_in_fabric_ns);

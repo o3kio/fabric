@@ -152,6 +152,13 @@ struct FakeLink {
     /// The namespace this link was CREATED in (`None` = root). Never
     /// changes after creation — like a WireGuard socket binding.
     creating_netns: Option<String>,
+    /// The WireGuard listen port configured on this link (via
+    /// `wg set <if> listen-port <p>`). A real WireGuard socket binds
+    /// in the link's CREATING namespace the moment a listen port (or
+    /// an endpoint) is configured; the fake models the listener from
+    /// `creating_netns` + this field, which is what `ss -uln` answers
+    /// per namespace.
+    listen_port: Option<u16>,
     addrs: std::collections::BTreeSet<String>,
 }
 
@@ -768,6 +775,88 @@ impl RecordingRunner {
             _ => CommandOutput::ok(),
         }
     }
+
+    /// Interpret `wg` arguments executed inside namespace `ns` (the
+    /// `ip netns exec NS wg ...` shape the provider uses):
+    /// `wg set <if> [private-key <path>] [listen-port <port>]
+    /// [peer ...]`.
+    ///
+    /// `listen-port` is recorded on the link — a real WireGuard socket
+    /// binds in the link's CREATING namespace as soon as the port is
+    /// configured, and the fake's `ss -uln` answers from exactly that
+    /// model, so a provider that misplaces the socket placement is
+    /// observable. `wg set` on a missing device fails with the real
+    /// wording. Private keys travel by file path (never argv) and are
+    /// not modeled beyond success.
+    fn wg(&mut self, ns: Option<&str>, rest: &[&str]) -> CommandOutput {
+        if rest.first() != Some(&"set") {
+            return CommandOutput::ok();
+        }
+        let Some(name) = rest.get(1) else {
+            return command_error("wg: insufficient arguments");
+        };
+        let key = ((*name).to_string(), ns.map(str::to_string));
+        let Some(link) = self.links.get_mut(&key) else {
+            return command_error(&format!(
+                "Unable to modify interface: {name}: No such device"
+            ));
+        };
+        if let Some(i) = rest.iter().position(|t| *t == "listen-port")
+            && let Some(port) = rest.get(i + 1)
+        {
+            link.listen_port = port.parse::<u16>().ok();
+        }
+        CommandOutput::ok()
+    }
+
+    /// `ss -uln` (listening UDP sockets, numeric) executed in namespace
+    /// `ns` (`None` = root): one line per WireGuard listener whose
+    /// socket is bound in that namespace.
+    ///
+    /// Answered from the socket-placement model: a WireGuard socket
+    /// binds in the namespace the link was CREATED in (`creating_netns`)
+    /// and never follows a later `ip link set netns` — so the dump of
+    /// the fabric namespace lists exactly the interfaces born INSIDE it
+    /// (the ns-bound placement the provider's runtime verification
+    /// detects), never a root-created link that was moved in. Line
+    /// shapes mirror the real ss(8) `State Recv-Q Send-Q Local
+    /// Address:Port Peer Address:Port` columns, with both the wildcard
+    /// IPv4 and bracketed IPv6 local-address forms a dual-stack bind
+    /// prints.
+    fn ss(&self, ns: Option<&str>, rest: &[&str]) -> CommandOutput {
+        // Collect the combined short flags (`-uln`, `-u -l -n`, `-lun`,
+        // ...): a substring check would miss `-l` inside `-uln`.
+        let mut flags = String::new();
+        for arg in rest {
+            if arg.starts_with('-') && !arg.starts_with("--") {
+                flags.push_str(&arg[1..]);
+            }
+        }
+        let has = |flag: char| flags.contains(flag);
+        if !(has('u') && has('l') && has('n')) {
+            return CommandOutput::ok();
+        }
+        let mut stdout =
+            String::from("State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n");
+        for link in self.links.values() {
+            if link.kind != "wireguard" {
+                continue;
+            }
+            if link.creating_netns.as_deref() != ns {
+                continue;
+            }
+            let Some(port) = link.listen_port else {
+                continue;
+            };
+            stdout.push_str(&format!("UNCONN 0      0      0.0.0.0:{port} 0.0.0.0:*\n"));
+            stdout.push_str(&format!("UNCONN 0      0      [::]:{port} [::]:*\n"));
+        }
+        CommandOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        }
+    }
 }
 
 fn parse_u32(raw: &str) -> Option<u32> {
@@ -856,6 +945,17 @@ fn is_observation(args: &[String]) -> bool {
     {
         return true;
     }
+    // `ss -uln` (namespaced: `ip netns exec NS ss -uln`; bare: program
+    // `ss`) — the runtime socket-placement observation.
+    if ip_args.first().map(String::as_str) == Some("ss") {
+        return true;
+    }
+    // `iptables -S` / `-L` dumps (any table) — the nat-residue
+    // observation. A standalone `-S`/`-L` token never appears inside a
+    // rule specification the provider issues.
+    if ip_args.iter().any(|arg| arg == "-S" || arg == "-L") {
+        return true;
+    }
     false
 }
 
@@ -889,6 +989,8 @@ impl FabricCommand for RecordingRunner {
                     match args.get(3) {
                         Some(&"ip") => return Ok(self.ip(args.get(2).copied(), &args[4..])),
                         Some(&"bridge") => return Ok(self.bridge(args.get(2).copied(), &args[4..])),
+                        Some(&"wg") => return Ok(self.wg(args.get(2).copied(), &args[4..])),
+                        Some(&"ss") => return Ok(self.ss(args.get(2).copied(), &args[4..])),
                         _ => return Ok(CommandOutput::ok()),
                     }
                 }
@@ -945,6 +1047,7 @@ impl FabricCommand for RecordingRunner {
             }
             "bridge" => Ok(self.bridge(None, args)),
             "iptables" => Ok(self.iptables(args)),
+            "ss" => Ok(self.ss(None, args)),
             _ => Ok(CommandOutput::ok()),
         }
     }
@@ -1306,6 +1409,161 @@ mod tests {
             Some(Some("nsx".to_string()))
         );
         assert_eq!(runner.link_created_in("missing"), None);
+    }
+
+    /// `wg set <if> listen-port <p>` is recorded on the link, and the
+    /// listener is observable per namespace from the socket-placement
+    /// model (`creating_netns`): `ss -uln` inside the CREATING
+    /// namespace lists the port, `ss -uln` in a namespace the link was
+    /// merely moved into does not. This is the observable the
+    /// provider's runtime socket-placement verification depends on.
+    #[test]
+    fn wg_listen_port_is_answered_by_ss_per_creating_namespace() {
+        let mut runner = RecordingRunner::new();
+        assert!(ok_or_err_out(runner.run("ip", &["netns", "add", "nsx"])).success);
+        // Root-created, configured, moved in: the socket stays
+        // root-side, so the fabric-ns dump must stay empty. (The wg is
+        // configured from inside the namespace AFTER the move — the
+        // provider's own order; `wg set` addresses the interface in
+        // the namespace it executes in.)
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "add", "wgroot", "type", "wireguard"]))
+                .success
+        );
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "set", "wgroot", "netns", "nsx"])).success
+        );
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                "nsx",
+                "wg",
+                "set",
+                "wgroot",
+                "listen-port",
+                "65001",
+            ],
+        ));
+        assert!(out.success, "wg set listen-port failed: {}", out.stderr);
+        let ns_ss = ok_or_err_out(runner.run("ip", &["netns", "exec", "nsx", "ss", "-uln"]));
+        assert!(ns_ss.success);
+        assert!(
+            !ns_ss.stdout.contains("65001"),
+            "a root-created wg moved into the ns must NOT listen there: {}",
+            ns_ss.stdout
+        );
+        let root_ss = ok_or_err_out(runner.run("ss", &["-uln"]));
+        assert!(root_ss.success);
+        assert!(
+            root_ss.stdout.contains(":65001"),
+            "the root-ns dump must list the root-bound listener: {}",
+            root_ss.stdout
+        );
+
+        // Created INSIDE the namespace and configured there: the socket
+        // binds ns-side — the ns dump lists it, the root dump does not.
+        assert!(
+            ok_or_err_out(runner.run(
+                "ip",
+                &[
+                    "netns",
+                    "exec",
+                    "nsx",
+                    "ip",
+                    "link",
+                    "add",
+                    "wgns",
+                    "type",
+                    "wireguard",
+                ],
+            ))
+            .success
+        );
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                "nsx",
+                "wg",
+                "set",
+                "wgns",
+                "listen-port",
+                "65002",
+            ],
+        ));
+        assert!(out.success, "wg set listen-port failed: {}", out.stderr);
+        let ns_ss = ok_or_err_out(runner.run("ip", &["netns", "exec", "nsx", "ss", "-uln"]));
+        assert!(
+            ns_ss.stdout.contains(":65002"),
+            "an ns-born wg must listen in its creating namespace: {}",
+            ns_ss.stdout
+        );
+        let root_ss = ok_or_err_out(runner.run("ss", &["-uln"]));
+        assert!(
+            !root_ss.stdout.contains(":65002"),
+            "an ns-born wg must NOT listen in the root ns: {}",
+            root_ss.stdout
+        );
+
+        // An unconfigured (port-less) wg listens nowhere: the ns dump
+        // still holds exactly the one ns-bound listener (two address
+        // forms) plus the header.
+        assert!(
+            ok_or_err_out(runner.run(
+                "ip",
+                &[
+                    "netns",
+                    "exec",
+                    "nsx",
+                    "ip",
+                    "link",
+                    "add",
+                    "wgbare",
+                    "type",
+                    "wireguard",
+                ],
+            ))
+            .success
+        );
+        let ns_ss = ok_or_err_out(runner.run("ip", &["netns", "exec", "nsx", "ss", "-uln"]));
+        assert_eq!(
+            ns_ss.stdout.lines().count(),
+            3, // header + the one ns-bound listener x 2 address forms
+            "only configured wireguard listeners appear: {}",
+            ns_ss.stdout
+        );
+    }
+
+    /// `wg set` on a missing device fails with the real wording — a
+    /// provider that configures a wg it never created (or lost to a
+    /// namespace change between check and set) must fail closed, not
+    /// pass vacuously.
+    #[test]
+    fn wg_set_on_a_missing_device_fails_like_the_real_wg() {
+        let mut runner = RecordingRunner::new();
+        assert!(ok_or_err_out(runner.run("ip", &["netns", "add", "nsx"])).success);
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                "nsx",
+                "wg",
+                "set",
+                "missing0",
+                "listen-port",
+                "65001",
+            ],
+        ));
+        assert!(!out.success, "wg set on a missing device must fail");
+        assert!(
+            out.stderr.contains("No such device"),
+            "real wg wording: {}",
+            out.stderr
+        );
     }
 
     /// Deleting one end of a veth pair removes BOTH ends, wherever the

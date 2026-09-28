@@ -63,6 +63,52 @@
   prerequisites: under the NAT-free underlay the root namespace terminates
   the WG transport socket and never forwards fabric packets.
 
+### Fixed (review round 6)
+- **Runtime socket-placement verification (MAJOR).** The journal can only
+  record intent; the kernel is the ground truth. On every apply where the
+  wg exists in the fabric namespace and no heal is pending, the provider
+  now runs `ip netns exec <fabric-ns> ss -uln` and fails the apply (or
+  heals) when a UDP listener sits on the configured WG port INSIDE the
+  fabric namespace — positive evidence of an ns-bound transport socket
+  (round-3..5 crash residue with the flag lost, or an operator-created
+  ns-born wg; previously such a host passed green forever on a dead
+  binding, since no NAT steers anything back to it). The heal is the same
+  full procedure as the journal-flag heal, with the flag journaled BEFORE
+  the first deletion so every interruption slice converges; it stays
+  ownership-gated (an unowned host with an ns-born listener fails closed
+  as foreign state), the port match is exact (a listener on 6500 never
+  matches 65001), and a hard failure of `ss` itself fails closed rather
+  than reading as "port absent". The healthy case (no listener) is a
+  no-op — no state churn, no WG session drop.
+- **Nat-residue verification after the tolerant legacy deletes (MINOR).**
+  After the exact-spec `iptables -t nat -D` deletions, the nat table is
+  listed and the apply fails closed on any residue rule still referencing
+  the legacy underlay signature (the 169.254.253 subnet, the `<prefix>-u`
+  veth, a DNAT targeting the WG port): exact-spec deletes silently miss
+  operator-installed VARIANTS of the legacy rules, and residue NAT state
+  on the transport is the postmortem's silent-death mode.
+- **Ownership-gated legacy veth deletion (MINOR).** The `<prefix>-u`
+  underlay veth is deleted only when the journal shows the provider owns
+  (or owned) fabric state; on a fresh host a colliding link is foreign
+  state and survives (the veth is inert under the NAT-free underlay, so
+  the apply proceeds).
+- **Creation claim before the root add (MINOR).** The new journal field
+  `fabric_creation_claimed` is persisted BEFORE the root
+  `ip link add <wg> type wireguard`, so both crash slices of the
+  add→move sequence converge on the next apply instead of the second
+  slice wedging permanently on `File exists` (empty journal → sweep
+  gated off). The v0.1.0/v0.1.1 first-apply wedge (journal saved only
+  at end of apply) remains fail-closed by design; manual cleanup.
+- Fake-kernel runner additionally models `ss -uln` per-namespace
+  listening-socket dumps (a wg listens in its creating namespace when it
+  has a listen port), `wg set listen-port` from inside a namespace, and
+  `wg set` on a missing device failing like the real wg.
+- Conformance suite gains `runtime_socket_placement_heals_unflagged_ns_born_wg`
+  (MAJOR-1 heal path); unit tests cover the heal, the healthy no-op, the
+  foreign fail-closed case, the `ss` hard-failure seam, the exact-port
+  parse, the nat-residue signatures and variant, the gated veth, the
+  claim crash slices, and the fresh-host retry guard.
+
 ### Notes
 - First tag whose `Cargo.toml` version matches the tag name. v0.1.0/v0.1.1 were
   tagged while the workspace version stayed 0.1.0; git-tag consumers (e.g. CHV)
@@ -71,6 +117,20 @@
   (the `wireguard_born_in_fabric_ns` journal field is reused with new
   semantics: `true` now marks the round-3..5 born-in-ns state needing the
   full heal; v0.1.0/v0.1.1 journals deserialize it as `false` = healthy).
+- The `fabric_creation_claimed` journal field is additive
+  (`serde(default)`): journals written by older code parse as `false`, and
+  older code reading a journal that carries it ignores the unknown field.
+- Downgrade notes: v0.1.1 reading a v0.1.2 journal parses it (serde
+  ignores the unknown `fabric_creation_claimed` /
+  `wireguard_born_in_fabric_ns` fields) but silently strips them on its
+  next save — re-upgrading then re-runs the one-time migrations (legacy
+  rule/veth cleanup, and the born-in-ns heal only if its trigger is
+  present again), which are idempotent; the only observable cost is a
+  single WireGuard session drop if the socket-placement heal trigger was
+  present. Downgrading mid-heal (a journal with
+  `wireguard_born_in_fabric_ns == true` and the wg already deleted) is
+  likewise recoverable: v0.1.1 ignores the unknown flag and re-creates
+  the wg its own way; re-upgrading cleans up after it again.
 - Contract §3.10 rewritten for the NAT-free underlay; still contract v1.
 
 ## [0.1.1] - 2026-09-28
