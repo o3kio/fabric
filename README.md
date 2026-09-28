@@ -6,8 +6,13 @@ the one codebase that both [O3K](https://github.com/o3kio/o3k) and
 locations to the same VLAN: VMs in one network ARP and ping each other with
 real MACs, identically on the same hypervisor and across hypervisors.
 
-Status: **Phase 1 skeleton** — compiling, tested provider core + conformance
-kit. Not yet consumed by either product; not yet proven on real hosts.
+Status: **hardened provider + green multi-host evidence gate.** The
+fake-kernel conformance suite and the 35-assertion multi-host evidence run
+(three real kernels via privileged docker: real ARP/ICMP with real MACs,
+encrypted underlay, zero-leak teardown, WG socket in the fabric netns) both
+pass at HEAD. Consumed by O3K and CHV via git tag. Cross-machine runs over
+real networks remain the final production gate (see `evidence/README.md` →
+Limitations).
 
 ## Design (one paragraph)
 
@@ -86,6 +91,14 @@ cross-host ARP/ping with real MACs, encrypted-underlay capture, zero-leak
 teardown) lives in [`evidence/`](evidence/README.md) — see
 `evidence/run-multinode.sh`. It is required before any production evidence
 claim.
+
+## Releasing
+
+Tags are lightweight and point at the **merge commit on `main`** of the PR
+being released. A release MUST bump the workspace `version` in `Cargo.toml`
+(and commit the regenerated `Cargo.lock`) and add a `CHANGELOG.md` entry in
+the same PR — v0.1.0/v0.1.1 were tagged without manifest bumps and are
+indistinguishable to version-keyed tooling; do not repeat that.
 
 ## Provenance
 

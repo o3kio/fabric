@@ -1,6 +1,6 @@
 # Fabric Provider Contract — v1
 
-Status: Accepted (Phase 1 skeleton)
+Status: Accepted
 
 Authors: Kubeko
 

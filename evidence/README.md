@@ -48,6 +48,7 @@ is always kept). It exits nonzero if any assertion failed.
 | `near_mtu_ping` | An ICMP payload of 1300 bytes (1328 on the wire) crosses the segment: 1328 ≤ tenant MTU 1380; encapsulated 1378 ≤ fabric MTU 1440; +60 WireGuard overhead = 1438 ≤ 1500 underlay. Regression evidence for the WireGuard-MTU fix (contract §2.3). |
 | `wg_mtu_is_1440` | The WireGuard interface carries the plan's fabric MTU (not the kernel default 1420). |
 | `wg_udp_captured`, `wg_udp_visible_on_underlay` | Encrypted WireGuard UDP (port 65001) is what is actually on the underlay wire. |
+| `wg_socket_in_fabric_ns_*` | The WireGuard UDP socket (`ss -uln`, cross-checked against `wg show`) listens **inside** the fabric netns and never in the root ns — regression evidence for the socket-placement fix (contract §3.10). |
 | `no_cleartext_tenant_traffic` | While tenant traffic flows over the fabric, an underlay capture filtered for plaintext ARP/ICMP contains **zero tenant-addressed packets**. |
 | `reapply_idempotent` | Replaying an unchanged plan creates no objects (contract §3.2). |
 | `bum_arp_reflooded` | After flushing h1's tenant neighbor table, ARP resolves again over the fabric — BUM flooding works, not just cached unicast. |
