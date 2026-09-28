@@ -99,6 +99,18 @@ JSON, `wg show`, tcpdump text captures) plus a binary pcap in the workdir
   real-internet path MTU behavior. Cross-machine runs over real networks
   remain the final production gate; this harness is the prerequisite for
   it, not a substitute.
+- **One captured-but-unresolved ARP anomaly.** In 44 acceptance-loop runs
+  (2026-09-28), exactly one run showed root-namespace ARP resolution for
+  peer underlay IPs failing for ~30s (requests left the host, replies never
+  arrived; artifacts: `evidence/results/20260928T175355Z/`). It did not
+  reproduce in 20 instrumented runs across idle and loaded host conditions,
+  host resources were clean, and no mechanism was identified. Since commit
+  4d3575c the harness permanently records per-host ARP timelines
+  (`arp-monitor-h*.txt`), neighbor tables in both namespaces, and
+  host-side bridge state on failure — any recurrence is dissectable from
+  the results dir alone. The fabric's underlay depends on root-ns ARP for
+  peers, as does any host networking; this anomaly is tracked, not
+  explained.
 - **Underlay housekeeping ARP.** The docker bridge itself occasionally
   emits ARP for container management (172.31.250.0/24). The cleartext
   check therefore asserts on the absence of *tenant-addressed*
