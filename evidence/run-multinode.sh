@@ -90,7 +90,33 @@ record() {
   return 0
 }
 pass() { record "$1" true "$2"; }
-fail() { record "$1" false "$2"; }
+fail() {
+  record "$1" false "$2"
+  capture_diagnostics "$1"
+}
+
+# Post-failure diagnostics: the nat-table packet counters discriminate
+# between "the DNAT rule never fired" (counter 0 on a host whose peer
+# reports ICMP port-unreachable) and "the rule fired but something else
+# dropped the flow"; conntrack shows the tuple classification. Captured
+# into the results dir on every failure for post-mortem analysis.
+capture_diagnostics() {
+  local triggering="$1"
+  for h in "${HOSTS[@]}"; do
+    local out="$RESULTS_DIR/diag-$h.txt"
+    {
+      echo "# diagnostics after failure: $triggering"
+      echo "## iptables -t nat -L -n -v (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" iptables -t nat -L -n -v 2>&1
+      echo "## wg show (fabric ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" wg show 2>&1
+      echo "## conntrack entries for the fabric port (root ns view)"
+      "${DOCKER[@]}" exec "fev-$h" sh -c "grep 65001 /proc/net/nf_conntrack 2>/dev/null || true" 2>&1
+      echo "## ip -s link (root ns)"
+      "${DOCKER[@]}" exec "fev-$h" ip -s link 2>&1
+    } >"$out" 2>&1
+  done
+}
 
 # docker, with sudo fallback (the script may run as a user without the
 # docker group or via `sudo bash`).
