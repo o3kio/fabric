@@ -192,7 +192,12 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     /// legacy underlay veth, legacy iptables rules) are re-rendered from
     /// the CURRENT configuration, not from the journal — so a `name_prefix`
     /// (or port) change between create and teardown leaves the
-    /// old-prefix shared objects behind. Network-scoped objects are
+    /// old-prefix WireGuard link and legacy underlay veth behind.
+    /// The old-prefix legacy NAT rules are NOT silently left behind:
+    /// they no longer match the re-rendered exact v0.1.1 specs, so they
+    /// trip the broad residue signature (§3.10) and fail BOTH apply and
+    /// teardown closed — with every kernel object still in place — until
+    /// an operator removes them. Network-scoped objects are
     /// immune: they are deleted by their journal-recorded names.
     ///
     /// Teardown enforces the SAME pre-destruction residue verification
@@ -675,10 +680,12 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     /// specification matches token for token.
     ///
     /// The residue VERIFICATION is deliberately NOT here (round-7
-    /// NIT): it runs at the START of the apply (see
-    /// [`Self::verify_no_legacy_nat_residue`]), before any destructive
-    /// action on any path — before the heal's WireGuard and
-    /// recorded-VXLAN deletions, before the root stray sweep — so a
+    /// NIT): it runs at the start of every apply AND every fabric
+    /// teardown — any path that destroys fabric state (see
+    /// [`Self::verify_no_legacy_nat_residue`]) — before any destructive
+    /// action: before the heal's WireGuard and
+    /// recorded-VXLAN deletions, before the root stray sweep, and
+    /// before the teardown's wg/ns deletions — so a
     /// residue hit fails closed with every kernel object still in
     /// place (previously the listing ran here, AFTER the heal path had
     /// already deleted the wg and the recorded VXLANs: a fail-closed
@@ -744,8 +751,9 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             ],
         )?;
         // The residue verification is NOT here (round-7 NIT): it was
-        // hoisted to the START of the apply (see
-        // verify_no_legacy_nat_residue) so a residue hit fails closed
+        // hoisted to the start of every apply AND every fabric
+        // teardown — any path that destroys fabric state (see
+        // verify_no_legacy_nat_residue) — so a residue hit fails closed
         // with every kernel object still in place — previously it ran
         // here, AFTER the heal path had already deleted the wg and the
         // recorded VXLANs. The tolerant exact-spec deletes above can
@@ -4992,6 +5000,127 @@ UNCONN 0      0      0.0.0.0:53         0.0.0.0:*\n";
         assert!(
             journal_cleared,
             "a successful teardown must clear the fabric ownership journal"
+        );
+        Ok(())
+    }
+
+    /// Round-9 NIT-3: a host holding TWO identical instances of an exact
+    /// v0.1.1 rule spec must fail teardown CLOSED — the
+    /// one-instance-per-exact-spec tolerance spends its single allowance
+    /// on the first instance, and the duplicate then hits the broad
+    /// residue signature (v0.1.0/v0.1.1 never installs a rule twice, so
+    /// a duplicate is operator-induced state and fails closed per
+    /// §3.10). This exercises the tolerance's duplicate arm on the
+    /// TEARDOWN path (the apply path and the unit matcher already cover
+    /// the same logic). Against 4e246c3 (pre-round-9) this fails: the
+    /// teardown ran no residue verification at all, the tolerant delete
+    /// removed one instance, and teardown returned Ok(true) with the
+    /// duplicate silently orphaned — the same mechanism the round-8
+    /// the same logic). Verified empirically against 4e246c3 in a
+    /// throwaway worktree (test-only splice): teardown returned
+    /// Ok(true) and the duplicate was silently orphaned — every
+    /// assertion below fails against that behavior.
+    #[test]
+    fn teardown_with_duplicated_exact_rule_fails_closed_state_preserved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("teardown-duplicate")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        provider.remove_network(&plan.network_id)?;
+        let mut runner = provider.into_runner();
+
+        // Seed the EXACT v0.1.1 MASQUERADE spec TWICE: the tolerance
+        // covers one instance; the duplicate must fail closed.
+        let masquerade: Vec<&str> = vec![
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            UNDERLAY_PREFIX,
+            "-j",
+            "MASQUERADE",
+        ];
+        for _ in 0..2 {
+            let out = runner.run("iptables", &masquerade)?;
+            assert!(
+                out.success,
+                "could not seed the duplicated exact rule: {}",
+                out.stderr
+            );
+        }
+        assert_eq!(
+            runner.iptables_rules().len(),
+            2,
+            "seeding sanity: both duplicate instances must be present"
+        );
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let result = provider.remove_fabric_if_unused();
+        let slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let wg_kept = provider.runner().has_link_in(&wg, Some(&ns));
+        let ns_kept = provider.runner().has_netns(&ns);
+        let rules_after = provider.runner().iptables_rules();
+        let journal_kept =
+            provider.ownership().fabric_configured && provider.ownership().fabric_creation_claimed;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        match result {
+            Err(FabricError::ForeignState { observed, .. }) => {
+                assert!(
+                    observed.contains("MASQUERADE"),
+                    "the error must name the duplicated residue rule: {observed}"
+                );
+            }
+            other => {
+                return Err(Box::new(FabricError::Invalid(format!(
+                    "teardown with a duplicated exact legacy rule must fail closed as \
+                     foreign state (the tolerance covers exactly one instance), got \
+                     {other:?}"
+                ))));
+            }
+        }
+        // Fail closed with state preserved: nothing deleted, both rule
+        // instances still present.
+        assert!(
+            wg_kept,
+            "the wg must survive the duplicate-residue failure (the verification must \
+             precede the teardown deletions)"
+        );
+        assert!(
+            ns_kept,
+            "the fabric namespace must survive the duplicate-residue failure"
+        );
+        assert_eq!(
+            rules_after.len(),
+            2,
+            "both duplicate instances must remain in place: {rules_after:?}"
+        );
+        assert!(
+            journal_kept,
+            "the ownership journal must survive the duplicate-residue failure untouched"
+        );
+        assert!(
+            slice.iter().any(|line| line == "iptables -t nat -S"),
+            "the teardown must run the residue verification: {slice:?}"
+        );
+        assert!(
+            !slice.iter().any(|line| line.contains(" link del ")),
+            "the duplicate-residue failure must issue no deletions at all: {slice:?}"
         );
         Ok(())
     }
