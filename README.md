@@ -6,13 +6,16 @@ the one codebase that both [O3K](https://github.com/o3kio/o3k) and
 locations to the same VLAN: VMs in one network ARP and ping each other with
 real MACs, identically on the same hypervisor and across hypervisors.
 
-Status: **hardened provider + green multi-host evidence gate.** The
-fake-kernel conformance suite and the 35-assertion multi-host evidence run
-(three real host instances — privileged containers on one physical kernel:
-real ARP/ICMP with real MACs, encrypted underlay, zero-leak teardown, WG
-socket in the fabric netns) both pass at HEAD. Consumed by O3K and CHV via
-git tag. Cross-machine runs over real networks remain the final production
-gate (see `evidence/README.md` → Limitations).
+Status: **hardened provider, NAT-free underlay, green multi-host evidence
+gate.** The fake-kernel conformance suite and the 35-assertion multi-host
+evidence run (three real host instances — privileged containers on one
+physical kernel: real ARP/ICMP with real MACs, encrypted underlay,
+zero-leak teardown, WG socket in the root netns — the interface is
+created root-side and moved in, so its transport socket binds where the
+host's normal routing and the peers' inbound flows both reach it) pass at
+HEAD. Consumed by O3K and CHV via git tag. Cross-machine runs over real
+networks remain the final production gate (see `evidence/README.md` →
+Limitations).
 
 ## Design (one paragraph)
 
@@ -56,9 +59,11 @@ those stay per-product. O3K consumes this via `crates/o3k-network`; CHV via
         │
     vxlan <prefix>-x-<hash8>  (id <VNI>, learning ON, HER via
         │                     00:00:00:00:00:00 fdb entries → peer transport IPs)
-    wg <prefix>-wg  (transport /32s only in AllowedIPs, UDP <port>)
-        │
- underlay veth 169.254.253.1/30 ↔ .2/30 + MASQUERADE/DNAT
+    wg <prefix>-wg  (transport /32s only in AllowedIPs, UDP <port>;
+        │             created in the ROOT ns, moved into the fabric ns —
+        │             its UDP socket binds root-side, NAT-free: outbound
+        │             via the host's normal routing, inbound direct)
+ host underlay routing (root ns)
 ```
 
 ## Usage sketch

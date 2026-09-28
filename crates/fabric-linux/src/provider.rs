@@ -1,12 +1,27 @@
 //! The Linux fabric provider: idempotent realization of stretched-L2 plans.
 //!
 //! Realization order (see `contracts/fabric-provider-v1.md`):
-//! validate plan -> journal plan -> ensure fabric (netns/WireGuard/underlay)
-//! -> configure peers (union over live plans) -> re-assert the WireGuard MTU
+//! validate plan -> journal plan -> ensure fabric (netns/WireGuard) ->
+//! configure peers (union over live plans) -> re-assert the WireGuard MTU
 //! (maximum fabric_mtu across live plans) -> ensure network (VXLAN +
 //! learning bridge + attachment veth + bounded HER flood list) -> save
 //! ownership. Teardown runs in reverse dependency order and preserves the
 //! WireGuard private key.
+//!
+//! Underlay design (contract §3.10, the v0.1.2 redesign): the WireGuard
+//! interface is created in the ROOT namespace and moved into the fabric
+//! namespace, so its UDP transport socket — which binds in the CREATING
+//! namespace and never follows the interface — lives in the root
+//! namespace. Outbound encrypted packets route via the host's normal
+//! routing with dynamic source selection, and inbound packets to
+//! `<host-ip>:<port>` are delivered directly to the listener. NO NAT
+//! rules exist for the transport: a MASQUERADE-remapped source port
+//! under simultaneous initiation makes the peer roam to a port nothing
+//! steers back, and a DNAT rule black-holes NEW inbound flows when the
+//! socket is elsewhere (the two races proven in the v0.1.2 postmortem).
+//! The v0.1.0/v0.1.1 underlay machinery (veth pair, 169.254.253.0/30,
+//! DNAT + MASQUERADE rules) is therefore deleted tolerantly on every
+//! apply.
 //!
 //! Reconciliation is re-assertive, not create-only: enslavement, link
 //! state, MTUs, and the local transport address are re-asserted on every
@@ -28,9 +43,7 @@ use std::path::Path;
 
 use fabric_plan::StretchedL2Plan;
 
-use crate::config::{
-    DEFAULT_UNDERLAY_FABRIC_IP, DEFAULT_UNDERLAY_HOST_IP, FabricLinuxConfig, UNDERLAY_PREFIX,
-};
+use crate::config::{DEFAULT_UNDERLAY_FABRIC_IP, FabricLinuxConfig, UNDERLAY_PREFIX};
 use crate::error::FabricError;
 use crate::keys;
 use crate::naming::Names;
@@ -54,7 +67,6 @@ pub struct ApplyReport {
 pub struct FabricReport {
     pub created_netns: bool,
     pub created_wireguard: bool,
-    pub created_underlay: bool,
 }
 
 /// The provider.
@@ -98,9 +110,7 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
 
         self.ownership.save(&self.config.ownership_path())?;
         Ok(ApplyReport {
-            created_fabric: fabric_report.created_netns
-                || fabric_report.created_wireguard
-                || fabric_report.created_underlay,
+            created_fabric: fabric_report.created_netns || fabric_report.created_wireguard,
             created_network,
         })
     }
@@ -163,8 +173,8 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     /// fabric (or lost it across a reboot) still reports `Ok(true)`.
     ///
     /// Naming caveat: the shared-fabric object names (WireGuard link,
-    /// host underlay veth, iptables rules) are re-rendered from the
-    /// CURRENT configuration, not from the journal — so a `name_prefix`
+    /// legacy underlay veth, legacy iptables rules) are re-rendered from
+    /// the CURRENT configuration, not from the journal — so a `name_prefix`
     /// (or port) change between create and teardown leaves the
     /// old-prefix shared objects behind. Network-scoped objects are
     /// immune: they are deleted by their journal-recorded names.
@@ -184,22 +194,23 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         let names = config_names(&self.config)?;
         let ns = names.fabric_namespace();
         let wg = names.wireguard_interface();
-        let host_veth = names.host_underlay_veth();
 
         // The ns-scoped deletions are skipped when the namespace is
         // already gone; the remaining deletions tolerate absent objects.
         if self.has_fabric_netns(&ns)? {
             self.ns_run_tolerant(&ns, "ip", &["link", "del", &wg])?;
         }
-        self.run_tolerant("ip", &["link", "del", host_veth.as_str()])?;
-        self.iptables_delete_underlay_rules(&host_veth)?;
+        // The legacy underlay machinery (v0.1.0/v0.1.1, and the unpushed
+        // round-3..5 code) — tolerated when already absent.
+        self.cleanup_legacy_underlay(&names)?;
         if self.has_fabric_netns(&ns)? {
             self.run_tolerant("ip", &["netns", "del", &ns])?;
         }
 
         self.ownership.fabric_configured = false;
-        // The WireGuard link is gone with the namespace; the born-in-ns
-        // claim must not outlive it (a later re-apply re-establishes it).
+        // The WireGuard link is gone with the namespace; any pending
+        // born-in-fabric-ns heal claim must not outlive it (a later
+        // re-apply creates the replacement root-side anyway).
         self.ownership.wireguard_born_in_fabric_ns = false;
         self.ownership.peers.clear();
         self.ownership.save(&self.config.ownership_path())?;
@@ -239,110 +250,35 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
 
         // WireGuard interface.
         //
-        // INVARIANT (contract §3.10): the interface MUST be created from
-        // INSIDE the fabric namespace. A WireGuard interface's UDP socket
-        // binds in the namespace the interface was CREATED in, and that
-        // binding is immutable for the interface's lifetime — moving the
-        // link into another namespace (or toggling it down/up inside the
-        // new namespace) never moves the socket. Empirically verified on
-        // kernel 6.8: `ip link add w type wireguard` in the root ns
-        // followed by `ip link set w netns <ns>` leaves the listening
-        // socket in the ROOT ns. The underlay DNAT rule then rewrites
-        // every NEW inbound UDP flow to the fabric-side underlay address
-        // — into the fabric namespace, where nothing listens — so those
-        // flows are silently black-holed (the kernel answers with a
-        // conntrack-reverse-NAT'd ICMP port-unreachable and the wg never
-        // sees the packet). Pairs survive only while a peer's outbound
-        // conntrack reply-tuple shields the flow from the NAT table,
-        // which makes the failure intermittent and timing-dependent.
+        // INVARIANT (contract §3.10, the v0.1.2 underlay redesign): the
+        // interface MUST be created in the ROOT namespace and then moved
+        // into the fabric namespace (`ip link add <wg> type wireguard`;
+        // `ip link set <wg> netns <fabric-ns>`). A WireGuard interface's
+        // UDP socket binds in the namespace the interface was CREATED in
+        // and that binding is immutable for the interface's lifetime —
+        // which under this design is exactly what we want:
+        //
+        // - Outbound: the root-ns socket routes via the host's normal
+        //   routing with dynamic source selection. No NAT rule exists,
+        //   so nothing can rewrite the flow — the peer always sees
+        //   `<host-underlay-ip>:<port>`, stable.
+        // - Inbound: `<peer>:<port> → <host-ip>:<port>` is delivered
+        //   directly to the root-ns listener.
+        //
+        // NO NAT rules may exist for the transport (see §3.10 for the
+        // two-race postmortem): a MASQUERADE-remapped source port under
+        // simultaneous initiation makes the peer roam to a port nothing
+        // steers back, and a DNAT rule black-holes every NEW inbound
+        // flow when the socket is elsewhere.
         let wg_show = self.ns_run(&ns, "ip", &["link", "show", &wg])?;
         let wg_in_ns = wg_show.success;
         let mut created_wireguard = false;
-        if !wg_in_ns {
-            // No WireGuard interface inside the fabric namespace. A stray
-            // link with our deterministic name may sit in the ROOT
-            // namespace (the legacy create-then-move sequence, crashed
-            // between add and move): it can never carry a usable socket
-            // placement for us, so it is swept tolerantly — absence is
-            // the normal case — before the interface is created inside
-            // the namespace.
-            //
-            // The sweep is gated on OWNERSHIP EVIDENCE (contract §3.10):
-            // journal-before-mutate means every object the old code ever
-            // created was preceded by an ownership-journal write, so a
-            // genuine legacy add-then-crash-before-move stray implies a
-            // journal that shows we own(ed) fabric state. ONE EXCEPTION:
-            // the released v0.1.0/v0.1.1 code saved the ownership journal
-            // only at the END of apply, so a crash on the very FIRST
-            // apply in the add→move window leaves a stray with an empty
-            // journal — that state wedges fail-closed here and on the
-            // collision check below (manual cleanup is the remedy; it is
-            // no worse than the released baseline, which also wedged).
-            // On a fresh host (no journal) a root-ns link with our
-            // deterministic name is FOREIGN state and must not be
-            // deleted here — the both-namespaces collision check in the
-            // healthy path below fails closed on it instead once the
-            // ns-scoped interface exists.
-            if self.owns_fabric_state() {
-                self.run_tolerant("ip", &["link", "del", &wg])?;
-            }
-            // Crash-window recovery for a LEGACY journal (born-in-ns
-            // flag not yet set) whose WireGuard was lost entirely —
-            // including the crash window of a heal that deleted the wg
-            // BEFORE the recorded VXLANs. Every recorded VXLAN binds
-            // `dev <wg>`, and that underlay reference died with the old
-            // interface, so the recorded VXLANs are stale even though
-            // identity verification cannot see the binding (contract
-            // §3.3): they are deleted tolerantly, by journal-recorded
-            // name, before the replacement wg exists. This apply's
-            // network re-creates its VXLAN below; other networks heal
-            // on their next apply.
-            if !self.ownership.wireguard_born_in_fabric_ns && !self.ownership.networks.is_empty() {
-                self.delete_recorded_vxlans(&ns)?;
-            }
-            self.ns_run_checked(&ns, "ip", &["link", "add", &wg, "type", "wireguard"])?;
-            created_wireguard = true;
-        } else if !self.ownership.wireguard_born_in_fabric_ns {
-            // LEGACY HEAL (one-time upgrade; contract §3.10): the wg link
-            // lives in the fabric namespace, but the journal predates the
-            // born-in-fabric-ns invariant — the interface was created in
-            // the root namespace and moved in, so its UDP socket is bound
-            // in the ROOT namespace and the creating-netns binding cannot
-            // be repaired in place. The only fix is delete + re-create
-            // from inside the namespace. Every per-network VXLAN device
-            // recorded in the ownership journal is deleted as well: the
-            // VXLANs bind `dev <wg>`, and that underlay reference breaks
-            // when the wg is deleted. This is a one-time WireGuard
-            // session drop + re-handshake on upgrade. All deletions are
-            // tolerant, so a heal interrupted anywhere simply re-runs:
-            // the flag is only set once the replacement link exists AND
-            // is fully configured below.
-            //
-            // ORDER (contract §3.10): the recorded VXLANs are deleted
-            // BEFORE the ns-scoped wg. A heal interrupted between the
-            // two then finds the wg absent with the flag still unset,
-            // and the wg-absent branch above recreates the wg AND (for
-            // a legacy journal) sweeps any recorded VXLANs the crash
-            // left behind — every interruption slice converges. The
-            // reverse order (wg first) would orphan the VXLANs forever:
-            // the wg-absent recovery would set the flag and never
-            // delete them, while identity verification keeps passing
-            // them green on a dead `dev` binding.
-            //
-            // The root-namespace sweep runs first (tolerantly): a
-            // legacy-crash stray may coexist with the ns-scoped link, and
-            // a stray that survives the heal would wedge the next apply
-            // at the both-namespaces fail-closed check.
-            self.run_tolerant("ip", &["link", "del", &wg])?;
-            self.delete_recorded_vxlans(&ns)?;
-            self.ns_run_tolerant(&ns, "ip", &["link", "del", &wg])?;
-            self.ns_run_checked(&ns, "ip", &["link", "add", &wg, "type", "wireguard"])?;
-            created_wireguard = true;
-        } else {
-            // Healthy path. Fail closed when a link with our
-            // deterministic name ALSO exists in the root namespace:
-            // that is foreign state (two interfaces, one name) —
-            // never adopted, never deleted here.
+        if wg_in_ns && !self.ownership.wireguard_born_in_fabric_ns {
+            // Healthy path: the wg lives in the fabric namespace and the
+            // journal carries no pending born-in-fabric-ns heal. Fail
+            // closed when a link with our deterministic name ALSO exists
+            // in the root namespace: that is foreign state (two
+            // interfaces, one name) — never adopted, never deleted here.
             let root_show = self.run("ip", &["link", "show", &wg])?;
             if root_show.success {
                 return Err(FabricError::ForeignState {
@@ -355,12 +291,112 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
                     ),
                 });
             }
+            // v0.1.0/v0.1.1 journals (the flag field is absent, so it
+            // deserializes as false) already carry a root-created +
+            // moved wg — the placement this design mandates — so the wg
+            // is NOT recreated; only the unconditional legacy-underlay
+            // cleanup below runs.
+            self.cleanup_legacy_underlay(&names)?;
+        } else {
+            if wg_in_ns {
+                // FULL HEAL (one-time; contract §3.10). The journal
+                // carries `wireguard_born_in_fabric_ns == true` — written
+                // only by the unpushed round-3..5 code, so this state
+                // exists in dev environments only. That code created the
+                // wg from INSIDE the fabric namespace, so its UDP socket
+                // is bound there — the placement this design eliminates.
+                // The creating-netns binding cannot be repaired in
+                // place; the only fix is delete + re-create via the
+                // root-creation sequence.
+                //
+                // The root-namespace stray sweep runs first
+                // (tolerantly): a legacy-crash stray may coexist with
+                // the ns-scoped link, and a stray that survived would
+                // wedge the recreation below at `ip link add` (name in
+                // use).
+                self.run_tolerant("ip", &["link", "del", &wg])?;
+                // ORDER (the round-5 crash-window-safe ordering,
+                // contract §3.10): every per-network VXLAN recorded in
+                // the ownership journal is deleted BEFORE the ns-scoped
+                // wg. A heal interrupted between the two then finds the
+                // wg absent with the flag still set, and the wg-absent
+                // branch below re-enters the same deletions — every
+                // interruption slice converges. The reverse order (wg
+                // first) would orphan the VXLANs forever: the wg-absent
+                // recovery would clear the flag and never delete them,
+                // while identity verification keeps passing them green
+                // on a dead `dev <wg>` binding. Each network fully
+                // heals on its own next apply (this apply's network
+                // below).
+                self.delete_recorded_vxlans(&ns)?;
+                self.ns_run_tolerant(&ns, "ip", &["link", "del", &wg])?;
+            } else {
+                // No WireGuard interface inside the fabric namespace.
+                // A stray link with our deterministic name may sit in
+                // the ROOT namespace — the crash window of THIS design's
+                // own create-then-move sequence (crashed between
+                // `ip link add` and `ip link set netns`), or the same
+                // window in the released v0.1.0/v0.1.1 code. It can
+                // never serve the fabric from there, so it is swept
+                // tolerantly — absence is the normal case — before the
+                // interface is created root-side.
+                //
+                // The sweep is gated on OWNERSHIP EVIDENCE (contract
+                // §3.10): journal-before-mutate means every object the
+                // old code ever created was preceded by an
+                // ownership-journal write, so a genuine crash stray
+                // implies a journal that shows we own(ed) fabric state.
+                // ONE EXCEPTION: the released v0.1.0/v0.1.1 code saved
+                // the ownership journal only at the END of apply, so a
+                // crash on the very FIRST apply in the add→move window
+                // leaves a stray with an empty journal — that state
+                // wedges fail-closed here and on the collision check
+                // above (manual cleanup is the remedy; it is no worse
+                // than the released baseline, which also wedged). On a
+                // fresh host (no journal) a root-ns link with our
+                // deterministic name is FOREIGN state and must not be
+                // deleted here — the `ip link add` below fails closed on
+                // it instead.
+                if self.owns_fabric_state() {
+                    self.run_tolerant("ip", &["link", "del", &wg])?;
+                }
+                // Crash-window recovery for a PENDING heal (flag still
+                // set) whose WireGuard was lost entirely — including the
+                // crash window of a heal that deleted the wg (the
+                // branch above). Every recorded VXLAN binds
+                // `dev <wg>`, and that underlay reference died with the
+                // old interface, so the recorded VXLANs are stale even
+                // though identity verification cannot see the binding
+                // (contract §3.3): they are deleted tolerantly, by
+                // journal-recorded name, before the replacement wg
+                // exists. This apply's network re-creates its VXLAN
+                // below; other networks heal on their next apply.
+                if self.ownership.wireguard_born_in_fabric_ns && !self.ownership.networks.is_empty()
+                {
+                    self.delete_recorded_vxlans(&ns)?;
+                }
+            }
+            // Legacy underlay machinery (rules first, then the veth
+            // pair) — AFTER the wg deletion in the heal path, BEFORE the
+            // recreation, and UNCONDITIONAL: every apply on every path
+            // that reaches here tolerantly deletes the v0.1.0/v0.1.1
+            // DNAT + MASQUERADE nat rules and the underlay veth pair
+            // (absence is the normal case on this design's hosts).
+            self.cleanup_legacy_underlay(&names)?;
+            // Create in the ROOT namespace, then move into the fabric
+            // namespace (the invariant above).
+            self.run_checked("ip", &["link", "add", &wg, "type", "wireguard"])?;
+            self.run_checked("ip", &["link", "set", &wg, "netns", &ns])?;
+            created_wireguard = true;
         }
 
-        // Key and listen port: on creation, the legacy heal (the fresh
+        // Key and listen port: on creation, the full heal (the fresh
         // link has no key), or the first apply after a crash that lost
         // the configured flag while the link survived. (Re-asserting
-        // these would be harmless but is not needed.)
+        // these would be harmless but is not needed.) The commands run
+        // from inside the fabric namespace — `wg set` configures the
+        // interface wherever it lives and never moves the UDP socket,
+        // which stays bound in the creating (root) namespace.
         if created_wireguard || !self.ownership.fabric_configured {
             let key_path =
                 keys::ensure_private_key(&self.config.private_key_path(), &mut self.runner)?;
@@ -371,14 +407,15 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             self.ownership.fabric_configured = true;
         }
         if created_wireguard {
-            // The interface inside the fabric namespace was born there
-            // and is now fully configured (key + listen port): record
-            // the invariant in the journal so later applies take the
-            // healthy path. Persisted immediately — after the mutation,
-            // before the rest of the apply — so a crash anywhere later
-            // still converges: with the flag unset the next apply simply
-            // re-runs the (idempotent) creation/heal.
-            self.ownership.wireguard_born_in_fabric_ns = true;
+            // The interface was created in the ROOT namespace, moved
+            // into the fabric namespace, and is now fully configured
+            // (key + listen port): clear any born-in-fabric-ns heal
+            // claim so later applies take the healthy path. Persisted
+            // immediately — after the mutation, before the rest of the
+            // apply — so a crash anywhere later still converges: with
+            // the claim still set the next apply simply re-runs the
+            // (idempotent) creation/heal.
+            self.ownership.wireguard_born_in_fabric_ns = false;
             self.ownership.save(&self.config.ownership_path())?;
         }
         // The local transport address is a mutable plan field: re-assert
@@ -393,122 +430,40 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         )?;
         self.ns_run_checked(&ns, "ip", &["link", "set", &wg, "up"])?;
 
-        // Underlay attachment veth pair.
-        let host_veth = names.host_underlay_veth();
-        let fabric_veth = names.fabric_underlay_veth();
-        let host_show = self.run("ip", &["link", "show", host_veth.as_str()])?;
-        let created_underlay = !host_show.success;
-        if created_underlay {
-            self.run_checked(
-                "ip",
-                &[
-                    "link",
-                    "add",
-                    host_veth.as_str(),
-                    "type",
-                    "veth",
-                    "peer",
-                    "name",
-                    fabric_veth.as_str(),
-                ],
-            )?;
-            self.run_checked("ip", &["link", "set", fabric_veth.as_str(), "netns", &ns])?;
-        }
-        // Addressing, link state, and the default route are re-asserted on
-        // every apply (all idempotent verbs): a crash between the pair
-        // creation and any of these steps must not leave a permanently
-        // half-plumbed underlay that re-apply reports as healthy.
-        let host_addr = format!("{}/30", DEFAULT_UNDERLAY_HOST_IP);
-        self.run_checked(
-            "ip",
-            &[
-                "addr",
-                "replace",
-                host_addr.as_str(),
-                "dev",
-                host_veth.as_str(),
-            ],
-        )?;
-        self.run_checked("ip", &["link", "set", host_veth.as_str(), "up"])?;
-        let fabric_addr = format!("{}/30", DEFAULT_UNDERLAY_FABRIC_IP);
-        self.ns_run_checked(
-            &ns,
-            "ip",
-            &[
-                "addr",
-                "replace",
-                fabric_addr.as_str(),
-                "dev",
-                fabric_veth.as_str(),
-            ],
-        )?;
-        self.ns_run_checked(&ns, "ip", &["link", "set", fabric_veth.as_str(), "up"])?;
-        let gateway = DEFAULT_UNDERLAY_HOST_IP.to_string();
-        self.ns_run_checked(
-            &ns,
-            "ip",
-            &["route", "replace", "default", "via", gateway.as_str()],
-        )?;
-        if created_underlay {
-            self.iptables_add_underlay_rules(&host_veth)?;
-            // Fabric forwarding and asymmetric-route tolerance.
-            self.ns_run_checked(&ns, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
-            let host_rp = format!("net.ipv4.conf.{}.rp_filter=0", host_veth);
-            self.run_checked("sysctl", &["-w", host_rp.as_str()])?;
-            let fabric_rp = format!("net.ipv4.conf.{}.rp_filter=0", fabric_veth);
-            self.ns_run_checked(&ns, "sysctl", &["-w", fabric_rp.as_str()])?;
-        }
-
         Ok(FabricReport {
             created_netns,
             created_wireguard,
-            created_underlay,
         })
     }
 
-    fn iptables_add_underlay_rules(&mut self, host_veth: &str) -> Result<(), FabricError> {
-        let wg_port = self.config.wireguard_port().to_string();
-        let fabric_ip = DEFAULT_UNDERLAY_FABRIC_IP.to_string();
-        self.run_checked(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-s",
-                UNDERLAY_PREFIX,
-                "-j",
-                "MASQUERADE",
-            ],
-        )?;
-        self.run_checked(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-A",
-                "PREROUTING",
-                "!",
-                "-i",
-                host_veth,
-                "-p",
-                "udp",
-                "--dport",
-                wg_port.as_str(),
-                "-j",
-                "DNAT",
-                "--to-destination",
-                fabric_ip.as_str(),
-            ],
-        )
+    /// Tolerantly delete the v0.1.0/v0.1.1 underlay machinery: the exact
+    /// DNAT and MASQUERADE nat rules and the underlay veth pair (its
+    /// root end; deleting it removes the pair and the fabric-ns routes
+    /// via it).
+    ///
+    /// UNCONDITIONAL on every apply and idempotent: absence is this
+    /// design's normal case (the rules and the veth are never created
+    /// anymore), so every deletion here is tolerant — an absent rule
+    /// (`iptables: Bad rule ...`) or device (`Cannot find device ...`)
+    /// means the desired end state is already reached. Any other
+    /// failure is a hard error (fail closed). The rule specifications
+    /// are EXACTLY the ones the v0.1.0/v0.1.1 code installed (verified
+    /// spec-for-spec against `git show v0.1.1:crates/fabric-linux/src/
+    /// provider.rs`), because `iptables -t nat -D` only hits a rule
+    /// whose specification matches token for token.
+    fn cleanup_legacy_underlay(&mut self, names: &Names) -> Result<(), FabricError> {
+        let host_veth = names.host_underlay_veth();
+        self.iptables_delete_underlay_rules(&host_veth)?;
+        // Deleting the root end removes the whole pair on a real kernel.
+        self.run_tolerant("ip", &["link", "del", host_veth.as_str()])
     }
 
     fn iptables_delete_underlay_rules(&mut self, host_veth: &str) -> Result<(), FabricError> {
         let wg_port = self.config.wireguard_port().to_string();
         let fabric_ip = DEFAULT_UNDERLAY_FABRIC_IP.to_string();
         // Tolerant: absent rules ("Bad rule ...") mean the desired end
-        // state is already reached (e.g. a rebooted kernel).
+        // state is already reached (the normal case on this design's
+        // hosts).
         self.run_tolerant(
             "iptables",
             &[
@@ -1265,7 +1220,9 @@ mod tests {
     }
 
     /// Rewrite the ownership journal in the legacy format (field absent)
-    /// — exactly the state a pre-fix deployment presents.
+    /// — exactly the state a v0.1.0/v0.1.1 deployment presents (their
+    /// code created the wg root-side and moved it in, so the placement
+    /// is already the one this design mandates).
     fn strip_born_flag(config: &FabricLinuxConfig) -> Result<(), FabricError> {
         let journal = config.ownership_path();
         let raw = fs::read_to_string(&journal)?;
@@ -1285,6 +1242,104 @@ mod tests {
             serde_json::to_string_pretty(&value)
                 .map_err(|e| FabricError::Ownership(e.to_string()))?,
         )?;
+        Ok(())
+    }
+
+    /// Force the ownership journal's `wireguard_born_in_fabric_ns` field
+    /// to `value` — `true` reproduces exactly the state the unpushed
+    /// round-3..5 code left behind (its wg was created inside the
+    /// fabric namespace, socket and all), the one-time full-heal
+    /// trigger under the NAT-free underlay.
+    fn force_born_flag(config: &FabricLinuxConfig, value: bool) -> Result<(), FabricError> {
+        let journal = config.ownership_path();
+        let raw = fs::read_to_string(&journal)?;
+        let mut parsed: FabricOwnership =
+            serde_json::from_str(&raw).map_err(|e| FabricError::Ownership(e.to_string()))?;
+        parsed.wireguard_born_in_fabric_ns = value;
+        parsed.save(&journal)?;
+        Ok(())
+    }
+
+    /// Seed the fake kernel with the exact legacy underlay machinery the
+    /// v0.1.0/v0.1.1 (and unpushed round-3..5) code installed: the
+    /// underlay veth pair with the fabric end moved into the namespace,
+    /// and the two nat rules — with EXACTLY the specifications that code
+    /// used, because `iptables -t nat -D` only hits spec-for-spec
+    /// matches.
+    fn seed_legacy_underlay(
+        runner: &mut RecordingRunner,
+        config: &FabricLinuxConfig,
+        names: &Names,
+    ) -> Result<(), FabricError> {
+        let ns = names.fabric_namespace();
+        let host_veth = names.host_underlay_veth();
+        let fabric_veth = names.fabric_underlay_veth();
+        let out = runner.run(
+            "ip",
+            &[
+                "link",
+                "add",
+                host_veth.as_str(),
+                "type",
+                "veth",
+                "peer",
+                "name",
+                fabric_veth.as_str(),
+            ],
+        )?;
+        if !out.success {
+            return Err(FabricError::Command(format!(
+                "could not seed the legacy veth pair: {}",
+                out.stderr.trim()
+            )));
+        }
+        let out = runner.run("ip", &["link", "set", fabric_veth.as_str(), "netns", &ns])?;
+        if !out.success {
+            return Err(FabricError::Command(format!(
+                "could not move the legacy fabric veth: {}",
+                out.stderr.trim()
+            )));
+        }
+        let wg_port = config.wireguard_port().to_string();
+        let fabric_ip = DEFAULT_UNDERLAY_FABRIC_IP.to_string();
+        let rules: Vec<Vec<&str>> = vec![
+            vec![
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                UNDERLAY_PREFIX,
+                "-j",
+                "MASQUERADE",
+            ],
+            vec![
+                "-t",
+                "nat",
+                "-A",
+                "PREROUTING",
+                "!",
+                "-i",
+                host_veth.as_str(),
+                "-p",
+                "udp",
+                "--dport",
+                wg_port.as_str(),
+                "-j",
+                "DNAT",
+                "--to-destination",
+                fabric_ip.as_str(),
+            ],
+        ];
+        for rule in &rules {
+            let out = runner.run("iptables", rule)?;
+            if !out.success {
+                return Err(FabricError::Command(format!(
+                    "could not seed the legacy nat rule: {}",
+                    out.stderr.trim()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1408,6 +1463,7 @@ mod tests {
         let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
         let network_id = plan.network_id.clone();
         let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
         let vxlan = names.vxlan(&network_id);
 
         let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
@@ -1422,8 +1478,12 @@ mod tests {
         // The kernel loses the fdb (e.g. the VXLAN was recreated) while
         // the journal still lists the flood peers.
         let out = runner.run(
-            "bridge",
+            "ip",
             &[
+                "netns",
+                "exec",
+                &ns,
+                "bridge",
                 "fdb",
                 "del",
                 FLOOD_MAC,
@@ -1766,17 +1826,23 @@ mod tests {
 
     // ---- CRITICAL: WireGuard socket binds in the creating namespace ----
 
-    /// Regression test for the socket-placement bug: the WireGuard
-    /// interface MUST be created from inside the fabric namespace
-    /// (`ip netns exec <ns> ip link add ...`), never created in the root
-    /// namespace and moved in — the UDP socket binds in the creating
-    /// namespace and never follows the interface, so a root-ns creation
-    /// leaves the listener outside the fabric underlay where the DNAT
-    /// rule black-holes every NEW inbound flow.
+    /// Regression test for the NAT-free underlay redesign: the WireGuard
+    /// interface MUST be created in the ROOT namespace and then moved
+    /// into the fabric namespace (`ip link add <wg> type wireguard`;
+    /// `ip link set <wg> netns <fabric-ns>`) — never created from inside
+    /// the fabric namespace. A WireGuard interface's UDP socket binds in
+    /// the namespace the interface was CREATED in and never follows the
+    /// interface; under this design the socket MUST live in the root
+    /// namespace so that (a) outbound WG packets route via the host's
+    /// normal routing with dynamic source selection and (b) inbound
+    /// packets to <host-ip>:<port> are delivered directly to the
+    /// listener. Creating the wg inside the fabric namespace (the
+    /// pre-fix behavior) binds the socket there and, with no NAT rules
+    /// in play, strands the transport.
     #[test]
-    fn wireguard_is_created_inside_the_fabric_namespace() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let root = test_root("wg-in-ns")?;
+    fn wireguard_is_created_in_the_root_namespace_and_moved_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("wg-root-create")?;
         let config = FabricLinuxConfig::new(&root);
         let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
         let names = Names::new(config.name_prefix())?;
@@ -1791,37 +1857,304 @@ mod tests {
             .iter()
             .map(|call| call.joined())
             .collect();
+        let created_in_root = provider.runner().link_created_in(&wg);
+        let placed_in_ns = provider.runner().has_link_in(&wg, Some(&ns));
         drop(provider);
 
         let _unused = fs::remove_dir_all(&root);
-        let ns_add = format!("ip netns exec {ns} ip link add {wg} type wireguard");
-        assert!(
-            joined.iter().any(|line| line == &ns_add),
-            "the WireGuard interface must be created inside the fabric namespace: {ns_add}"
-        );
+        // Created in the ROOT namespace, moved into the fabric namespace.
         let root_add = format!("ip link add {wg} type wireguard");
         assert!(
-            !joined.iter().any(|line| line == &root_add),
-            "the WireGuard interface must NOT be created in the root namespace"
+            joined.iter().any(|line| line == &root_add),
+            "the WireGuard interface must be created in the root namespace: {root_add}"
         );
-        let root_move = format!("ip link set {wg} netns {ns}");
+        let move_in = format!("ip link set {wg} netns {ns}");
         assert!(
-            !joined.iter().any(|line| line == &root_move),
-            "the WireGuard interface must NOT be moved into the fabric namespace \
-             (the socket never follows)"
+            joined.iter().any(|line| line == &move_in),
+            "the WireGuard interface must be moved into the fabric namespace: {move_in}"
+        );
+        // ...and never created from inside the fabric namespace.
+        let ns_add = format!("ip netns exec {ns} ip link add {wg} type wireguard");
+        assert!(
+            !joined.iter().any(|line| line == &ns_add),
+            "the WireGuard interface must NOT be created inside the fabric namespace \
+             (the socket binds in the creating namespace)"
+        );
+        // Fake-kernel state agrees: the socket's creating namespace is
+        // the root namespace, the link's placement is the fabric ns.
+        assert_eq!(
+            created_in_root,
+            Some(None),
+            "the wg must have been CREATED in the root namespace (socket placement)"
+        );
+        assert!(placed_in_ns, "the wg link must live in the fabric ns");
+        Ok(())
+    }
+
+    /// Regression test for the NAT-free underlay: the provider must NOT
+    /// install ANY iptables nat rule for the WireGuard transport. The
+    /// v0.1.2 postmortem proved two races that any NAT state on the
+    /// transport causes: (1) a DNAT rule black-holes every NEW inbound
+    /// flow when the socket lives in another namespace, and (2) under
+    /// simultaneous initiation the conntrack tuple collision forces
+    /// MASQUERADE to remap the source port (observed 65001 → 37414),
+    /// the peer roams to the remapped port, and nothing steers return
+    /// traffic back — the pair never recovers. The only escape is for
+    /// the outbound direction to carry NO NAT state at all.
+    #[test]
+    fn no_nat_rules_are_installed_for_the_transport() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("no-nat")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        // The only iptables commands the provider may issue are the
+        // legacy TOLERANT DELETIONS (-D); an append (-A/-I) of any nat
+        // rule is the regression.
+        let appended: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "iptables" && call.args.iter().any(|arg| arg == "-A" || arg == "-I")
+            })
+            .map(|call| call.joined())
+            .collect();
+        let rules = provider.runner().iptables_rules();
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            appended.is_empty(),
+            "the provider must not append any iptables rule: {appended:?}"
+        );
+        assert!(
+            rules.is_empty(),
+            "the fake kernel must hold no nat rules after apply: {rules:?}"
         );
         Ok(())
     }
 
-    /// A deployment running the pre-fix code has the wg link inside the
-    /// fabric namespace with its UDP socket bound in the ROOT namespace
-    /// (creating_netns is immutable), journaled without the
-    /// born-in-fabric-ns flag. Re-apply must heal: delete the wg and
-    /// every recorded VXLAN (they bind `dev <wg>`), re-create the wg
-    /// inside the namespace, force key/port configuration, and record
-    /// the flag — then a further apply is a pure no-op replay.
+    /// A host upgraded from v0.1.0/v0.1.1 (or the unpushed round-3..5
+    /// code) still carries the legacy underlay machinery: the DNAT +
+    /// MASQUERADE nat rules and the underlay veth pair. EVERY apply —
+    /// including a pure re-apply of an unchanged plan on an otherwise
+    /// healthy fabric — must tolerantly delete them, with EXACTLY the
+    /// rule specifications the old code installed (`iptables -t nat -D`
+    /// only matches spec-for-spec). Absence (a fresh host, a second
+    /// apply) is a tolerated no-op.
     #[test]
-    fn legacy_wireguard_socket_placement_is_healed() -> Result<(), Box<dyn std::error::Error>> {
+    fn legacy_underlay_rules_and_veth_are_removed_on_every_apply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("legacy-cleanup")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let host_veth = names.host_underlay_veth();
+        let fabric_veth = names.fabric_underlay_veth();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        // Seed the legacy machinery exactly as the old code left it.
+        {
+            let mut runner = provider.into_runner();
+            seed_legacy_underlay(&mut runner, &config, &names)?;
+            let seeded_rules = runner.iptables_rules();
+            let seeded_veth = runner.has_link(host_veth.as_str());
+            assert_eq!(
+                seeded_rules.len(),
+                2,
+                "seeding sanity: both legacy nat rules must be present"
+            );
+            assert!(seeded_veth, "seeding sanity: the legacy veth must exist");
+            provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        }
+
+        // A pure re-apply (unchanged plan, healthy fabric) must still
+        // remove the legacy machinery.
+        let before = provider.runner().calls().len();
+        let report = provider.apply_plan(&plan)?;
+        let slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let rules_gone = provider.runner().iptables_rules().is_empty();
+        let veth_gone = !provider.runner().has_link(host_veth.as_str())
+            && !provider.runner().has_link(fabric_veth.as_str());
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            !report.created_fabric && !report.created_network,
+            "the cleanup re-apply must not re-create anything"
+        );
+        // The EXACT v0.1.1 rule specifications, deleted spec-for-spec.
+        let masq_del = format!("iptables -t nat -D POSTROUTING -s {UNDERLAY_PREFIX} -j MASQUERADE");
+        assert!(
+            slice.iter().any(|line| line == &masq_del),
+            "the MASQUERADE rule must be deleted with its exact spec: {masq_del}"
+        );
+        let dnat_del = format!(
+            "iptables -t nat -D PREROUTING ! -i {host_veth} -p udp --dport 65001 \
+             -j DNAT --to-destination {}",
+            DEFAULT_UNDERLAY_FABRIC_IP
+        );
+        assert!(
+            slice.iter().any(|line| line == &dnat_del),
+            "the DNAT rule must be deleted with its exact spec: {dnat_del}"
+        );
+        // The veth pair goes via its root end.
+        let veth_del = format!("ip link del {host_veth}");
+        assert!(
+            slice.iter().any(|line| line == &veth_del),
+            "the underlay veth pair must be deleted via its root end: {veth_del}"
+        );
+        assert!(rules_gone, "no legacy nat rule may survive the apply");
+        assert!(veth_gone, "neither end of the underlay veth may survive");
+        Ok(())
+    }
+
+    /// A v0.1.0/v0.1.1 journal (the born flag field is absent) already
+    /// carries a root-created + moved WireGuard — exactly the placement
+    /// this design mandates — so the wg must NOT be recreated: no
+    /// deletion, no creation, no key/port forcing. Only the
+    /// unconditional legacy rule/veth cleanup runs. (The pre-fix code
+    /// treated this journal as needing a heal into the fabric
+    /// namespace and deleted + recreated the wg.)
+    #[test]
+    fn legacy_journal_does_not_recreate_the_root_created_wireguard()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("legacy-keep")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let vxlan = names.vxlan(&plan.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        let runner = provider.into_runner();
+
+        // Rewrite the ownership journal in the legacy format (field
+        // absent): exactly the state a v0.1.0/v0.1.1 deployment presents.
+        strip_born_flag(&config)?;
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let report = provider.apply_plan(&plan)?;
+        let slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let wg_kept = provider.runner().has_link_in(&wg, Some(&ns));
+        let vxlan_kept = provider.runner().has_link(&vxlan);
+        let flag = provider.ownership().wireguard_born_in_fabric_ns;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            !report.created_fabric,
+            "a legacy journal must not re-create the (already root-created) wg"
+        );
+        assert!(
+            !slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {wg}")),
+            "the wg must not be deleted"
+        );
+        assert!(
+            !slice
+                .iter()
+                .any(|line| line.contains(&format!("link add {wg}"))),
+            "the wg must not be recreated: {slice:?}"
+        );
+        assert!(
+            !slice.iter().any(
+                |line| line.starts_with(&format!("ip netns exec {ns} wg set {wg} private-key"))
+            ),
+            "key/port must not be forced on a wg that already carries them"
+        );
+        assert!(
+            !slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} wg set {wg} listen-port 65001")),
+            "the listen port must not be forced on a configured wg"
+        );
+        assert!(wg_kept, "the wg must survive untouched");
+        assert!(vxlan_kept, "the recorded vxlan must survive (no heal)");
+        assert!(!flag, "no born-in-ns claim may appear");
+        // The unconditional legacy cleanup still ran.
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip link del {}", names.host_underlay_veth())),
+            "the legacy veth cleanup must still run"
+        );
+        Ok(())
+    }
+
+    /// Swap the fabric-ns WireGuard for one CREATED inside the namespace
+    /// — reproducing the link the unpushed round-3..5 code left behind,
+    /// whose UDP socket is bound in the fabric namespace (a WireGuard
+    /// socket binds in its creating namespace for life and never
+    /// follows the interface). Used by the born-in-ns heal scenarios.
+    fn reborn_wg_in_ns(runner: &mut RecordingRunner, names: &Names) -> Result<(), FabricError> {
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
+        if !out.success {
+            return Err(FabricError::Command(format!(
+                "could not drop the moved wg for the test: {}",
+                out.stderr.trim()
+            )));
+        }
+        let out = runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &ns,
+                "ip",
+                "link",
+                "add",
+                &wg,
+                "type",
+                "wireguard",
+            ],
+        )?;
+        if !out.success {
+            return Err(FabricError::Command(format!(
+                "could not re-create the wg inside the namespace: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// A deployment running the unpushed round-3..5 code presents the
+    /// one-time full-heal state: the wg link sits inside the fabric
+    /// namespace with its UDP socket bound THERE (creating_netns is
+    /// immutable), the journal carries `wireguard_born_in_fabric_ns ==
+    /// true`, and the legacy underlay machinery (DNAT + MASQUERADE
+    /// rules, underlay veth) is still installed. Re-apply must heal:
+    /// sweep a possible root-ns stray, delete every recorded VXLAN
+    /// BEFORE the ns-scoped wg (crash-window ordering), delete the
+    /// ns-scoped wg, clean up the legacy rules + veth, re-create the wg
+    /// in the ROOT namespace and move it in, force key/port, and clear
+    /// the flag. The other network's VXLAN heals on its own next apply,
+    /// and a further apply is a pure no-op replay (modulo the
+    /// unconditional legacy cleanup).
+    #[test]
+    fn born_in_fabric_ns_journal_is_healed_to_root_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = test_root("wg-heal")?;
         let config = FabricLinuxConfig::new(&root);
         let plan_a = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
@@ -1829,18 +2162,26 @@ mod tests {
         let names = Names::new(config.name_prefix())?;
         let ns = names.fabric_namespace();
         let wg = names.wireguard_interface();
+        let host_veth = names.host_underlay_veth();
         let vxlan_a = names.vxlan(&plan_a.network_id);
         let vxlan_b = names.vxlan(&plan_b.network_id);
 
         let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
         provider.apply_plan(&plan_a)?;
         provider.apply_plan(&plan_b)?;
-        assert!(provider.ownership().wireguard_born_in_fabric_ns);
-        let runner = provider.into_runner();
+        assert!(
+            !provider.ownership().wireguard_born_in_fabric_ns,
+            "sanity: the new code journals no heal claim"
+        );
+        let mut runner = provider.into_runner();
 
-        // Rewrite the ownership journal in the legacy format (field
-        // absent): exactly the state a pre-fix deployment presents.
-        strip_born_flag(&config)?;
+        // Reproduce the round-3..5 residue: an ns-born wg (socket bound
+        // in the fabric namespace), the heal-pending flag, and the
+        // legacy underlay machinery.
+        reborn_wg_in_ns(&mut runner, &names)?;
+        force_born_flag(&config, true)?;
+        seed_legacy_underlay(&mut runner, &config, &names)?;
+        assert_eq!(runner.link_created_in(&wg), Some(Some(ns.clone())));
 
         // Healing apply of net-a.
         let before_heal = runner.calls().len();
@@ -1863,49 +2204,16 @@ mod tests {
             heal_report.created_fabric,
             "the heal re-creates the WireGuard interface"
         );
-        assert!(healed_flag, "the journal must record the heal");
-        // The wg is deleted (namespace-scoped, plus the root-ns stray
-        // sweep) and re-created INSIDE the namespace.
         assert!(
-            heal_slice
-                .iter()
-                .any(|line| line == &format!("ip netns exec {ns} ip link del {wg}")),
-            "the heal must delete the legacy wg inside the namespace"
+            !healed_flag,
+            "a completed heal must clear the born-in-ns claim"
         );
-        assert!(
-            heal_slice
-                .iter()
-                .any(|line| line == &format!("ip link del {wg}")),
-            "the heal must sweep a possible root-ns stray first"
-        );
-        assert!(
-            heal_slice
-                .iter()
-                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
-            "the heal must re-create the wg inside the namespace"
-        );
-        // Every recorded VXLAN is deleted (they bind dev <wg>); the
-        // applied network's VXLAN is re-created in the same apply.
-        assert!(
-            heal_slice
-                .iter()
-                .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_a}")),
-            "the heal must delete the applied network's vxlan"
-        );
-        assert!(
-            heal_slice
-                .iter()
-                .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_b}")),
-            "the heal must delete every recorded vxlan, not just the applied one"
-        );
-        // MAJOR-1: the recorded VXLANs must be deleted BEFORE the
-        // ns-scoped wg. With the reverse (pre-fix) order, a crash
-        // between the wg delete and the VXLAN deletes orphans the VXLANs
-        // forever: the wg-absent recovery sets the flag and never
-        // deletes them, while identity verification keeps passing them
-        // green on a dead `dev <wg>` binding.
+        // ORDER (crash-window convergence, contract §3.10): the
+        // root-ns stray sweep runs first (a stray would wedge the
+        // recreation at `ip link add`)...
         let index_of = |needle: &str| heal_slice.iter().position(|line| line == needle);
-        let (Some(wg_del_at), Some(vxlan_a_at), Some(vxlan_b_at)) = (
+        let (Some(root_sweep_at), Some(wg_del_at), Some(vxlan_a_at), Some(vxlan_b_at)) = (
+            index_of(&format!("ip link del {wg}")),
             index_of(&format!("ip netns exec {ns} ip link del {wg}")),
             index_of(&format!("ip netns exec {ns} ip link del {vxlan_a}")),
             index_of(&format!("ip netns exec {ns} ip link del {vxlan_b}")),
@@ -1915,21 +2223,68 @@ mod tests {
             )));
         };
         assert!(
+            root_sweep_at < vxlan_a_at && root_sweep_at < vxlan_b_at,
+            "the root-ns stray sweep must run before the recorded-vxlan deletes"
+        );
+        // ...then every recorded VXLAN is deleted BEFORE the ns-scoped
+        // wg. With the reverse order, a crash between the wg delete and
+        // the VXLAN deletes orphans the VXLANs forever: the wg-absent
+        // recovery would clear the flag and never delete them, while
+        // identity verification keeps passing them green on a dead
+        // `dev <wg>` binding.
+        assert!(
             vxlan_a_at < wg_del_at && vxlan_b_at < wg_del_at,
-            "the recorded vxlans must be deleted before the ns-scoped wg \
-             (crash-window convergence, contract §3.10)"
+            "the recorded vxlans must be deleted before the ns-scoped wg"
+        );
+        // ...and the wg is re-created in the ROOT namespace and moved
+        // in, never from inside the fabric namespace.
+        let (Some(root_add_at), Some(move_at)) = (
+            index_of(&format!("ip link add {wg} type wireguard")),
+            index_of(&format!("ip link set {wg} netns {ns}")),
+        ) else {
+            return Err(Box::new(FabricError::Invalid(
+                "the heal must re-create the wg root-side and move it in".to_string(),
+            )));
+        };
+        assert!(
+            wg_del_at < root_add_at,
+            "the ns wg dies before the recreation"
+        );
+        assert!(root_add_at < move_at, "the root add precedes the move");
+        assert!(
+            !heal_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
+            "the heal must NOT re-create the wg inside the fabric namespace"
+        );
+        // The legacy machinery goes in the same apply, with the EXACT
+        // v0.1.1 rule specifications.
+        let masq_del = format!("iptables -t nat -D POSTROUTING -s {UNDERLAY_PREFIX} -j MASQUERADE");
+        assert!(
+            heal_slice.iter().any(|line| line == &masq_del),
+            "the heal must delete the legacy MASQUERADE rule: {masq_del}"
+        );
+        let dnat_del = format!(
+            "iptables -t nat -D PREROUTING ! -i {host_veth} -p udp --dport 65001 \
+             -j DNAT --to-destination {}",
+            DEFAULT_UNDERLAY_FABRIC_IP
         );
         assert!(
-            heal_slice.iter().any(|line| line.contains(&format!(
-                "ip netns exec {ns} ip link add {vxlan_a} type vxlan"
-            ))),
-            "the applied network's vxlan must be re-created in the same apply"
+            heal_slice.iter().any(|line| line == &dnat_del),
+            "the heal must delete the legacy DNAT rule: {dnat_del}"
         );
         assert!(
-            vxlan_b_gone,
-            "the other network's vxlan heals on its own next apply, not this one"
+            heal_slice
+                .iter()
+                .any(|line| line == &format!("ip link del {host_veth}")),
+            "the heal must delete the legacy underlay veth pair"
         );
-        // The fresh link has no key: key and listen port are forced.
+        assert!(
+            provider.runner().iptables_rules().is_empty(),
+            "no legacy nat rule may survive the heal"
+        );
+        // The fresh link has no key: key and listen port are forced
+        // (from inside the namespace — `wg set` never moves the socket).
         assert!(
             heal_slice.iter().any(
                 |line| line.starts_with(&format!("ip netns exec {ns} wg set {wg} private-key"))
@@ -1942,10 +2297,29 @@ mod tests {
                 .any(|line| line == &format!("ip netns exec {ns} wg set {wg} listen-port 65001")),
             "the heal must re-configure the listen port"
         );
+        // The applied network's VXLAN is re-created in the same apply;
+        // the other network's heals on its own next apply.
+        assert!(
+            heal_slice.iter().any(|line| line.contains(&format!(
+                "ip netns exec {ns} ip link add {vxlan_a} type vxlan"
+            ))),
+            "the applied network's vxlan must be re-created in the same apply"
+        );
+        assert!(
+            vxlan_b_gone,
+            "the other network's vxlan heals on its own next apply, not this one"
+        );
         assert_eq!(
             flood_a, 1,
             "the re-created vxlan's flood list must be rebuilt exactly once"
         );
+        // The replacement wg is root-born: its socket binds root-side.
+        assert_eq!(
+            provider.runner().link_created_in(&wg),
+            Some(None),
+            "the healed wg must have been CREATED in the root namespace"
+        );
+        assert!(provider.runner().has_link_in(&wg, Some(&ns)));
 
         // The other network converges on its next apply.
         let before_b = provider.runner().calls().len();
@@ -1973,8 +2347,10 @@ mod tests {
             "net-b's flood list must be rebuilt exactly once"
         );
 
-        // After the heal, an unchanged-plan apply is a pure no-op replay:
-        // no object creation, no deletion, no duplicate flood entries.
+        // After the heal, an unchanged-plan apply is a pure no-op
+        // replay — modulo the UNCONDITIONAL legacy cleanup, whose
+        // tolerant deletions (`iptables -t nat -D ...`, `ip link del
+        // <host-veth>`) run on every apply by design.
         let before_replay = provider.runner().calls().len();
         let replay_report = provider.apply_plan(&plan_a)?;
         let replay_slice: Vec<String> = provider
@@ -2000,21 +2376,52 @@ mod tests {
             "post-heal replay must not create links: {replay_slice:?}"
         );
         assert!(
-            !replay_slice.iter().any(|line| line.contains(" link del ")),
-            "post-heal replay must not delete links: {replay_slice:?}"
+            !replay_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {wg}")),
+            "post-heal replay must not delete the wg"
+        );
+        assert!(
+            !replay_slice
+                .iter()
+                .any(|line| line == &format!("ip link del {wg}")),
+            "post-heal replay must not run the root-ns stray sweep"
+        );
+        assert!(
+            !replay_slice.iter().any(
+                |line| line.starts_with(&format!("ip netns exec {ns} wg set {wg} private-key"))
+            ),
+            "post-heal replay must not force the private key"
+        );
+        assert!(
+            !replay_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} wg set {wg} listen-port 65001")),
+            "post-heal replay must not force the listen port"
+        );
+        // The unconditional legacy cleanup DID run (tolerated no-ops).
+        assert!(
+            replay_slice
+                .iter()
+                .any(|line| line == &format!("ip link del {host_veth}")),
+            "the unconditional legacy veth cleanup runs on every replay"
         );
         assert_eq!(
             flood_a_after, 1,
             "post-heal replays must not duplicate flood entries"
         );
-        assert!(flag_after);
+        assert!(!flag_after);
         Ok(())
     }
 
-    /// The legacy create-then-move sequence crashed between add and move:
-    /// a stray WireGuard link with our deterministic name sits in the
-    /// ROOT namespace and the fabric namespace has none. Apply must
-    /// clear the stray and create the interface inside the namespace.
+    /// The crash window of THIS design's own create-then-move sequence
+    /// (crashed between `ip link add` and `ip link set netns` — the
+    /// same window the released v0.1.0/v0.1.1 code had): a stray
+    /// WireGuard link with our deterministic name sits in the ROOT
+    /// namespace while the fabric namespace has none. With ownership
+    /// evidence in the journal (journal-before-mutate means a genuine
+    /// crash stray implies it), apply must sweep the stray tolerantly
+    /// and then run the root-create + move sequence.
     #[test]
     fn stray_root_namespace_wireguard_is_swept_on_create() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -2025,19 +2432,28 @@ mod tests {
         let ns = names.fabric_namespace();
         let wg = names.wireguard_interface();
 
-        // Pre-seed the crash residue: a root-ns WireGuard link.
-        let mut runner = RecordingRunner::new();
+        // Establish ownership first (the journal evidence that gates the
+        // sweep), then leave the crash residue behind.
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        let mut runner = provider.into_runner();
+        let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
+        assert!(
+            out.success,
+            "could not drop the ns wg for the test: {}",
+            out.stderr
+        );
         let out = runner.run("ip", &["link", "add", &wg, "type", "wireguard"])?;
         assert!(out.success, "could not pre-seed the stray: {}", out.stderr);
-        let preseed_len = runner.calls().len();
 
+        let before = runner.calls().len();
         let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
         provider.apply_plan(&plan)?;
         let joined: Vec<String> = provider
             .runner()
             .calls()
             .iter()
-            .skip(preseed_len)
+            .skip(before)
             .map(|call| call.joined())
             .collect();
         let flag = provider.ownership().wireguard_born_in_fabric_ns;
@@ -2051,29 +2467,85 @@ mod tests {
                 .any(|line| line == &format!("ip link del {wg}")),
             "the root-ns stray must be swept before creation"
         );
-        // ...and the interface was created inside the namespace, never
-        // in the root namespace.
+        // ...and the replacement is created in the ROOT namespace and
+        // moved in, never from inside the fabric namespace.
         assert!(
             joined
                 .iter()
-                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
-            "the wg must be created inside the fabric namespace"
+                .any(|line| line == &format!("ip link add {wg} type wireguard")),
+            "the wg must be created in the root namespace"
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|line| line == &format!("ip link set {wg} netns {ns}")),
+            "the wg must be moved into the fabric namespace"
         );
         assert!(
             !joined
                 .iter()
-                .any(|line| line == &format!("ip link add {wg} type wireguard")),
-            "the wg must NOT be created in the root namespace"
+                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
+            "the wg must NOT be created inside the fabric namespace"
         );
-        assert!(flag, "the creation must be journaled");
+        assert!(!flag, "the creation must leave no heal claim behind");
         Ok(())
     }
 
-    /// A WireGuard link with our deterministic name existing in the root
-    /// namespace while the journal claims a healthy fabric (the link is
-    /// also visible from the fabric namespace — on a real kernel that
-    /// means one link per namespace) is foreign state: fail closed,
-    /// never adopt and never delete.
+    /// The other side of the ownership gate: on a FRESH host (empty
+    /// journal) a root-ns link with our deterministic name is FOREIGN
+    /// state — the sweep must not delete it, and the root-side
+    /// `ip link add` fails closed on the name collision instead. The
+    /// foreign link survives untouched (manual cleanup is the remedy;
+    /// see the WireGuard section of `ensure_fabric` for why this is no
+    /// worse than the released baseline).
+    #[test]
+    fn fresh_host_root_stray_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("wg-stray-fresh")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let wg = names.wireguard_interface();
+
+        // Fresh host, no journal — plus a foreign root-ns link with our
+        // deterministic name.
+        let mut runner = RecordingRunner::new();
+        let out = runner.run("ip", &["link", "add", &wg, "type", "wireguard"])?;
+        assert!(out.success, "could not pre-seed the stray: {}", out.stderr);
+        let before = runner.calls().len();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let result = provider.apply_plan(&plan);
+        let sweep_issued = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .any(|call| call.joined() == format!("ip link del {wg}"));
+        let foreign_survived = provider.runner().has_link_in(&wg, None);
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            result.is_err(),
+            "a fresh-host root-ns stray must fail the apply closed"
+        );
+        assert!(
+            !sweep_issued,
+            "a fresh host (empty journal) must not run the root-ns stray \
+             sweep: the colliding link would be foreign state"
+        );
+        assert!(
+            foreign_survived,
+            "the foreign root-ns link must survive the failed apply untouched"
+        );
+        Ok(())
+    }
+
+    /// A WireGuard link with our deterministic name existing in BOTH the
+    /// root namespace and the fabric namespace (real kernels keep
+    /// per-namespace name tables, so both coexist) while the journal
+    /// claims a healthy fabric is foreign state: fail closed, never
+    /// adopt and never delete.
     #[test]
     fn root_and_fabric_namespace_wireguard_collision_fails_closed()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2086,18 +2558,11 @@ mod tests {
 
         let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
         provider.apply_plan(&plan)?;
-        assert!(provider.ownership().wireguard_born_in_fabric_ns);
         let mut runner = provider.into_runner();
 
-        // Foreign state: the wg link exists in the ROOT namespace (here:
-        // the namespace-placed link was replaced by a root-placed one —
-        // on a real kernel this is the both-namespaces collision).
-        let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
-        assert!(
-            out.success,
-            "could not drop the wg for the test: {}",
-            out.stderr
-        );
+        // Foreign state: a SECOND link with our deterministic name in
+        // the ROOT namespace, alongside the healthy fabric-ns wg (the
+        // per-namespace name tables allow both to exist).
         let out = runner.run("ip", &["link", "add", &wg, "type", "wireguard"])?;
         assert!(
             out.success,
@@ -2107,15 +2572,21 @@ mod tests {
 
         let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
         let result = provider.apply_plan(&plan);
-        // MINOR-1: the foreign root-ns link must SURVIVE the failed
-        // apply — the healthy path never deletes, it only fails closed.
-        let foreign_survived = provider.runner().has_link(&wg);
+        // The foreign root-ns link AND the healthy ns-scoped link must
+        // SURVIVE the failed apply — the healthy path never deletes, it
+        // only fails closed.
+        let foreign_survived = provider.runner().has_link_in(&wg, None);
+        let ns_wg_survived = provider.runner().has_link_in(&wg, Some(&ns));
         drop(provider);
 
         let _unused = fs::remove_dir_all(&root);
         assert!(
             foreign_survived,
             "a foreign root-ns wg must never be deleted by a failed apply"
+        );
+        assert!(
+            ns_wg_survived,
+            "the healthy fabric-ns wg must never be deleted by a failed apply"
         );
         match result {
             Err(FabricError::ForeignState { .. }) => Ok(()),
@@ -2269,11 +2740,12 @@ mod tests {
     // ---- MAJOR-1: interrupted-heal crash windows -------------------------
 
     /// MAJOR-1 slice (a): a heal interrupted AFTER the recorded-VXLAN
-    /// deletes but BEFORE the wg delete (pre-seeded: wg present, legacy
-    /// journal, VXLANs absent) converges on the next apply — the heal
-    /// re-enters and finishes, the applied network's VXLAN is
-    /// re-created, and the born-in-ns flag is set. The other network's
-    /// VXLAN heals on its own next apply.
+    /// deletes but BEFORE the wg delete (pre-seeded: ns-born wg present,
+    /// heal-pending flag set, VXLANs absent) converges on the next
+    /// apply — the heal re-enters and finishes (the VXLAN deletions are
+    /// tolerant no-ops), the applied network's VXLAN is re-created, and
+    /// the born-in-ns claim is cleared. The other network's VXLAN heals
+    /// on its own next apply.
     #[test]
     fn interrupted_heal_after_vxlan_deletes_converges() -> Result<(), Box<dyn std::error::Error>> {
         let root = test_root("heal-crashtest-a")?;
@@ -2288,12 +2760,13 @@ mod tests {
         let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
         provider.apply_plan(&plan_a)?;
         provider.apply_plan(&plan_b)?;
-        assert!(provider.ownership().wireguard_born_in_fabric_ns);
         let mut runner = provider.into_runner();
 
-        // Legacy journal (flag stripped) + crash residue: the heal's
-        // VXLAN deletes ran, the wg delete did not.
-        strip_born_flag(&config)?;
+        // Round-3..5 state (ns-born wg + heal-pending flag) plus the
+        // crash residue: the heal's VXLAN deletes ran, the wg delete
+        // did not.
+        reborn_wg_in_ns(&mut runner, &names)?;
+        force_born_flag(&config, true)?;
         for vxlan in [&vxlan_a, &vxlan_b] {
             let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", vxlan])?;
             assert!(
@@ -2325,7 +2798,7 @@ mod tests {
             report.created_fabric,
             "the interrupted heal must finish: the wg is re-created"
         );
-        assert!(flag, "the heal must record the born-in-ns flag");
+        assert!(!flag, "a completed heal must clear the born-in-ns claim");
         assert!(
             vxlan_a_back,
             "the applied network's vxlan must be re-created in the same apply"
@@ -2346,14 +2819,15 @@ mod tests {
         Ok(())
     }
 
-    /// MAJOR-1 slice (b): the crash window of the OLD heal order — the
-    /// wg was deleted, the recorded VXLANs were not (pre-seeded: wg
-    /// absent, legacy journal, VXLANs present, journal records both
-    /// networks). The next apply takes the wg-absent branch: it must
-    /// delete the stale VXLANs (their `dev <wg>` binding died with the
-    /// old interface and identity verification cannot see that),
-    /// re-create the wg inside the namespace plus this network's VXLAN,
-    /// and set the flag. A second apply must be a pure no-op replay.
+    /// MAJOR-1 slice (b): the crash window DURING the heal — the ns wg
+    /// was deleted, the recorded VXLANs were not (pre-seeded: wg
+    /// absent, heal-pending flag set, VXLANs present, journal records
+    /// both networks). The next apply takes the wg-absent branch: it
+    /// must delete the stale VXLANs (their `dev <wg>` binding died with
+    /// the old interface and identity verification cannot see that),
+    /// re-create the wg in the ROOT namespace, move it in, plus this
+    /// network's VXLAN, and clear the flag. A second apply must be a
+    /// pure no-op replay (modulo the unconditional legacy cleanup).
     #[test]
     fn interrupted_heal_after_wg_delete_converges() -> Result<(), Box<dyn std::error::Error>> {
         let root = test_root("heal-crashtest-b")?;
@@ -2363,18 +2837,18 @@ mod tests {
         let names = Names::new(config.name_prefix())?;
         let ns = names.fabric_namespace();
         let wg = names.wireguard_interface();
+        let host_veth = names.host_underlay_veth();
         let vxlan_a = names.vxlan(&plan_a.network_id);
         let vxlan_b = names.vxlan(&plan_b.network_id);
 
         let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
         provider.apply_plan(&plan_a)?;
         provider.apply_plan(&plan_b)?;
-        assert!(provider.ownership().wireguard_born_in_fabric_ns);
         let mut runner = provider.into_runner();
 
-        // Legacy journal (flag stripped) + the OLD order's crash
-        // residue: the wg is gone, the recorded VXLANs survived it.
-        strip_born_flag(&config)?;
+        // Round-3..5 state (heal-pending flag) plus the crash residue:
+        // the wg is gone, the recorded VXLANs survived it.
+        force_born_flag(&config, true)?;
         let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
         assert!(
             out.success,
@@ -2399,7 +2873,8 @@ mod tests {
             .runner()
             .fdb_entry_count(&vxlan_a, FLOOD_MAC, "198.18.0.2");
 
-        // The second apply must be a pure no-op replay.
+        // The second apply must be a pure no-op replay (modulo the
+        // unconditional legacy cleanup).
         let before_replay = provider.runner().calls().len();
         let replay_report = provider.apply_plan(&plan_a)?;
         let replay_slice: Vec<String> = provider
@@ -2419,7 +2894,7 @@ mod tests {
             report.created_fabric,
             "the wg-absent recovery must re-create the WireGuard interface"
         );
-        assert!(flag, "the recovery must record the born-in-ns flag");
+        assert!(!flag, "the recovery must clear the born-in-ns claim");
         // The stale, binding-dead VXLANs are swept by journal-recorded
         // name BEFORE the replacement wg exists...
         assert!(
@@ -2434,12 +2909,24 @@ mod tests {
                 .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_b}")),
             "every stale recorded vxlan must be deleted, not just the applied one"
         );
-        // ...the wg is re-created inside the namespace...
+        // ...the wg is re-created in the ROOT namespace and moved in...
         assert!(
             slice
                 .iter()
+                .any(|line| line == &format!("ip link add {wg} type wireguard")),
+            "the wg must be re-created in the root namespace"
+        );
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip link set {wg} netns {ns}")),
+            "the wg must be moved into the fabric namespace"
+        );
+        assert!(
+            !slice
+                .iter()
                 .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
-            "the wg must be re-created inside the fabric namespace"
+            "the wg must NOT be re-created inside the fabric namespace"
         );
         // ...and this network's VXLAN is re-created on the NEW wg.
         assert!(
@@ -2467,8 +2954,23 @@ mod tests {
             "the second apply must not create links: {replay_slice:?}"
         );
         assert!(
-            !replay_slice.iter().any(|line| line.contains(" link del ")),
-            "the second apply must not delete links: {replay_slice:?}"
+            !replay_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {wg}")),
+            "the second apply must not delete the wg"
+        );
+        assert!(
+            !replay_slice
+                .iter()
+                .any(|line| line == &format!("ip link del {wg}")),
+            "the second apply must not run the root-ns stray sweep"
+        );
+        // The unconditional legacy cleanup DID run (tolerated no-ops).
+        assert!(
+            replay_slice
+                .iter()
+                .any(|line| line == &format!("ip link del {host_veth}")),
+            "the unconditional legacy veth cleanup runs on every replay"
         );
         assert_eq!(
             flood_a_after, 1,
@@ -2481,12 +2983,13 @@ mod tests {
 
     /// On a fresh host (empty journal) the root-ns stray sweep must NOT
     /// run: a root-ns link with our deterministic name is FOREIGN state
-    /// there, and journal-before-mutate means a genuine legacy
-    /// add-then-crash stray always implies a journal that shows we
-    /// own(ed) fabric state. In the fake kernel the sweep is a tolerated
-    /// no-op when no link exists, so the gate is observable through the
-    /// recorded call journal: the pre-fix code issued the root-ns
-    /// deletion on EVERY fresh apply.
+    /// there, and journal-before-mutate means a genuine crash stray
+    /// always implies a journal that shows we own(ed) fabric state. In
+    /// the fake kernel the sweep is a tolerated no-op when no link
+    /// exists, so the gate is observable through the recorded call
+    /// journal. The wg itself is created in the ROOT namespace and
+    /// moved into the fabric namespace (the design-F invariant), and no
+    /// heal claim is journaled.
     #[test]
     fn root_stray_sweep_is_skipped_on_a_fresh_host() -> Result<(), Box<dyn std::error::Error>> {
         let root = test_root("stray-gate-fresh")?;
@@ -2518,20 +3021,26 @@ mod tests {
         assert!(
             joined
                 .iter()
-                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
-            "the wg must still be created inside the fabric namespace"
+                .any(|line| line == &format!("ip link add {wg} type wireguard")),
+            "the wg must be created in the root namespace"
         );
-        assert!(flag, "the creation must be journaled");
+        assert!(
+            joined
+                .iter()
+                .any(|line| line == &format!("ip link set {wg} netns {ns}")),
+            "the wg must be moved into the fabric namespace"
+        );
+        assert!(!flag, "the creation must leave no heal claim behind");
         Ok(())
     }
 
     /// The other side of the gate: when the journal shows we own(ed)
     /// fabric state, a lost ns-scoped wg re-apply DOES run the root-ns
-    /// stray sweep (a legacy add-then-crash stray is ours to clean) and
-    /// re-creates the wg inside the namespace — while the recorded
-    /// VXLANs are NOT deleted, because the born-in-ns flag is set (no
+    /// stray sweep (a crash stray is ours to clean) and re-creates the
+    /// wg via the root-create + move sequence — while the recorded
+    /// VXLANs are NOT deleted, because the born-in-ns flag is clear (no
     /// heal pending; the belt-and-braces VXLAN sweep is scoped to
-    /// legacy journals).
+    /// pending heals).
     #[test]
     fn root_stray_sweep_runs_with_ownership_evidence() -> Result<(), Box<dyn std::error::Error>> {
         let root = test_root("stray-gate-owned")?;
@@ -2544,7 +3053,6 @@ mod tests {
 
         let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
         provider.apply_plan(&plan)?;
-        assert!(provider.ownership().wireguard_born_in_fabric_ns);
         let mut runner = provider.into_runner();
 
         // The ns-scoped wg is lost (kernel crash / operator) while the
@@ -2581,8 +3089,20 @@ mod tests {
         assert!(
             slice
                 .iter()
+                .any(|line| line == &format!("ip link add {wg} type wireguard")),
+            "the wg must be re-created in the root namespace"
+        );
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip link set {wg} netns {ns}")),
+            "the wg must be moved into the fabric namespace"
+        );
+        assert!(
+            !slice
+                .iter()
                 .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
-            "the wg must be re-created inside the fabric namespace"
+            "the wg must NOT be re-created inside the fabric namespace"
         );
         assert!(
             report.created_fabric && !report.created_network,
@@ -2590,10 +3110,10 @@ mod tests {
         );
         assert!(
             vxlan_kept,
-            "with the born-in-ns flag set, a lost wg must NOT delete the \
-             recorded vxlans (no heal pending)"
+            "with no heal pending (flag clear), a lost wg must NOT delete \
+             the recorded vxlans"
         );
-        assert!(flag);
+        assert!(!flag);
         Ok(())
     }
 

@@ -49,24 +49,30 @@ pub struct NetworkOwnership {
 pub struct FabricOwnership {
     /// Journal format version.
     pub state_version: u32,
-    /// True once the shared fabric (netns, WireGuard, underlay veths) has
-    /// been configured on this host.
+    /// True once the shared fabric (netns, WireGuard) has been
+    /// configured on this host.
     pub fabric_configured: bool,
-    /// True once the WireGuard interface in the fabric namespace is known
-    /// to have been CREATED inside that namespace. A WireGuard interface's
-    /// UDP socket binds in the namespace the interface was created in and
-    /// never follows the interface, so an interface that was created in
-    /// the root namespace and moved in leaves its socket outside the
-    /// fabric underlay — the provider repairs that by delete + re-create
-    /// from inside the namespace. Journals written before this field
-    /// existed parse as `false` (`serde(default)`), which triggers the
-    /// one-time legacy heal. The field is additive, so READING is
-    /// compatible in both directions (serde ignores the unknown field in
-    /// old code, `serde(default)` fills the absent field in new code) —
-    /// but round-trips through OLD code are not format-preserving: old
-    /// code parsing a new journal silently strips the unknown flag on its
-    /// next save, so a downgrade followed by a re-upgrade re-triggers the
-    /// one-time heal (one WireGuard session drop).
+    /// True while the fabric's WireGuard interface was created INSIDE
+    /// the fabric namespace — the placement the v0.1.2 underlay
+    /// redesign eliminated (a WireGuard interface's UDP socket binds
+    /// in the namespace the interface was created in and never follows
+    /// the interface; under the redesign the socket must live in the
+    /// ROOT namespace, so the interface is created root-side and moved
+    /// in). Only the unpushed round-3..5 code ever created the
+    /// interface ns-side and set this flag; such journals (dev
+    /// environments only) trigger the one-time full heal that deletes
+    /// and re-creates the interface via the root-creation sequence.
+    /// The flag is cleared once the replacement interface exists and
+    /// is fully configured (key + listen port), so a heal interrupted
+    /// anywhere simply re-runs. Journals written by v0.1.0/v0.1.1
+    /// (field absent) and by the current code parse as `false` — the
+    /// healthy value: their interfaces were already created in the
+    /// root namespace and moved in. The field is additive, so READING
+    /// is compatible in both directions (serde ignores the unknown
+    /// field in old code, `serde(default)` fills the absent field in
+    /// new code) — but round-trips through OLD code are not
+    /// format-preserving: old code parsing a new journal silently
+    /// strips the unknown flag on its next save.
     #[serde(default)]
     pub wireguard_born_in_fabric_ns: bool,
     /// WireGuard peers currently configured (union over live plans).
@@ -183,12 +189,13 @@ mod tests {
     fn legacy_journal_without_socket_placement_flag_parses()
     -> Result<(), Box<dyn std::error::Error>> {
         // A journal written before `wireguard_born_in_fabric_ns` existed
-        // must keep parsing (as false — the legacy-heal trigger). The
-        // field is additive, so READING is compatible in both directions
-        // — but not round-tripping: old code reading a NEW journal parses
-        // it fine and then strips the unknown flag on its next save, so a
-        // downgrade + re-upgrade re-triggers the one-time heal (one WG
-        // session drop). Never a format break, though.
+        // must keep parsing (as false — the healthy value under the
+        // NAT-free underlay: v0.1.0/v0.1.1 created the wg root-side and
+        // moved it in, so no heal is pending). The field is additive, so
+        // READING is compatible in both directions — but not
+        // round-tripping: old code reading a NEW journal parses it fine
+        // and then strips the unknown flag on its next save. Never a
+        // format break, though.
         let root = std::env::temp_dir().join(format!(
             "fabric-own-legacy-{}-{}",
             std::process::id(),
@@ -208,7 +215,8 @@ mod tests {
         assert!(loaded.fabric_configured);
         assert!(
             !loaded.wireguard_born_in_fabric_ns,
-            "an old journal must parse as legacy (socket placement unknown)"
+            "an old journal must parse as healthy (root-created wg placement, \
+             no born-in-fabric-ns heal pending)"
         );
         // Round-trip rewrites the journal WITH the new field (serde's
         // default only affects deserialization), keeping the value.

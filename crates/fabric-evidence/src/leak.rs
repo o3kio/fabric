@@ -1,21 +1,19 @@
 //! Zero-leak teardown verification.
 //!
 //! Checks this host's KERNEL state only: no fabric netns, no prefixed
-//! links, no NAT rules referencing the underlay prefix, no routes via the
-//! host underlay veth. The private key file and journal directories under
-//! the state root REMAIN by design (contract §3.5: keys survive teardown)
-//! and are intentionally not residue.
+//! links. The private key file and journal directories under the state
+//! root REMAIN by design (contract §3.5: keys survive teardown) and are
+//! intentionally not residue. The v0.1.2 NAT-free underlay installs no
+//! iptables rules and no underlay routes, so there is nothing else the
+//! provider could leave behind (the v0.1.0/v0.1.1 nat rules and veth
+//! are deleted tolerantly on every apply); the leak check therefore
+//! watches the two object families that still exist: namespaces and
+//! prefixed links.
 
 use fabric_linux::{FabricCommand, Names};
 use serde::Serialize;
 
 use crate::error::RunError;
-
-/// The provider's link-local underlay attachment prefix (see
-/// `fabric_linux::config::UNDERLAY_PREFIX`).
-const UNDERLAY_PREFIX: &str = "169.254.253.0/30";
-/// The fabric-side DNAT target inside the underlay /30.
-const UNDERLAY_FABRIC_IP: &str = "169.254.253.2";
 
 /// Leak-check outcome. `residue` entries are human-readable descriptions.
 #[derive(Serialize)]
@@ -49,18 +47,6 @@ pub fn leak_check<R: FabricCommand>(runner: &mut R, prefix: &str) -> Result<Leak
         }
     }
 
-    // NAT rules referencing the underlay prefix or its DNAT target.
-    let nat = runner.run("iptables", &["-t", "nat", "-S"])?;
-    for rule in nat_residue(&nat.stdout) {
-        residue.push(format!("nat rule: {rule}"));
-    }
-
-    // Routes still pointing through the host underlay veth.
-    let routes = runner.run("ip", &["route", "show"])?;
-    for route in route_residue(&routes.stdout, &names.host_underlay_veth()) {
-        residue.push(format!("route: {route}"));
-    }
-
     Ok(LeakReport {
         clean: residue.is_empty(),
         residue,
@@ -81,35 +67,6 @@ pub fn parse_link_names(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// Return the `iptables -t nat -S` rule lines that reference the fabric
-/// underlay prefix (`-s 169.254.253.0/30 ... MASQUERADE`) or its DNAT
-/// target (`... --to-destination 169.254.253.2`). Token-exact matching so
-/// neighboring addresses (e.g. 169.254.253.254) do not false-positive.
-pub fn nat_residue(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter(|line| {
-            line.split_whitespace()
-                .any(|token| token == UNDERLAY_PREFIX || token == UNDERLAY_FABRIC_IP)
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-/// Return the `ip route show` lines that route via `dev <dev>`.
-pub fn route_residue(output: &str, dev: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter(|line| {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            tokens
-                .windows(2)
-                .any(|pair| pair[0] == "dev" && pair[1] == dev)
-        })
-        .map(str::to_string)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,19 +82,6 @@ mod tests {
 7: brten: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1380 state UP mode DEFAULT group default
 ";
 
-    const SAMPLE_NAT: &str = "\
--P PREROUTING ACCEPT
--A POSTROUTING -s 172.31.250.0/24 ! -o docker0 -j MASQUERADE
--A POSTROUTING -s 169.254.253.0/30 -j MASQUERADE
--A PREROUTING ! -i ev-u -p udp --dport 65001 -j DNAT --to-destination 169.254.253.2
-";
-
-    const SAMPLE_ROUTES: &str = "\
-default via 172.31.250.1 dev eth0
-172.31.250.0/24 dev eth0 proto kernel scope link src 172.31.250.2
-169.254.253.0/30 dev ev-u proto kernel scope link src 169.254.253.1
-";
-
     #[test]
     fn parses_link_names_with_veth_and_suffixes() {
         let names = parse_link_names(SAMPLE_LINKS);
@@ -150,28 +94,6 @@ default via 172.31.250.1 dev eth0
                 "brten".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn nat_residue_matches_underlay_rules_only() {
-        let rules = nat_residue(SAMPLE_NAT);
-        assert_eq!(rules.len(), 2, "both fabric rules must be flagged");
-        let rules = nat_residue(
-            "-A POSTROUTING -s 169.254.253.254 -j MASQUERADE\n-A POSTROUTING -j RETURN\n",
-        );
-        assert!(
-            rules.is_empty(),
-            "neighboring underlay addresses must not false-positive"
-        );
-    }
-
-    #[test]
-    fn route_residue_matches_only_the_underlay_veth() {
-        let routes = route_residue(SAMPLE_ROUTES, "ev-u");
-        assert_eq!(routes.len(), 1);
-        assert!(routes[0].contains("169.254.253.0/30 dev ev-u"));
-        assert!(route_residue(SAMPLE_ROUTES, "eth0").len() == 2);
-        assert!(route_residue(SAMPLE_ROUTES, "lo").is_empty());
     }
 
     #[test]

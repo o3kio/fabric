@@ -127,11 +127,17 @@ impl FabricCommand for RealCommandRunner {
 
 /// A recorded link in the fake kernel.
 ///
-/// `netns` models the namespace the link lives in (None = root). It is
-/// set at creation (`ip netns exec NS ip link add ...` places the link
-/// in NS; a bare `ip link add` places it in the root namespace) and
-/// updated by `ip link set <link> netns <ns>`. Deletion is by global
-/// name — a simplification, since the fake has one name table.
+/// Links are keyed by `(name, netns)` — a real kernel's interface name
+/// tables are per-network-namespace, so the same name CAN exist in the
+/// root namespace and inside a namespace simultaneously (the
+/// both-namespaces WireGuard collision the provider must fail closed
+/// on). The key's namespace is set at creation (`ip netns exec NS ip
+/// link add ...` places the link in NS; a bare `ip link add` places it
+/// in the root namespace) and updated by `ip link set <link> netns
+/// <ns>`. `creating_netns` records the birth namespace separately: a
+/// WireGuard interface's UDP socket binds in the namespace the link
+/// was CREATED in and never follows a later move — the placement the
+/// underlay design depends on (contract §3.10).
 #[derive(Clone, Debug, Default)]
 struct FakeLink {
     kind: String,
@@ -139,23 +145,38 @@ struct FakeLink {
     dstport: Option<u16>,
     local: Option<String>,
     mtu: Option<u32>,
-    netns: Option<String>,
+    /// The other end of a veth pair, if any. Deleting either end of a
+    /// pair removes both, wherever the peer currently lives (real
+    /// kernel semantics).
+    peer: Option<String>,
+    /// The namespace this link was CREATED in (`None` = root). Never
+    /// changes after creation — like a WireGuard socket binding.
+    creating_netns: Option<String>,
     addrs: std::collections::BTreeSet<String>,
 }
 
 /// An in-memory fake kernel plus call journal.
 ///
 /// It models just enough of `ip`/`wg`/`bridge`/`iptables`/`sysctl` for the
-/// provider's observation and mutation paths: namespaces, link existence,
-/// VXLAN identity, and success/failure injection.
+/// provider's observation and mutation paths: namespaces, per-namespace
+/// link placement, VXLAN identity, iptables nat rules (with the real
+/// `Bad rule` wording on a non-matching `-D`), and success/failure
+/// injection.
 pub struct RecordingRunner {
     calls: Vec<CommandCall>,
     netns: std::collections::BTreeSet<String>,
-    links: BTreeMap<String, FakeLink>,
+    /// Links keyed by `(name, netns)` — per-namespace name tables, like
+    /// the real kernel.
+    links: BTreeMap<(String, Option<String>), FakeLink>,
     /// Routing-table entries (destination strings; the fake kernel models
     /// one global table, which is sufficient because the provider only
     /// manages routes inside the fabric namespace).
     routes: std::collections::BTreeSet<String>,
+    /// iptables rules keyed by `<table>|<chain>|<spec>` with an instance
+    /// count: `-A` appends one instance (the real iptables permits
+    /// duplicate rules), `-D` removes exactly one matching instance and
+    /// fails with the real `Bad rule` wording when none exists.
+    iptables: BTreeMap<String, usize>,
     /// Forwarding-table entries: (device, mac, dst) triples with an
     /// instance count. Flood entries share the all-zeros MAC with one
     /// row per remote. `append` increments the count — the kernel does
@@ -177,6 +198,7 @@ impl RecordingRunner {
             netns: std::collections::BTreeSet::new(),
             links: BTreeMap::new(),
             routes: std::collections::BTreeSet::new(),
+            iptables: BTreeMap::new(),
             fdb: BTreeMap::new(),
             failures: Vec::new(),
         }
@@ -201,9 +223,49 @@ impl RecordingRunner {
         self.failures.push(pattern.into());
     }
 
-    /// True when the fake kernel currently holds a link named `name`.
+    /// True when the fake kernel currently holds a link named `name` in
+    /// ANY namespace.
     pub fn has_link(&self, name: &str) -> bool {
-        self.links.contains_key(name)
+        self.links.keys().any(|(n, _)| n == name)
+    }
+
+    /// True when the fake kernel holds a link named `name` in exactly the
+    /// namespace `netns` (`None` = root namespace). Real kernels keep
+    /// per-namespace name tables, so the same name may exist in several
+    /// namespaces at once.
+    pub fn has_link_in(&self, name: &str, netns: Option<&str>) -> bool {
+        self.links
+            .contains_key(&(name.to_string(), netns.map(str::to_string)))
+    }
+
+    /// The namespace a link named `name` was CREATED in (`Some(None)` =
+    /// root namespace), when such a link exists in any namespace. A
+    /// WireGuard interface's UDP socket binds in its creating namespace
+    /// for life and never follows `ip link set netns` — this is the
+    /// observable socket placement the underlay design depends on.
+    pub fn link_created_in(&self, name: &str) -> Option<Option<String>> {
+        self.links
+            .iter()
+            .find(|((n, _), _)| n == name)
+            .map(|(_, link)| link.creating_netns.clone())
+    }
+
+    /// The iptables rules the fake kernel currently holds, as joined
+    /// `"<table> <chain> <spec>"` strings (e.g.
+    /// `"nat POSTROUTING -s 169.254.253.0/30 -j MASQUERADE"`), one entry
+    /// per rule instance. Empty on hosts where the provider installed no
+    /// NAT rules — the regression signal for the NAT-free underlay.
+    pub fn iptables_rules(&self) -> Vec<String> {
+        let mut rules = Vec::new();
+        for (key, count) in &self.iptables {
+            let parts: Vec<&str> = key.splitn(3, '|').collect();
+            if parts.len() == 3 {
+                for _ in 0..*count {
+                    rules.push(format!("{} {} {}", parts[0], parts[1], parts[2]));
+                }
+            }
+        }
+        rules
     }
 
     /// True when the fake kernel holds a route with destination `dest`
@@ -212,18 +274,22 @@ impl RecordingRunner {
         self.routes.contains(dest)
     }
 
-    /// True when link `dev` currently carries the address `addr`
-    /// (e.g. `198.18.0.1/32`).
+    /// True when a link named `dev` (in any namespace) currently carries
+    /// the address `addr` (e.g. `198.18.0.1/32`).
     pub fn has_addr(&self, dev: &str, addr: &str) -> bool {
         self.links
-            .get(dev)
-            .is_some_and(|link| link.addrs.contains(addr))
+            .iter()
+            .any(|((name, _), link)| name == dev && link.addrs.contains(addr))
     }
 
-    /// The fake kernel's current MTU for a link, when the link exists and
-    /// an MTU was set on it (links start at the generic default of 1500).
+    /// The fake kernel's current MTU for a link named `name` (in any
+    /// namespace), when the link exists and an MTU was set on it (links
+    /// start at the generic default of 1500).
     pub fn link_mtu(&self, name: &str) -> Option<u32> {
-        self.links.get(name).and_then(|link| link.mtu)
+        self.links
+            .iter()
+            .find(|((n, _), _)| n == name)
+            .and_then(|(_, link)| link.mtu)
     }
 
     /// True when the fake kernel currently holds a namespace named `ns`.
@@ -249,7 +315,9 @@ impl RecordingRunner {
     }
 
     /// Interpret `bridge` arguments starting at `rest` (after any
-    /// `netns exec NS` prefix already stripped).
+    /// `netns exec NS` prefix already stripped); `ns` is the namespace
+    /// the command executes in, which decides which link table the
+    /// device lookup consults.
     ///
     /// Models the kernel's forwarding-table rules closely enough to catch
     /// verb-level mistakes a real kernel rejects: `replace` is refused for
@@ -263,7 +331,7 @@ impl RecordingRunner {
     /// that accumulated N duplicates needs N deletes to disappear
     /// entirely). `fdb show [dev <dev>]` prints one line per instance,
     /// like the real `bridge fdb show`.
-    fn bridge(&mut self, rest: &[&str]) -> CommandOutput {
+    fn bridge(&mut self, ns: Option<&str>, rest: &[&str]) -> CommandOutput {
         if rest.first() != Some(&"fdb") {
             return CommandOutput::ok();
         }
@@ -298,10 +366,15 @@ impl RecordingRunner {
         if dev.is_empty() {
             return command_error("bridge: insufficient arguments");
         }
-        if !self.links.contains_key(dev) {
+        let dev_key = (dev.to_string(), ns.map(str::to_string));
+        if !self.links.contains_key(&dev_key) {
             return command_error(&format!("Cannot find device \"{dev}\""));
         }
-        if self.links.get(dev).is_some_and(|link| link.kind != "vxlan") {
+        if self
+            .links
+            .get(&dev_key)
+            .is_some_and(|link| link.kind != "vxlan")
+        {
             return command_error("Operation not supported: fdb with dst requires a vxlan device");
         }
         if !is_unicast_mac(mac) && op == "replace" {
@@ -367,12 +440,17 @@ impl RecordingRunner {
     /// Interpret `ip` arguments starting at `rest`. `ns` is the network
     /// namespace the command executes in (`Some(..)` for
     /// `ip netns exec NS ip ...`, `None` for a root-namespace call); it
-    /// decides where created links are placed and which links a
-    /// namespace-scoped `link show` observes.
+    /// decides which per-namespace link table created links are placed
+    /// into and which links a namespace-scoped command observes or
+    /// mutates — like the real kernel, where a link named `x` in the
+    /// root namespace and one named `x` inside a namespace are two
+    /// different interfaces.
     fn ip(&mut self, ns: Option<&str>, rest: &[&str]) -> CommandOutput {
         // Normalize: drop a leading `-d` detail flag, remembering it.
         let detail = rest.first() == Some(&"-d");
         let rest = if detail { &rest[1..] } else { rest };
+        // The per-namespace table key every lookup below uses.
+        let key_of = |name: &str| (name.to_string(), ns.map(str::to_string));
         // link add NAME type KIND [vxlan opts]
         if rest.first() == Some(&"link") && rest.get(1) == Some(&"add") {
             let name = rest[2];
@@ -380,7 +458,7 @@ impl RecordingRunner {
                 kind: "generic".to_string(),
                 // A link is born in the namespace the add runs in; its
                 // WireGuard socket (if any) binds there for life.
-                netns: ns.map(str::to_string),
+                creating_netns: ns.map(str::to_string),
                 ..FakeLink::default()
             };
             let mut peer_name: Option<&str> = None;
@@ -423,34 +501,48 @@ impl RecordingRunner {
                     _ => i += 1,
                 }
             }
-            // The kernel refuses to create an existing name.
-            if self.links.contains_key(name) {
+            // The kernel refuses to create an existing name — per
+            // namespace.
+            if self.links.contains_key(&key_of(name)) {
                 return command_error("RTNETLINK answers: File exists");
             }
             if let Some(peer) = peer_name {
-                if self.links.contains_key(peer) {
+                if self.links.contains_key(&key_of(peer)) {
                     return command_error("RTNETLINK answers: File exists");
                 }
                 let peer_link = FakeLink {
-                    netns: ns.map(str::to_string),
+                    peer: Some(name.to_string()),
+                    creating_netns: ns.map(str::to_string),
                     ..FakeLink::default()
                 };
-                self.links.insert(peer.to_string(), peer_link);
+                self.links.insert(key_of(peer), peer_link);
+                link.peer = Some(peer.to_string());
             }
-            self.links.insert(name.to_string(), link);
+            self.links.insert(key_of(name), link);
             return CommandOutput::ok();
         }
-        // link del NAME (deleting a device drops its forwarding entries,
-        // as the kernel does). Deleting a missing device fails like the
-        // real `ip` ("Cannot find device") — providers must tolerate
-        // that explicitly.
+        // link del NAME. Deleting a device drops its forwarding entries;
+        // deleting one end of a veth pair removes BOTH ends, wherever the
+        // peer currently lives (real kernel semantics — deleting the
+        // root-ns underlay veth also removes the fabric-ns peer and the
+        // routes via them). Deleting a missing device fails like the real
+        // `ip` ("Cannot find device") — providers must tolerate that
+        // explicitly.
         if rest.first() == Some(&"link") && matches!(rest.get(1), Some(&"del") | Some(&"delete")) {
             if let Some(name) = rest.get(2) {
-                if !self.links.contains_key(*name) {
+                let Some((_, link)) = self.links.remove_entry(&key_of(name)) else {
                     return cannot_find_device(name);
+                };
+                self.drop_link_state(name);
+                if let Some(peer) = link.peer {
+                    // The peer may have been moved to another namespace;
+                    // find it by name anywhere.
+                    let peer_key = self.links.keys().find(|(n, _)| n == &peer).cloned();
+                    if let Some(peer_key) = peer_key {
+                        self.links.remove(&peer_key);
+                        self.drop_link_state(&peer);
+                    }
                 }
-                self.links.remove(*name);
-                self.fdb.retain(|(dev, _, _), _| dev != name);
             }
             return CommandOutput::ok();
         }
@@ -459,7 +551,7 @@ impl RecordingRunner {
             let op = rest.get(1).copied().unwrap_or("");
             let addr = rest.get(2).copied().unwrap_or("");
             let dev = arg_after(rest, "dev").unwrap_or("");
-            let Some(link) = self.links.get_mut(dev) else {
+            let Some(link) = self.links.get_mut(&key_of(dev)) else {
                 return cannot_find_device(dev);
             };
             return match op {
@@ -524,7 +616,7 @@ impl RecordingRunner {
                 match *op {
                     "mtu" => {
                         let value = rest.get(4).copied().and_then(parse_u32);
-                        return match (self.links.get_mut(*name), value) {
+                        return match (self.links.get_mut(&key_of(name)), value) {
                             (Some(link), Some(mtu)) => {
                                 link.mtu = Some(mtu);
                                 CommandOutput::ok()
@@ -536,10 +628,10 @@ impl RecordingRunner {
                         };
                     }
                     "name" => {
-                        if let (Some(new_name), Some(link)) =
-                            (rest.get(4), self.links.remove(*name))
+                        if let Some(new_name) = rest.get(4)
+                            && let Some((_, link)) = self.links.remove_entry(&key_of(name))
                         {
-                            self.links.insert((*new_name).to_string(), link);
+                            self.links.insert(key_of(new_name), link);
                             return CommandOutput::ok();
                         }
                         return cannot_find_device(name);
@@ -548,13 +640,15 @@ impl RecordingRunner {
                         // `ip link set NAME netns NS` moves the link into
                         // NS (the placement — never the WireGuard socket,
                         // which stays bound in the creating namespace).
-                        return match (rest.get(4), self.links.get_mut(*name)) {
-                            (Some(target), Some(link)) => {
-                                link.netns = Some((*target).to_string());
-                                CommandOutput::ok()
-                            }
-                            _ => cannot_find_device(name),
+                        let Some(target) = rest.get(4) else {
+                            return cannot_find_device(name);
                         };
+                        let Some((_, link)) = self.links.remove_entry(&key_of(name)) else {
+                            return cannot_find_device(name);
+                        };
+                        self.links
+                            .insert((name.to_string(), Some((*target).to_string())), link);
+                        return CommandOutput::ok();
                     }
                     // up/down/master/addr: accepted, not modeled.
                     _ => {}
@@ -562,22 +656,13 @@ impl RecordingRunner {
             }
             return CommandOutput::ok();
         }
-        // link show [-d] NAME
-        if rest.first() == Some(&"link") && rest.get(1) == Some(&"show") {
-            if let (Some(name), Some(link)) =
-                (rest.get(2), rest.get(2).and_then(|n| self.links.get(*n)))
-            {
-                // A real kernel's `link show` only observes links in the
-                // command's own namespace. The fake keeps one global
-                // name table, so this is modeled by placement: a ROOT-ns
-                // `link show` does not see namespace-placed links (like
-                // the real kernel), while a namespace-scoped `link show`
-                // sees every link (a deliberate, documented quirk the
-                // `foreign_state_rejects_prefix_vni` conformance case
-                // relies on — see its comment).
-                if ns.is_none() && link.netns.is_some() {
-                    return missing_device(name);
-                }
+        // link show [-d] NAME — observes only the command's own
+        // namespace's name table, like the real kernel.
+        if rest.first() == Some(&"link")
+            && rest.get(1) == Some(&"show")
+            && let Some(name) = rest.get(2)
+        {
+            if let Some(link) = self.links.get(&key_of(name)) {
                 let mut stdout = format!(
                     "{}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu {} state UP\n",
                     name,
@@ -609,11 +694,79 @@ impl RecordingRunner {
                     stderr: String::new(),
                 };
             }
-            if let Some(name) = rest.get(2) {
-                return missing_device(name);
-            }
+            return missing_device(name);
         }
         CommandOutput::ok()
+    }
+
+    /// Drop the forwarding-table entries of a deleted device.
+    fn drop_link_state(&mut self, name: &str) {
+        self.fdb.retain(|(dev, _, _), _| dev != name);
+    }
+
+    /// Interpret `iptables` arguments: `[-t TABLE] OP CHAIN SPEC...`.
+    ///
+    /// `-A`/`-I` append one rule instance (the real iptables permits
+    /// identical duplicate rules); `-D` removes exactly ONE matching
+    /// instance and fails with the real wording when no rule matches —
+    /// `iptables: Bad rule (does a matching rule exist in that chain?)` —
+    /// which the provider's tolerant deletions must match. `-S`/`-L`
+    /// dump one `-A CHAIN SPEC` line per instance.
+    fn iptables(&mut self, args: &[&str]) -> CommandOutput {
+        let mut rest = args;
+        let mut table = "filter".to_string();
+        if rest.first() == Some(&"-t") {
+            if let Some(t) = rest.get(1) {
+                table = (*t).to_string();
+            }
+            rest = &rest[2..];
+        }
+        let Some(op) = rest.first().copied() else {
+            return CommandOutput::ok();
+        };
+        if op == "-S" || op == "-L" {
+            let prefix = format!("{table}|");
+            let mut stdout = String::new();
+            for (key, count) in &self.iptables {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                let parts: Vec<&str> = key.splitn(3, '|').collect();
+                if parts.len() == 3 {
+                    for _ in 0..*count {
+                        stdout.push_str(&format!("-A {} {}\n", parts[1], parts[2]));
+                    }
+                }
+            }
+            return CommandOutput {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            };
+        }
+        let chain = rest.get(1).copied().unwrap_or("");
+        let spec = rest[2..].join(" ");
+        let key = format!("{table}|{chain}|{spec}");
+        match op {
+            "-A" | "-I" => {
+                *self.iptables.entry(key).or_insert(0) += 1;
+                CommandOutput::ok()
+            }
+            "-D" => match self.iptables.get_mut(&key) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    CommandOutput::ok()
+                }
+                Some(_) => {
+                    self.iptables.remove(&key);
+                    CommandOutput::ok()
+                }
+                None => {
+                    command_error("iptables: Bad rule (does a matching rule exist in that chain?).")
+                }
+            },
+            _ => CommandOutput::ok(),
+        }
     }
 }
 
@@ -735,7 +888,7 @@ impl FabricCommand for RecordingRunner {
                     }
                     match args.get(3) {
                         Some(&"ip") => return Ok(self.ip(args.get(2).copied(), &args[4..])),
-                        Some(&"bridge") => return Ok(self.bridge(&args[4..])),
+                        Some(&"bridge") => return Ok(self.bridge(args.get(2).copied(), &args[4..])),
                         _ => return Ok(CommandOutput::ok()),
                     }
                 }
@@ -774,7 +927,7 @@ impl FabricCommand for RecordingRunner {
                         let ns_name = (*ns).to_string();
                         self.netns.remove(*ns);
                         self.links
-                            .retain(|_, link| link.netns.as_deref() != Some(ns_name.as_str()));
+                            .retain(|(_, netns), _| netns.as_deref() != Some(ns_name.as_str()));
                     }
                     return Ok(CommandOutput::ok());
                 }
@@ -790,7 +943,8 @@ impl FabricCommand for RecordingRunner {
                 }
                 Ok(CommandOutput::ok())
             }
-            "bridge" => Ok(self.bridge(args)),
+            "bridge" => Ok(self.bridge(None, args)),
+            "iptables" => Ok(self.iptables(args)),
             _ => Ok(CommandOutput::ok()),
         }
     }
@@ -1061,6 +1215,201 @@ mod tests {
         assert!(out.success, "netns del failed: {}", out.stderr);
         assert!(!runner.has_link("wgx"), "ns links die with the netns");
         assert!(!runner.has_link("wgroot"));
+    }
+
+    /// Real kernels keep per-namespace name tables: the same name can
+    /// exist in the root namespace and inside a namespace at the same
+    /// time. The fake models this — it is the state the provider's
+    /// both-namespaces WireGuard collision check fails closed on.
+    #[test]
+    fn the_same_link_name_can_exist_in_two_namespaces() {
+        let mut runner = RecordingRunner::new();
+        assert!(ok_or_err_out(runner.run("ip", &["netns", "add", "nsx"])).success);
+        // Root-created link...
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "add", "wg0", "type", "wireguard"])).success
+        );
+        // ...plus a DIFFERENT link with the same name inside the ns: both
+        // coexist (the add does not fail with "File exists").
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                "nsx",
+                "ip",
+                "link",
+                "add",
+                "wg0",
+                "type",
+                "wireguard",
+            ],
+        ));
+        assert!(out.success, "per-ns name tables must allow the same name");
+        assert!(runner.has_link_in("wg0", None));
+        assert!(runner.has_link_in("wg0", Some("nsx")));
+        // Each namespace's show sees only its own link...
+        assert!(ok_or_err_out(runner.run("ip", &["link", "show", "wg0"])).success);
+        assert!(
+            ok_or_err_out(runner.run("ip", &["netns", "exec", "nsx", "ip", "link", "show", "wg0"]))
+                .success
+        );
+        // ...and a root-ns deletion does not touch the ns-scoped one.
+        assert!(ok_or_err_out(runner.run("ip", &["link", "del", "wg0"])).success);
+        assert!(
+            !runner.has_link_in("wg0", None),
+            "the root-ns link must be gone"
+        );
+        assert!(
+            runner.has_link_in("wg0", Some("nsx")),
+            "the ns-scoped link must survive a root-ns deletion"
+        );
+    }
+
+    /// The creating namespace of a link is recorded separately from its
+    /// current placement: a WireGuard interface's UDP socket binds in
+    /// the creating namespace for life and never follows
+    /// `ip link set netns` — the placement the underlay design
+    /// depends on.
+    #[test]
+    fn link_creation_namespace_is_recorded_separately_from_placement() {
+        let mut runner = RecordingRunner::new();
+        assert!(ok_or_err_out(runner.run("ip", &["netns", "add", "nsx"])).success);
+        // Root-created, then moved: the socket stays root-side.
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "add", "wgroot", "type", "wireguard"]))
+                .success
+        );
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "set", "wgroot", "netns", "nsx"])).success
+        );
+        assert_eq!(runner.link_created_in("wgroot"), Some(None));
+        assert!(runner.has_link_in("wgroot", Some("nsx")));
+        // Created INSIDE the namespace: the socket binds ns-side.
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                "nsx",
+                "ip",
+                "link",
+                "add",
+                "wgns",
+                "type",
+                "wireguard",
+            ],
+        ));
+        assert!(out.success, "ns-scoped add failed: {}", out.stderr);
+        assert_eq!(
+            runner.link_created_in("wgns"),
+            Some(Some("nsx".to_string()))
+        );
+        assert_eq!(runner.link_created_in("missing"), None);
+    }
+
+    /// Deleting one end of a veth pair removes BOTH ends, wherever the
+    /// peer currently lives — the real kernel semantics the legacy
+    /// underlay cleanup relies on (deleting the root-ns underlay veth
+    /// also removes the fabric-ns peer).
+    #[test]
+    fn deleting_one_end_of_a_veth_pair_removes_both() {
+        let mut runner = RecordingRunner::new();
+        assert!(ok_or_err_out(runner.run("ip", &["netns", "add", "nsx"])).success);
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "link", "add", "ev-u", "type", "veth", "peer", "name", "ev-v",
+            ],
+        ));
+        assert!(out.success, "veth pair creation failed: {}", out.stderr);
+        // The fabric end moves into the namespace (the v0.1.0/v0.1.1
+        // underlay shape).
+        assert!(ok_or_err_out(runner.run("ip", &["link", "set", "ev-v", "netns", "nsx"])).success);
+        assert!(runner.has_link_in("ev-u", None));
+        assert!(runner.has_link_in("ev-v", Some("nsx")));
+        // Deleting the ROOT end removes the moved peer too.
+        assert!(ok_or_err_out(runner.run("ip", &["link", "del", "ev-u"])).success);
+        assert!(!runner.has_link("ev-u"));
+        assert!(
+            !runner.has_link("ev-v"),
+            "deleting one veth end must remove the pair"
+        );
+        // Deleting a now-missing end fails like the real ip.
+        let out = ok_or_err_out(runner.run("ip", &["link", "del", "ev-u"]));
+        assert!(!out.success);
+        assert!(out.stderr.contains("Cannot find device"));
+    }
+
+    /// iptables nat rules: `-A` appends (duplicates accumulate, like the
+    /// real iptables), `-D` removes exactly one matching instance, and a
+    /// `-D` with no matching rule fails with the REAL wording the
+    /// provider's tolerant deletions must match.
+    #[test]
+    fn iptables_append_delete_and_bad_rule_wording() {
+        let mut runner = RecordingRunner::new();
+        let masq = [
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            "169.254.253.0/30",
+            "-j",
+            "MASQUERADE",
+        ];
+        assert!(ok_or_err_out(runner.run("iptables", &masq)).success);
+        assert!(ok_or_err_out(runner.run("iptables", &masq)).success);
+        assert_eq!(runner.iptables_rules().len(), 2, "duplicates accumulate");
+        // The dump lists one line per instance.
+        let out = ok_or_err_out(runner.run("iptables", &["-t", "nat", "-S"]));
+        assert!(out.success);
+        assert_eq!(
+            out.stdout
+                .lines()
+                .filter(|l| l.contains("MASQUERADE"))
+                .count(),
+            2
+        );
+        // A spec-for-spec -D removes ONE instance; a mismatched spec
+        // (different port) is a different rule entirely.
+        let del = [
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            "169.254.253.0/30",
+            "-j",
+            "MASQUERADE",
+        ];
+        assert!(ok_or_err_out(runner.run("iptables", &del)).success);
+        assert_eq!(runner.iptables_rules().len(), 1);
+        let wrong = [
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            "169.254.253.0/30",
+            "-j",
+            "ACCEPT",
+        ];
+        let out = ok_or_err_out(runner.run("iptables", &wrong));
+        assert!(!out.success, "a non-matching spec must fail");
+        // ...with the REAL iptables wording (kernel-faithful fake).
+        assert!(
+            out.stderr
+                .contains("Bad rule (does a matching rule exist in that chain?)"),
+            "real iptables -D wording: {}",
+            out.stderr
+        );
+        // The last matching instance deletes cleanly; then Bad rule.
+        assert!(ok_or_err_out(runner.run("iptables", &del)).success);
+        let out = ok_or_err_out(runner.run("iptables", &del));
+        assert!(!out.success, "deleting a missing rule must fail");
+        assert!(out.stderr.contains("Bad rule"));
+        assert!(runner.iptables_rules().is_empty());
     }
 
     #[test]

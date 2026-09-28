@@ -23,8 +23,9 @@ One provider instance realizes, on one Linux host, the networks described by
 **only** component permitted to manipulate the fabric's kernel objects.
 Control planes never touch `ip`/`wg`/`bridge` for fabric state directly.
 
-Shared (one per host): fabric network namespace, WireGuard interface,
-underlay veth attachment, NAT rules.
+Shared (one per host): fabric network namespace, WireGuard interface
+(created in the root namespace and moved into the fabric namespace, so
+its UDP transport socket binds root-side — §3.10).
 Per-network: VXLAN device, fabric-side learning bridge, attachment veth pair,
 head-end replication (HER) flood entries.
 
@@ -61,13 +62,13 @@ attachment, VNI binding allocation, placement, FIPs, lifecycle.
    re-converges to the true maximum.
 
    **Host prerequisites (operator responsibility, not provider-managed):**
-   the *root* network namespace must have `net.ipv4.ip_forward=1` — the
-   provider enables forwarding only inside the fabric namespace, while
-   forwarding between the host underlay veth and the physical underlay
-   happens in the root namespace — and the underlay device must tolerate
-   the fabric's asymmetric return path (`net.ipv4.conf.<underlay_dev>.rp_filter`
-   set to loose or off), since fabric replies leave through a different
-   veth than the underlay traffic arrives on.
+   the root namespace must have working routes to every peer's underlay
+   endpoint (the host's normal routing, however the host acquires it).
+   Nothing else: the v0.1.2 NAT-free underlay (§3.10) terminates the
+   WireGuard transport socket in the root namespace and hands encrypted
+   packets to the host's normal routing with dynamic source selection,
+   so the root namespace does not forward fabric packets and no
+   `ip_forward` or `rp_filter` tuning is required.
 4. Private keys are not representable in a plan. Only public keys travel in
    control-plane state.
 
@@ -91,16 +92,14 @@ idempotent).
 Reconciliation is **re-assertive, not create-only**: enslavement
 (`ip link set <vxlan|port veth> master <bridge>`), link state
 (`ip link set ... up`), the per-network MTUs (VXLAN, consumer veth,
-fabric-side port veth — all `tenant_mtu`), the underlay attachment
-(addressing via `ip addr replace`, link state, default route via
-`ip route replace`), and the local transport /32 on the WireGuard
-interface are re-asserted on **every** apply. All of these verbs are
-idempotent; a crash between object creation and any of these steps — or a
-mutated plan field such as `tenant_mtu` — heals on the next apply instead
-of leaving a half-plumbed network that reports as healthy. Only the
-WireGuard private key and listen port remain guarded by their
-create/configure flags (re-asserting them would be harmless but is
-unnecessary).
+fabric-side port veth — all `tenant_mtu`), and the local transport /32
+on the WireGuard interface are re-asserted on **every** apply. All of
+these verbs are idempotent; a crash between object creation and any of
+these steps — or a mutated plan field such as `tenant_mtu` — heals on
+the next apply instead of leaving a half-plumbed network that reports
+as healthy. Only the WireGuard private key and listen port remain
+guarded by their create/configure flags (re-asserting them would be
+harmless but is unnecessary).
 
 ### 3.3 Fail-closed on foreign state
 If a kernel object exists where the provider expects to create one — or an
@@ -176,8 +175,9 @@ list. This is what makes the network one literal VLAN across hosts.
 ### 3.8 Teardown ordering and convergence
 Network teardown removes, in order: HER flood entries, attachment veth
 pair, VXLAN device, fabric-side bridge; then reconciles the WireGuard peer
-set against remaining live plans. Fabric teardown (netns, WireGuard,
-underlay veths, NAT rules) is permitted only when zero networks are owned.
+set against remaining live plans. Fabric teardown (netns, WireGuard, and
+the legacy underlay machinery of §3.10) is permitted only when zero
+networks are owned.
 
 Teardown is idempotent and converges to the desired end state: deleting an
 object that is already absent is success (a deletion whose stderr
@@ -197,78 +197,142 @@ The provider never bridges fabric traffic into site-local switches; the
 only tenant-side exposure is the consumer attachment veth, which the host
 enslaves to its own tenant bridge under its own anti-spoof policy.
 
-### 3.10 WireGuard socket placement
-The WireGuard interface is created from **inside** the fabric namespace
-(`ip netns exec <fabric-ns> ip link add <wg> type wireguard`). A
-WireGuard interface's UDP socket binds in the namespace where the
-interface is **created** and never follows a later
-`ip link set netns` — verified empirically on kernel 6.8, including that
-a down/up toggle inside the destination namespace does not re-bind it.
-An interface created in the root namespace and then moved into the
-fabric namespace therefore leaves its listening socket in the root
-namespace, where the fabric's underlay DNAT rules do not apply: inbound
-encrypted flows are DNAT'ed toward the fabric namespace, where no socket
-listens, and are black-holed.
+### 3.10 WireGuard transport: root-created, moved in, NAT-free
 
-Legacy state — journals written by provider versions predating this
-invariant, detectable via the absent `wireguard_born_in_fabric_ns`
-journal flag, which old journals deserialize as `false` — is healed by a
-one-time, idempotent procedure: a stray root-namespace interface of the
-same name is swept tolerantly, but **only when the journal shows the
-provider owns (or owned) fabric state** — journal-before-mutate means a
-genuine legacy add-then-crash-before-move stray implies a journal, with
-one exception: the released v0.1.0/v0.1.1 code saved the ownership
-journal only at the end of apply, so a crash on the very first apply in
-the add→move window leaves a stray with an empty journal; that state
-wedges fail-closed and requires manual cleanup (it is no worse than the
-released baseline, which also wedged). On a fresh host (no journal) a
-colliding root-namespace link is foreign state
-and is never deleted, and the both-namespaces check below fails closed
-on it instead. Every VXLAN recorded in the ownership journal is deleted
-**first** (their `dev <wg>` underlay binding dies with the old
-interface, and identity verification cannot see that — §3.3; each
-network fully heals on its own next apply), then the namespace-scoped
-interface is deleted, and the interface is recreated from inside the
-fabric namespace with the private key and listen port forced. The
-journal flag is set only after the key/port configuration succeeds.
-This deletion order makes every interruption slice of the heal
-convergent: interrupted before the interface deletion, the next apply
-re-enters the heal and finishes; interrupted after it, the next apply
-takes the WireGuard-absent path, which recreates the interface inside
-the namespace and — when the journal is legacy (flag unset) and still
-records networks — also tolerantly deletes the recorded VXLANs, the
-same way. That wg-absent branch covers a legacy fabric whose WireGuard
-was lost entirely, including the crash window of heal implementations
-that deleted the interface before the VXLANs. If an interface of the
-WireGuard name exists in **both** the root and the fabric namespace,
-the provider fails closed (foreign state) rather than guessing which
-one is its own.
+The WireGuard interface is created in the **root** namespace and then
+moved into the fabric namespace:
+
+```
+ip link add <wg> type wireguard        # root namespace
+ip link set <wg> netns <fabric-ns>     # move
+ip netns exec <fabric-ns> ip addr replace <transport-ip>/32 dev <wg>
+ip netns exec <fabric-ns> ip link set <wg> up
+ip netns exec <fabric-ns> wg set <wg> private-key <path> listen-port <port>
+```
+
+A WireGuard interface's UDP socket binds in the namespace where the
+interface is **created** and never follows a later
+`ip link set netns` — verified empirically on kernel 6.8, including
+that a down/up toggle inside the destination namespace does not re-bind
+it. Creating the interface root-side is therefore what places the
+transport socket in the root namespace, and that placement is the
+design:
+
+- **Outbound**: encrypted packets leave through the host's normal
+  routing with dynamic source selection; the peer always observes
+  `<host-underlay-ip>:<port>`, stable across interface moves and
+  address changes.
+- **Inbound**: `<peer>:<port> → <host-ip>:<port>` is delivered directly
+  to the root-namespace listener.
+
+The provider MUST NOT install any iptables NAT rule for the transport.
+Two races make any NAT state on the transport fatal (the v0.1.2
+postmortem):
+
+1. **DNAT black-hole**: a PREROUTING DNAT rule rewrites every NEW
+   inbound flow toward the address the rule was written for; when the
+   listening socket lives elsewhere (as it does under the pre-v0.1.2
+   underlay), the flow is delivered where nothing listens and is
+   silently dropped — handshake initiation from the peer side never
+   completes.
+2. **MASQUERADE port remap**: under simultaneous bidirectional
+   initiation, the conntrack tuple for the host's own outbound flow
+   collides with the inbound flow's expectation and forces MASQUERADE
+   to remap the source port (observed: 65001 → 37414). WireGuard
+   endpoint roaming then latches the peer onto the remapped port, and
+   nothing steers return traffic back to it — the pair never recovers
+   without manual intervention.
+
+The only escape from both races is for the transport to carry no NAT
+state at all; the root-side socket gives the outbound direction the
+host's normal source selection and the inbound direction a directly
+addressed listener, so no rule is needed. Consequence: exactly one
+fabric per WireGuard listen port per host (two fabrics sharing a port
+would bind their sockets to the same `<host-ip>:<port>` and interleave
+each other's handshakes — deterministically rejected at creation time
+by the port collision instead).
+
+**Legacy migration.** The v0.1.0/v0.1.1 underlay (underlay veth pair,
+169.254.253.0/30, DNAT + MASQUERADE rules) is deleted **tolerantly on
+every apply** — rules first, with EXACTLY the rule specifications the
+old code installed (`iptables -t nat -D` only matches spec-for-spec),
+then the veth pair via its root end. Absence is this design's normal
+case, so the deletions are unconditional and idempotent. Journals
+written by v0.1.0/v0.1.1 (the `wireguard_born_in_fabric_ns` field
+absent, deserialized as `false`) already describe a root-created and
+moved WireGuard — exactly the placement mandated here — so no heal
+runs for them; only the legacy cleanup does. A journal with
+`wireguard_born_in_fabric_ns == true` (written only by the unpushed
+round-3..5 development code, whose WireGuard was created **inside**
+the fabric namespace and whose socket is therefore bound there) is
+healed by a one-time, idempotent, full procedure:
+
+1. A stray root-namespace interface of the same name is swept
+   tolerantly — but **only when the journal shows the provider owns
+   (or owned) fabric state** (journal-before-mutate means a genuine
+   crash stray implies such a journal; the same gate covers this
+   design's own add→move crash window). On a fresh host (no journal) a
+   colliding root-namespace link is foreign state and is never
+   deleted; the root-side `ip link add` fails closed on the name
+   instead. One exception wedges fail-closed by design: the released
+   v0.1.0/v0.1.1 code saved the ownership journal only at the end of
+   apply, so a crash on the very first apply in the add→move window
+   leaves a stray with an empty journal — manual cleanup is the remedy
+   (no worse than the released baseline, which also wedged).
+2. Every VXLAN recorded in the ownership journal is deleted **before**
+   the namespace-scoped interface (their `dev <wg>` underlay binding
+   dies with the old interface, and identity verification cannot see
+   that — §3.3; each network fully heals on its own next apply). This
+   order makes every interruption slice convergent: interrupted before
+   the interface deletion, the next apply re-enters the heal and
+   finishes; interrupted after it, the next apply takes the
+   WireGuard-absent path, which recreates the interface root-side and —
+   while the flag is still set and the journal still records networks —
+   also tolerantly deletes the recorded VXLANs, the same way.
+3. The namespace-scoped interface is deleted, the legacy underlay
+   machinery is cleaned up, and the interface is re-created in the
+   ROOT namespace, moved in, and configured with the private key and
+   listen port forced.
+4. The journal flag is cleared only after the key/port configuration
+   succeeds, so a crash anywhere in the heal simply re-runs it.
+
+If an interface of the WireGuard name exists in **both** the root and
+the fabric namespace while the journal claims a healthy fabric, the
+provider fails closed (foreign state) rather than guessing which one
+is its own.
 
 ## 4. Conformance
 
 Every provider integration MUST pass `fabric-conformance::run_suite()`
 (reference fake-kernel runner) in CI, covering: plan validation, idempotent
-replay, WireGuard creation inside the fabric namespace, flood-list
-reconciliation without duplicates after repeated replays, flood-list
-scoping, foreign-state rejection (including prefix-VNI rejection),
-teardown cleanliness, key non-leakage, peer withdrawal, and
-fabric-removal fencing — plus the hardening cases: teardown convergence
-after a simulated kernel restart, re-apply healing of partial state,
-flood-list shrinking, duplicate flood-entry convergence, and
-MTU/addressing re-assertion. The fake kernel
-models the real `ip`/`bridge`/`wg` failure and placement semantics
-(missing devices, duplicate names, missing namespaces, missing
+replay, WireGuard creation in the root namespace with the move into the
+fabric namespace, absence of any NAT rule for the transport, legacy
+underlay cleanup (exact-spec rule deletions plus the veth pair) on every
+apply, the born-in-fabric-namespace journal healing to the root-creation
+sequence, flood-list reconciliation without duplicates after repeated
+replays, flood-list scoping, foreign-state rejection (including
+prefix-VNI rejection), teardown cleanliness, key non-leakage, peer
+withdrawal, and fabric-removal fencing — plus the hardening cases:
+teardown convergence after a simulated kernel restart, re-apply healing
+of partial state, flood-list shrinking, duplicate flood-entry
+convergence, and MTU/addressing re-assertion. The fake kernel
+models the real `ip`/`bridge`/`wg`/`iptables` failure and placement
+semantics (missing devices, duplicate names, missing namespaces, missing
 fdb/route entries with real kernel error strings, per-namespace link
-placement, counting fdb entries), so a permissive provider flow fails
-the suite rather than silently passing.
+placement and name tables, per-namespace link-creation records — the
+WireGuard socket placement — the `Bad rule` wording of a non-matching
+`iptables -D`, and counting fdb entries), so a permissive provider flow
+fails the suite rather than silently passing.
 
 The privileged multi-host gate (three real hosts on one kernel, real
 WireGuard handshakes, cross-host L2 and near-MTU tenant traffic,
 cleartext underlay capture proving encryption, per-host assertion that
-the WireGuard UDP socket listens inside the fabric namespace and not in
-the root namespace, idempotent replay, and zero-leak teardown) is the
-separate harness `evidence/run-multinode.sh`; it is required before any
-production evidence claim.
+the WireGuard UDP socket listens in the ROOT namespace (`ss -uln` in
+the root namespace shows the listen port; inside the fabric namespace
+it does not, while `wg show` there still reports the port — the device
+lives in the namespace, the socket does not), idempotent replay, and
+zero-leak teardown) is the separate harness `evidence/run-multinode.sh`;
+it is required before any production evidence claim.
 
 ## 5. Versioning
 

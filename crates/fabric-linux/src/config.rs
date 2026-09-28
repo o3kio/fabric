@@ -11,11 +11,16 @@ pub const DEFAULT_WIREGUARD_PORT: u16 = 65_001;
 /// Standard VXLAN destination port.
 pub const DEFAULT_VXLAN_PORT: u16 = 4789;
 
-/// Default underlay attachment link-local pair (host side / fabric side).
+/// Legacy (v0.1.0/v0.1.1) underlay attachment link-local pair (host side /
+/// fabric side). The NAT-free underlay no longer creates any of this
+/// machinery; the addresses survive only as the exact specification
+/// operands of the tolerant legacy cleanup (`iptables -t nat -D ...`).
 pub const DEFAULT_UNDERLAY_HOST_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 253, 1);
-/// Fabric-side underlay veth address.
+/// Legacy fabric-side underlay veth address (the DNAT target of the
+/// v0.1.0/v0.1.1 rule the cleanup deletes).
 pub const DEFAULT_UNDERLAY_FABRIC_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 253, 2);
-/// The underlay attachment is a /30.
+/// The legacy underlay attachment /30 (the MASQUERADE source operand of
+/// the v0.1.0/v0.1.1 rule the cleanup deletes).
 pub const UNDERLAY_PREFIX: &str = "169.254.253.0/30";
 
 /// Configuration for the Linux fabric provider.

@@ -20,8 +20,10 @@
 #      packets appear in cleartext.
 #   5. Idempotent re-apply, zero-leak teardown in every host, and survival
 #      of the host keypair across fabric teardown (by design).
-#   6. WireGuard socket placement: the WG UDP socket listens inside the
-#      fabric namespace, never in the root namespace (contract §3.10).
+#   6. WireGuard socket placement: the WG UDP socket listens in the ROOT
+#      namespace — never inside the fabric namespace (contract §3.10,
+#      the NAT-free underlay: the interface is created root-side and
+#      moved in, and the socket binds in the creating namespace).
 #
 # PREREQUISITES (orchestrator machine):
 #   - Linux with the wireguard and vxlan kernel modules available (the
@@ -97,11 +99,13 @@ fail() {
   capture_diagnostics "$1"
 }
 
-# Post-failure diagnostics: the nat-table packet counters discriminate
-# between "the DNAT rule never fired" (counter 0 on a host whose peer
-# reports ICMP port-unreachable) and "the rule fired but something else
-# dropped the flow"; conntrack shows the tuple classification. Captured
-# into the results dir on every failure for post-mortem analysis.
+# Post-failure diagnostics. Under the NAT-free underlay (contract §3.10)
+# the provider installs NO nat rules of its own, so the nat table's
+# packet counters are expected to show only the container runtime's own
+# chains (e.g. docker's MASQUERADE) — any rule referencing port 65001 or
+# 169.254.253.0/30 in this dump is itself a regression signal; conntrack
+# shows the tuple classification. Captured into the results dir on every
+# failure for post-mortem analysis.
 capture_diagnostics() {
   local triggering="$1"
   for h in "${HOSTS[@]}"; do
@@ -209,7 +213,7 @@ trap cleanup EXIT
 # --------------------------------------------------------------------------
 # Static musl build: the binary must run inside the containers regardless
 # of the orchestrator's glibc version.
-log "1/9 building fabric-evidence (release, static musl)"
+log "1/8 building fabric-evidence (release, static musl)"
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v runuser >/dev/null 2>&1; then
   # Root's PATH does not carry the invoking user's rustup toolchain
   # (~/.cargo/bin), and runuser does not start a login shell: resolve
@@ -229,7 +233,7 @@ fi
 # --------------------------------------------------------------------------
 # 2. docker network + image + three privileged containers
 # --------------------------------------------------------------------------
-log "2/9 creating docker network $NET_NAME ($NET_SUBNET) and containers"
+log "2/8 creating docker network $NET_NAME ($NET_SUBNET) and containers"
 if ! "${DOCKER[@]}" network inspect "$NET_NAME" >/dev/null 2>&1; then
   "${DOCKER[@]}" network create --subnet "$NET_SUBNET" "$NET_NAME" >/dev/null
 fi
@@ -254,11 +258,14 @@ rm -rf "$BUILD_DIR"
 for h in "${HOSTS[@]}"; do
   "${DOCKER[@]}" rm -f "fev-$h" >/dev/null 2>&1 || true
   # One shared workdir mount; each host uses its own state root /work/<h>.
+  # No ip_forward/rp_filter sysctls: under the NAT-free underlay the
+  # root namespace terminates the WG transport socket and hands packets
+  # to the container's normal routing — it never forwards fabric
+  # packets (contract §2.3).
   "${DOCKER[@]}" run -d --name "fev-$h" \
     --privileged \
     --network "$NET_NAME" \
     --hostname "$h" \
-    --sysctl net.ipv4.ip_forward=1 \
     -v "$BIN:/usr/local/bin/fabric-evidence:ro" \
     -v "$WORK_DIR:/work" \
     "$IMAGE" sleep infinity >/dev/null
@@ -266,23 +273,9 @@ for h in "${HOSTS[@]}"; do
 done
 
 # --------------------------------------------------------------------------
-# 3. root-namespace prerequisites in every container
+# 3. identities (public keys only — never private material)
 # --------------------------------------------------------------------------
-log "3/9 applying root-ns prerequisites (ip_forward, rp_filter)"
-for h in "${HOSTS[@]}"; do
-  # Contract §2.3 host prerequisites: forwarding between the host underlay
-  # veth and the container's external underlay happens in the root ns
-  # (the provider enables it only inside the fabric ns), and the fabric's
-  # asymmetric return path needs rp_filter tolerance.
-  hexec "$h" sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  hexec "$h" sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
-  hexec "$h" sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
-done
-
-# --------------------------------------------------------------------------
-# 4. identities (public keys only — never private material)
-# --------------------------------------------------------------------------
-log "4/9 collecting host identities"
+log "3/8 collecting host identities"
 declare -A PUBKEY
 for h in "${HOSTS[@]}"; do
   fev "$h" identity --root "/work/$h" --prefix "$PREFIX" >"$RESULTS_DIR/identity-$h.json"
@@ -304,9 +297,9 @@ done
 log "container underlay IPs: h1=${CONN_IP[h1]} h2=${CONN_IP[h2]} h3=${CONN_IP[h3]}"
 
 # --------------------------------------------------------------------------
-# 5. plan generation (on the orchestrator)
+# 4. plan generation (on the orchestrator)
 # --------------------------------------------------------------------------
-log "5/9 generating plans (vni $VNI, tenant_mtu $TENANT_MTU, fabric_mtu $FABRIC_MTU)"
+log "4/8 generating plans (vni $VNI, tenant_mtu $TENANT_MTU, fabric_mtu $FABRIC_MTU)"
 python3 - "$WORK_DIR" "$WG_PORT" "$VNI" "$NETWORK_ID" "$TENANT_MTU" "$FABRIC_MTU" \
   "${CONN_IP[h1]}" "${CONN_IP[h2]}" "${CONN_IP[h3]}" \
   "${PUBKEY[h1]}" "${PUBKEY[h2]}" "${PUBKEY[h3]}" <<'PY'
@@ -347,9 +340,9 @@ for host_id, conn_ip, pubkey, transport_ip in hosts:
 PY
 
 # --------------------------------------------------------------------------
-# 6. apply + tenant-up on every host
+# 5. apply + tenant-up on every host
 # --------------------------------------------------------------------------
-log "6/9 applying plans and bringing tenants up"
+log "5/8 applying plans and bringing tenants up"
 for h in "${HOSTS[@]}"; do
   if fev "$h" apply --root "/work/$h" --prefix "$PREFIX" --plan "/work/plan-$h.json" \
       >"$RESULTS_DIR/apply-$h.json" 2>"$RESULTS_DIR/apply-$h.stderr"; then
@@ -367,18 +360,21 @@ for h in "${HOSTS[@]}"; do
   fi
 done
 
-# WireGuard socket placement (regression evidence for the create-in-ns
-# fix, contract §3.10): the WG UDP socket must live INSIDE the fabric
-# namespace. A WireGuard socket binds in the netns where the interface
-# is CREATED and never follows a later `ip link set netns`, so an
-# interface created in the root ns and moved would leave its socket in
-# the root ns — where the fabric's DNAT rules do not apply — and peer
-# traffic would be sent un-NAT'ed into a black hole. ss(8) lists
-# listening UDP sockets per network namespace, so the namespace side of
-# the invariant is directly observable; and because ss alone proves
-# only "a listener", `wg show <wg>` inside the fabric namespace is
-# additionally required to succeed and report the configured listen
-# port, proving the listener belongs to our WireGuard device.
+# WireGuard socket placement (regression evidence for the NAT-free
+# underlay, contract §3.10): the WG UDP socket must live in the ROOT
+# namespace — never inside the fabric namespace. A WireGuard socket
+# binds in the netns where the interface is CREATED and never follows a
+# later `ip link set netns`; the provider therefore creates the
+# interface root-side and moves it in, so the socket binds in the root
+# namespace, where outbound encrypted packets take the host's normal
+# routing (dynamic source selection, no NAT rewriting the port) and
+# inbound flows to <host-ip>:<port> reach the listener directly. ss(8)
+# lists listening UDP sockets per network namespace, so the root-ns
+# side of the invariant is directly observable; and because ss alone
+# proves only "a listener", `wg show <wg>` inside the fabric namespace
+# is additionally required to succeed and report the configured listen
+# port, proving the device (which lives in the fabric ns) owns the
+# root-ns listener.
 for h in "${HOSTS[@]}"; do
   ns_ss="$(hexec "$h" ip netns exec "$PREFIX-fabric" ss -uln)"
   root_ss="$(hexec "$h" ss -uln)"
@@ -386,12 +382,11 @@ for h in "${HOSTS[@]}"; do
   printf '%s\n' "$root_ss" >"$RESULTS_DIR/ss-root-ns-$h.txt"
   ns_listening="$(printf '%s\n' "$ns_ss" | grep -E ":${WG_PORT}\b" || true)"
   root_listening="$(printf '%s\n' "$root_ss" | grep -E ":${WG_PORT}\b" || true)"
-  # ss(8) alone proves only "a listener on the port inside the
+  # ss(8) alone proves only "a listener on the port in the root
   # namespace" — not that the listener belongs to OUR WireGuard device.
-  # Prove socket ownership: `wg show <wg>` inside the fabric namespace
-  # must succeed and report the configured listen port (a wg device
-  # whose UDP socket is bound elsewhere, or a foreign socket on the
-  # port, cannot satisfy this).
+  # Prove ownership from the device side: `wg show <wg>` inside the
+  # fabric namespace (where the device lives) must succeed and report
+  # the configured listen port.
   wg_ns_show=""
   if wg_ns_show="$(hexec "$h" ip netns exec "$PREFIX-fabric" wg show "$PREFIX-wg" 2>&1)"; then
     printf '%s\n' "$wg_ns_show" >"$RESULTS_DIR/wg-show-fabric-ns-$h.txt"
@@ -402,12 +397,12 @@ for h in "${HOSTS[@]}"; do
   fi
   wg_port_reported="$(printf '%s\n' "$wg_ns_show" \
     | grep -E "listening port: ${WG_PORT}$" || true)"
-  if [[ -n "$ns_listening" && -z "$root_listening" && -n "$wg_port_reported" ]]; then
-    pass "wg_socket_in_fabric_ns_$h" \
-      "WG device $PREFIX-wg reports listen port $WG_PORT in $PREFIX-fabric ns; UDP $WG_PORT listens there, not in root ns"
+  if [[ -z "$ns_listening" && -n "$root_listening" && -n "$wg_port_reported" ]]; then
+    pass "wg_socket_in_root_ns_$h" \
+      "WG device $PREFIX-wg reports listen port $WG_PORT in $PREFIX-fabric ns; UDP $WG_PORT listens in the root ns, not in the fabric ns"
   else
-    fail "wg_socket_in_fabric_ns_$h" \
-      "ns match: '${ns_listening:-<none>}', root match: '${root_listening:-<none>}', wg-reported port: '${wg_port_reported:-<none>}'"
+    fail "wg_socket_in_root_ns_$h" \
+      "root match: '${root_listening:-<none>}', ns match: '${ns_listening:-<none>}', wg-reported port: '${wg_port_reported:-<none>}'"
   fi
 done
 
@@ -426,9 +421,9 @@ for h in "${HOSTS[@]}"; do
 done
 
 # --------------------------------------------------------------------------
-# 7. evidence collection
+# 6. evidence collection
 # --------------------------------------------------------------------------
-log "7/9 collecting evidence"
+log "6/8 collecting evidence"
 
 # Continuous ARP monitor per host (root-ns eth0): the full ARP timeline —
 # requests AND replies from each vantage — is the decisive instrument for
@@ -633,9 +628,9 @@ for h in "${HOSTS[@]}"; do
 done
 
 # --------------------------------------------------------------------------
-# 8. summary
+# 7. summary
 # --------------------------------------------------------------------------
-log "8/9 writing summary"
+log "7/8 writing summary"
 python3 - "$RESULTS_DIR" <<'PY' >"$RESULTS_DIR/summary.json"
 import json, sys
 results = sys.argv[1]
@@ -655,7 +650,7 @@ summary = {
 print(json.dumps(summary, indent=2))
 PY
 
-log "9/9 assertion table"
+log "8/8 assertion table"
 echo "=================================================================="
 while IFS=$'\t' read -r name ok detail; do
   if [[ "$ok" == "true" ]]; then status="PASS"; else status="FAIL"; fi
