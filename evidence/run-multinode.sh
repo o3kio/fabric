@@ -157,7 +157,16 @@ trap cleanup EXIT
 # of the orchestrator's glibc version.
 log "1/9 building fabric-evidence (release, static musl)"
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v runuser >/dev/null 2>&1; then
-  runuser -u "$SUDO_USER" -- cargo build --release --target x86_64-unknown-linux-musl -p fabric-evidence
+  # Root's PATH does not carry the invoking user's rustup toolchain
+  # (~/.cargo/bin), and runuser does not start a login shell: resolve
+  # cargo through a login shell of the build user and invoke it by
+  # absolute path.
+  CARGO_BIN="$(runuser -u "$SUDO_USER" -- sh -lc 'command -v cargo')" || CARGO_BIN=""
+  [[ -n "$CARGO_BIN" ]] || {
+    echo "cargo not on PATH for build user $SUDO_USER" >&2
+    exit 1
+  }
+  runuser -u "$SUDO_USER" -- "$CARGO_BIN" build --release --target x86_64-unknown-linux-musl -p fabric-evidence
 else
   cargo build --release --target x86_64-unknown-linux-musl -p fabric-evidence
 fi
