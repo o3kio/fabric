@@ -194,6 +194,36 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     /// (or port) change between create and teardown leaves the
     /// old-prefix shared objects behind. Network-scoped objects are
     /// immune: they are deleted by their journal-recorded names.
+    ///
+    /// Teardown enforces the SAME pre-destruction residue verification
+    /// as apply (round-8 MINOR-1, contract §3.10): the read-only nat
+    /// table listing runs here — after the eligibility guards, BEFORE
+    /// the WireGuard deletion, the namespace deletion, and the tolerant
+    /// legacy deletes — so a legacy-underlay residue that the
+    /// exact-spec deletions cannot remove fails the teardown closed
+    /// with EVERY kernel object still in place. Before round-7's hoist
+    /// the listing lived inside `cleanup_legacy_underlay` and thus also
+    /// covered this path; the hoist (correctly) moved it ahead of the
+    /// apply-path destruction but silently dropped it from teardown,
+    /// letting a host carrying an operator VARIANT of a legacy rule
+    /// tear down "successfully" and orphan the variant in the root nat
+    /// table. The verification reuses the apply path's exact
+    /// one-instance-per-exact-spec tolerance: the tolerant deletes
+    /// later in THIS teardown remove exactly those specs, so a legacy
+    /// host holding its own exact v0.1.0/v0.1.1 rules still converges
+    /// (the documented migration); a variant, a second identical
+    /// instance, or any other signature hit fails closed BEFORE any
+    /// destructive action.
+    ///
+    /// Crash-slice reasoning (the mirror of the apply path's): a crash
+    /// between this verification and the tolerant deletes below leaves
+    /// the journals untouched (the ownership journal is only rewritten
+    /// after the deletions succeed) and the kernel one deletion further
+    /// along at most. The next operation — apply OR teardown —
+    /// re-runs the same verification with the same tolerance and then
+    /// re-runs the same idempotent tolerant deletes, so every
+    /// interruption slice converges; no slice can strand residue that a
+    /// later pass would have rejected.
     pub fn remove_fabric_if_unused(&mut self) -> Result<bool, FabricError> {
         if !self.ownership.networks.is_empty() {
             return Ok(false);
@@ -206,6 +236,14 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
                 return Ok(false);
             }
         }
+
+        // Residue verification BEFORE any destructive action (see the
+        // doc comment above): read-only, so it can safely precede even
+        // the WireGuard deletion. A failure here leaves the wg, the
+        // fabric namespace, and the ownership journal fully intact —
+        // fail closed with state preserved, exactly like the apply
+        // path's guarantee.
+        self.verify_no_legacy_nat_residue()?;
 
         let names = config_names(&self.config)?;
         let ns = names.fabric_namespace();
@@ -333,8 +371,12 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         //    dump to be quiet before healing) silently keeps a dead
         //    transport in the second case — the exact class this
         //    design forbids. So: fail CLOSED on the ambiguity — no
-        //    deletion, no journal change, a specific error naming both
-        //    observations, the configured port, and the remediation.
+        //    deletion, no ownership-journal change, a specific error
+        //    naming both observations, the configured port, and the
+        //    remediation. (The plan journal has already been persisted
+        //    by journal-before-mutate — that write is intent, not
+        //    fabric state, which is why the guarantee is scoped to
+        //    fabric state and the ownership journal.)
         //    Both underlying causes converge to a good state after the
         //    operator removes the foreign listener; an apply failing
         //    this way leaves the existing datapath untouched.
@@ -396,7 +438,8 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
                              WireGuard is healthy (root-bound socket) with a FOREIGN \
                              fabric-namespace listener, or it was born inside the fabric \
                              namespace (dead transport) with a FOREIGN root-namespace \
-                             listener. Nothing was modified. Remediation: inspect the \
+                             listener. No fabric state and no ownership-journal state \
+                             was modified. Remediation: inspect the \
                              listeners on port {port} in both namespaces \
                              (ip netns exec {ns} ss -ulnp; ss -ulnp), remove the foreign \
                              one, and re-apply — an existing healthy datapath is \
@@ -734,19 +777,21 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     }
 
     /// Read-only legacy-residue verification (round-6 MINOR-1, hoisted
-    /// to the apply start in round-7, contract §3.10): list the nat
-    /// table and fail closed on any rule matching the legacy underlay
-    /// signature that the apply's tolerant exact-spec deletions cannot
-    /// remove — operator-installed VARIANTS of the legacy rules (a DNAT
-    /// with `-i eth0` instead of `! -i <prefix>-u`, a different
-    /// address inside 169.254.253/24, a duplicate instance of an exact
-    /// spec, ...). Residue NAT state on the WireGuard transport is
-    /// exactly the postmortem's silent-death mode; a delete that
+    /// to the apply start in round-7 and extended to the fabric-teardown
+    /// path in round-8, contract §3.10): list the nat table and fail
+    /// closed on any rule matching the legacy underlay signature that
+    /// neither the apply's nor the teardown's tolerant exact-spec
+    /// deletions can remove — operator-installed VARIANTS of the legacy
+    /// rules (a DNAT with `-i eth0` instead of `! -i <prefix>-u`, a
+    /// different address inside 169.254.253/24, a duplicate instance of
+    /// an exact spec, ...). Residue NAT state on the WireGuard transport
+    /// is exactly the postmortem's silent-death mode; a delete that
     /// silently missed must not pass as cleaned — and the failure must
     /// arrive BEFORE any destructive action on any path (before the
-    /// heal deletions, before the root stray sweep), with every kernel
-    /// object still in place. Fails closed on a hard failure of the
-    /// listing itself, too (the provider cannot know what remains).
+    /// apply's heal deletions and root stray sweep; before teardown's
+    /// WireGuard and namespace deletions), with every kernel object
+    /// still in place. Fails closed on a hard failure of the listing
+    /// itself, too (the provider cannot know what remains).
     fn verify_no_legacy_nat_residue(&mut self) -> Result<(), FabricError> {
         let host_veth = config_names(&self.config)?.host_underlay_veth();
         let exact = self.legacy_exact_rule_lines(&host_veth);
@@ -4050,8 +4095,10 @@ mod tests {
                     "the error must name both observations' namespaces: {observed}"
                 );
                 assert!(
-                    observed.contains("Nothing was modified"),
-                    "the error must state that nothing was modified: {observed}"
+                    observed
+                        .contains("No fabric state and no ownership-journal state was modified"),
+                    "the error must scope the nothing-modified guarantee to fabric \
+                     state and the ownership journal: {observed}"
                 );
             }
             other => {
@@ -4301,6 +4348,125 @@ mod tests {
         assert!(
             result.is_err(),
             "a hard failure of the socket-placement observation must fail the apply closed"
+        );
+        Ok(())
+    }
+
+    /// Round-8 NIT-2: the ROOT-namespace leg of the three-way
+    /// socket-placement discriminator has its own hard-failure branch,
+    /// reachable only when the fabric-ns leg is POSITIVE (the root leg
+    /// is issued only then). The existing
+    /// `socket_placement_check_failure_fails_closed` injects a
+    /// substring `ss -uln` failure, which the fabric-ns leg (issued
+    /// first, on every healthy apply) consumes — the root leg's `Err`
+    /// branch never executes there. This test makes the fabric-ns leg
+    /// positive with an ns-born wg and injects a failure for the bare
+    /// root-ns `ss -uln` ONLY, via an exact-line injection: the root
+    /// line is a strict SUFFIX of the namespaced line
+    /// `ip netns exec <ns> ss -uln`, so substring matching can never
+    /// target the root leg alone. The apply must fail closed as a
+    /// Command error with nothing healed and nothing deleted.
+    ///
+    /// Honest classification: this is a forward COVERAGE PIN, not a
+    /// fails-pre-fix test. The root-leg `Err` branch exists and already
+    /// fails the apply closed at 4e246c3 (round-7 introduced the
+    /// three-way discriminator); what is missing there is any test that
+    /// exercises the branch — and the `fail_on_exact` test-kit helper
+    /// this test needs does not exist at 4e246c3 either, so the test
+    /// cannot even compile against it. Verified empirically in a
+    /// throwaway worktree (see the round-8 report).
+    #[test]
+    fn root_leg_ss_hard_failure_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("wg-ss-root-fail")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let vxlan = names.vxlan(&plan.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        let mut runner = provider.into_runner();
+
+        // Make the fabric-ns leg positive: an ns-born wg whose socket
+        // (and listener) is bound inside the fabric namespace.
+        reborn_wg_in_ns(&mut runner, &config, &names)?;
+        let ns_ss = runner.run("ip", &["netns", "exec", &ns, "ss", "-uln"])?;
+        assert!(
+            ns_ss.stdout.contains(":65001"),
+            "seeding sanity: the ns-born wg must listen inside the fabric ns"
+        );
+        // Fail ONLY the bare root-ns `ss -uln` (exact-line match): the
+        // fabric-ns leg must keep succeeding so the discriminator
+        // reaches the root leg.
+        runner.fail_on_exact("ss -uln");
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let result = provider.apply_plan(&plan);
+        let slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let wg_still_ns_born = provider.runner().link_created_in(&wg);
+        let wg_kept = provider.runner().has_link_in(&wg, Some(&ns));
+        let vxlan_kept = provider.runner().has_link(&vxlan);
+        let flag = provider.ownership().wireguard_born_in_fabric_ns;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        // Both legs ran, in order: the fabric-ns observation succeeded,
+        // and only then was the root-ns observation attempted.
+        let fabric_leg = slice
+            .iter()
+            .position(|line| line == &format!("ip netns exec {ns} ss -uln"));
+        let root_leg = slice.iter().position(|line| line == "ss -uln");
+        assert!(
+            fabric_leg.is_some(),
+            "the fabric-ns leg must run (it must succeed here): {slice:?}"
+        );
+        assert_eq!(
+            root_leg,
+            Some(slice.len().saturating_sub(1)),
+            "the root-ns leg must be the LAST command issued: {slice:?}"
+        );
+        // The apply failed closed as a Command error (the root-leg
+        // hard-failure branch — never "port absent").
+        match result {
+            Err(FabricError::Command(message)) => {
+                assert!(
+                    message.contains("root namespace"),
+                    "the error must name the root-ns observation: {message}"
+                );
+            }
+            other => {
+                return Err(Box::new(FabricError::Invalid(format!(
+                    "a hard failure of the root-ns ss leg must fail the apply closed as a \
+                     command error, got {other:?}"
+                ))));
+            }
+        }
+        // Nothing healed, nothing deleted: the ns-born wg (still a dead
+        // transport — the operator's problem now, on a loud error), the
+        // recorded vxlan, and the journal all survive untouched.
+        assert_eq!(
+            wg_still_ns_born,
+            Some(Some(ns.clone())),
+            "the ns-born wg must NOT be healed across the failed root-leg observation"
+        );
+        assert!(wg_kept, "the ns-born wg must survive untouched");
+        assert!(vxlan_kept, "the recorded vxlan must survive untouched");
+        assert!(
+            !flag,
+            "the failed observation must not journal a heal claim"
+        );
+        assert!(
+            !slice.iter().any(|line| line.contains(" link del ")),
+            "the failed observation must issue no deletions at all: {slice:?}"
         );
         Ok(())
     }
@@ -4627,6 +4793,205 @@ UNCONN 0      0      0.0.0.0:53         0.0.0.0:*\n";
         assert!(
             flag,
             "the heal-pending flag must be untouched by the failed apply"
+        );
+        Ok(())
+    }
+
+    // ---- round-8 MINOR-1: teardown residue verification ------------------
+
+    /// Round-8 MINOR-1: the fabric-teardown path lost the residue
+    /// fail-closed guard when the verification was hoisted to the apply
+    /// start in round-7 — `remove_fabric_if_unused` ran only the
+    /// tolerant exact-spec deletes, so a host carrying an operator
+    /// VARIANT of a legacy rule (which the exact `-D`s cannot hit) tore
+    /// down "successfully" and silently orphaned the variant rule in
+    /// the root nat table. Teardown must now fail CLOSED with the wg
+    /// link, the fabric namespace, and the ownership journal fully
+    /// intact — fail closed with state preserved, matching the apply
+    /// path's guarantee. Pre-fix (4e246c3): teardown returned Ok(true),
+    /// deleted the wg and the namespace, and left the variant rule
+    /// orphaned — every assertion below fails against that behavior
+    /// (verified empirically against 4e246c3 in a throwaway worktree).
+    #[test]
+    fn teardown_with_nat_residue_variant_fails_closed_state_preserved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("teardown-residue")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        provider.remove_network(&plan.network_id)?;
+        let mut runner = provider.into_runner();
+
+        // Seed an operator VARIANT of the legacy DNAT rule (same intent,
+        // different specification): the exact-spec deletes later in the
+        // teardown cannot hit it.
+        let variant: Vec<&str> = vec![
+            "-t",
+            "nat",
+            "-A",
+            "PREROUTING",
+            "-i",
+            "eth0",
+            "-p",
+            "udp",
+            "--dport",
+            "65001",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            "169.254.253.2",
+        ];
+        let out = runner.run("iptables", &variant)?;
+        assert!(
+            out.success,
+            "could not seed the variant rule: {}",
+            out.stderr
+        );
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let result = provider.remove_fabric_if_unused();
+        let slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let wg_kept = provider.runner().has_link_in(&wg, Some(&ns));
+        let ns_kept = provider.runner().has_netns(&ns);
+        let rules_after = provider.runner().iptables_rules();
+        let journal_kept =
+            provider.ownership().fabric_configured && provider.ownership().fabric_creation_claimed;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        match result {
+            Err(FabricError::ForeignState { observed, .. }) => {
+                assert!(
+                    observed.contains("--dport 65001"),
+                    "the error must name the residue rule: {observed}"
+                );
+            }
+            other => {
+                return Err(Box::new(FabricError::Invalid(format!(
+                    "teardown with a legacy nat-rule variant must fail closed as foreign \
+                     state, got {other:?}"
+                ))));
+            }
+        }
+        // Fail closed with state preserved: the wg, the fabric ns, the
+        // ownership journal, and the residue rule itself all survive.
+        assert!(
+            wg_kept,
+            "the wg must survive the residue failure (the verification must precede \
+             the teardown deletions)"
+        );
+        assert!(
+            ns_kept,
+            "the fabric namespace must survive the residue failure"
+        );
+        assert_eq!(
+            rules_after.len(),
+            1,
+            "the variant rule must remain in place (never deleted by a non-matching \
+             spec): {rules_after:?}"
+        );
+        assert!(
+            journal_kept,
+            "the ownership journal must survive the residue failure untouched"
+        );
+        // Ordering: the read-only residue listing ran, and NO destructive
+        // command was issued at all after it.
+        assert!(
+            slice.iter().any(|line| line == "iptables -t nat -S"),
+            "the teardown must run the residue verification: {slice:?}"
+        );
+        assert!(
+            !slice.iter().any(|line| line.contains(" link del ")),
+            "the residue failure must issue no deletions at all: {slice:?}"
+        );
+        assert!(
+            !slice
+                .iter()
+                .any(|line| line == &format!("ip netns del {ns}")),
+            "the residue failure must not delete the fabric namespace: {slice:?}"
+        );
+        Ok(())
+    }
+
+    /// Round-8 MINOR-1 (tolerance pin): a legacy host holding EXACTLY
+    /// the two exact v0.1.1 rule specs still tears down successfully —
+    /// the hoisted teardown verification reuses the apply path's
+    /// one-instance-per-exact-spec tolerance, and the tolerant deletes
+    /// later in the same teardown remove exactly those specs, so the
+    /// documented migration convergence holds on the teardown path too.
+    /// This passes against the pre-fix code as well (teardown already
+    /// ran the tolerant deletes and never verified residue); it is a
+    /// FORWARD PIN for the tolerance semantics, guarding against a
+    /// future stricter teardown verification breaking legacy-host
+    /// convergence (declared honestly per the round-8 brief).
+    #[test]
+    fn teardown_on_legacy_host_with_exact_rules_converges() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("teardown-legacy")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let host_veth = names.host_underlay_veth();
+        let fabric_veth = names.fabric_underlay_veth();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        provider.remove_network(&plan.network_id)?;
+        let mut runner = provider.into_runner();
+
+        // The exact legacy machinery a v0.1.0/v0.1.1 deployment presents:
+        // both exact-spec nat rules plus the underlay veth pair.
+        seed_legacy_underlay(&mut runner, &config, &names)?;
+        assert_eq!(
+            runner.iptables_rules().len(),
+            2,
+            "seeding sanity: both exact legacy rules must be present"
+        );
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let removed = provider.remove_fabric_if_unused()?;
+        let rules_gone = provider.runner().iptables_rules().is_empty();
+        let veth_gone = !provider.runner().has_link(host_veth.as_str())
+            && !provider.runner().has_link(fabric_veth.as_str());
+        let ns_gone = !provider.runner().has_netns(&ns);
+        let journal_cleared = !provider.ownership().fabric_configured
+            && !provider.ownership().fabric_creation_claimed;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            removed,
+            "a legacy host holding exactly the two exact v0.1.1 specs must tear down \
+             successfully (one-instance-per-exact-spec tolerance)"
+        );
+        assert!(
+            rules_gone,
+            "the tolerant exact-spec deletes must remove both legacy rules on teardown"
+        );
+        assert!(
+            veth_gone,
+            "neither end of the legacy underlay veth may survive teardown"
+        );
+        assert!(
+            ns_gone,
+            "the fabric namespace must be removed by a successful teardown"
+        );
+        assert!(
+            journal_cleared,
+            "a successful teardown must clear the fabric ownership journal"
         );
         Ok(())
     }

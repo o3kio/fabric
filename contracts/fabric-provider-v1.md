@@ -177,7 +177,12 @@ Network teardown removes, in order: HER flood entries, attachment veth
 pair, VXLAN device, fabric-side bridge; then reconciles the WireGuard peer
 set against remaining live plans. Fabric teardown (netns, WireGuard, and
 the legacy underlay machinery of §3.10) is permitted only when zero
-networks are owned.
+networks are owned, and is preceded by the same read-only nat-residue
+verification as apply (§3.10): a legacy-rule variant the tolerant deletes
+cannot hit fails the teardown closed with the WireGuard, the fabric
+namespace, and the ownership journal intact, while a host holding exactly
+its own two exact v0.1.1 rules still tears down (the same
+one-instance-per-exact-spec tolerance).
 
 Teardown is idempotent and converges to the desired end state: deleting an
 object that is already absent is success (a deletion whose stderr
@@ -266,7 +271,19 @@ the nat table is LISTED (`iptables -t nat -S`, read-only) at the
 (before the heal's WireGuard and recorded-VXLAN deletions, before the
 root stray sweep, before the tolerant deletes themselves), and the
 apply **fails closed** on any residue rule matching the legacy
-underlay signature, so a hit leaves every kernel object in place. The
+underlay signature, so a hit leaves every kernel object in place.
+**Fabric teardown enforces the same pre-destruction verification**
+(round-8): `remove_fabric_if_unused` runs the identical read-only
+listing — after its eligibility guards, before the WireGuard deletion,
+the namespace deletion, and its own tolerant legacy deletes — so a
+residue variant fails the teardown closed with the WireGuard link, the
+fabric namespace, and the ownership journal fully intact (fail closed
+with state preserved, the same guarantee the apply path gives). A
+crash between the teardown's verification and its tolerant deletes is
+covered by the same convergence argument as every other slice: the
+ownership journal is only rewritten after the deletions succeed, and
+the next operation — apply or teardown — re-verifies with the same
+tolerance and re-runs the same idempotent deletes. The
 signature is deliberately **broad**, and each arm carries its
 rationale:
 
@@ -284,6 +301,30 @@ The only tolerance is exactly ONE instance of each exact v0.1.1 rule
 specification — the tolerant deletes are guaranteed to remove those,
 so they are this provider's own convergent legacy state, not foreign
 variants; a second instance of either, or any variant, fails closed.
+The tolerance applies identically on the teardown path: the tolerant
+deletes later in the same teardown remove exactly those specs, so a
+legacy host holding its own exact v0.1.0/v0.1.1 rules still tears down
+— the documented migration convergence holds in both directions.
+
+**Byte-identity assumption of the `-S` tolerance (validation gap,
+documented honestly).** The one-instance tolerance — and the round-6
+tolerant deletes themselves — compare `iptables -t nat -S` output
+lines byte-for-byte against the provider's exact v0.1.0/v0.1.1
+rule-spec strings. The conformance fake kernel canonically re-joins
+the provider's own tokens, so it cannot detect a divergence between
+the ADD-time specification and a real kernel's `-S` rendering of the
+same rule (negation token order, option rewrites or re-ordering by
+iptables-versions). The assumption is believed safe because the two
+specs are simple (a three-operand MASQUERADE and a single-negation
+DNAT), were verified spec-for-spec against `git show
+v0.1.1:crates/fabric-linux/src/provider.rs` in round 6, and the same
+byte identity already underpinned the round-6 deletes. A real-kernel
+divergence would NOT silently pass: the would-be tolerated line would
+miss the exact-spec comparison, match the broad residue signature, and
+fail the apply or teardown closed — loud, kernel intact, remediable by
+hand-deleting the residue. The multi-node evidence environment never
+exercises this path (fresh hosts, no legacy rules), so the assumption
+is covered by the argument above, not by the evidence loop.
 The veth deletion is likewise **ownership-gated** (the same
 discipline as the stray sweep below): on a fresh host whose journal
 owns no fabric state, a root-ns link colliding with the deterministic
@@ -368,7 +409,12 @@ listener on 6500 never matches a configured 65001):
    closed with a specific error naming both observations, the
    configured port, and the remediation (inspect both namespaces'
    listeners on that port and remove the foreign one), and MUST NOT
-   delete anything or change any journal state. Healing on the
+   delete anything or change any ownership-journal state. (The plan
+   journal for the applied network has already been persisted before
+   the discriminator runs — journal-before-mutate, §3.1 — so the
+   nothing-modified guarantee is scoped to fabric state and the
+   ownership journal; that plan-journal write is intent, not fabric
+   state.) Healing on the
    fabric-namespace observation alone would destroy a healthy
    transport and never converge — the healed interface plus the
    surviving foreign listener reproduces the same observation on

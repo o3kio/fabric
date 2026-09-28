@@ -63,6 +63,63 @@
   prerequisites: under the NAT-free underlay the root namespace terminates
   the WG transport socket and never forwards fabric packets.
 
+### Fixed (review round 8)
+- **Teardown re-gained the nat-residue fail-closed guard (MINOR).** The
+  round-7 hoist moved the `iptables -t nat -S` residue listing to the
+  start of every apply — and, unintentionally, off the teardown path:
+  `remove_fabric_if_unused` ran only the tolerant exact-spec deletes,
+  so a host carrying an operator VARIANT of a legacy rule (which the
+  exact `-D`s cannot hit) tore down "successfully" and silently
+  orphaned the variant rule in the root nat table. Teardown now runs
+  the same read-only verification after its eligibility guards and
+  BEFORE the WireGuard deletion, the namespace deletion, and its own
+  tolerant legacy deletes, reusing the apply path's exact
+  one-instance-per-exact-spec tolerance — a legacy host holding
+  exactly its own two v0.1.1 rule specs still tears down (the tolerant
+  deletes later in the same teardown remove them; documented migration
+  convergence holds), while a variant, a duplicate instance, or any
+  other signature hit fails closed with the wg link, the fabric
+  namespace, and the ownership journal fully intact. A crash between
+  the verification and the tolerant deletes converges: the next
+  operation (apply or teardown) re-verifies with the same tolerance
+  and re-runs the same idempotent deletes. Contract §3.8/§3.10
+  updated; new tests
+  `teardown_with_nat_residue_variant_fails_closed_state_preserved`
+  (fails against 4e246c3: pre-fix teardown returned `Ok(true)` and
+  orphaned the variant) and
+  `teardown_on_legacy_host_with_exact_rules_converges` (forward pin
+  for the tolerance semantics — it also passes pre-fix, by design).
+- **Honest note on the `-S` token-identity assumption (MINOR,
+  docs).** Contract §3.10 now states that the one-instance tolerance —
+  and the round-6 tolerant deletes — compare `iptables -t nat -S`
+  output byte-for-byte against the provider's exact v0.1.0/v0.1.1
+  rule-spec strings, why this is believed safe (simple two-rule specs,
+  spec-for-spec verified against `git show v0.1.1` in round 6), what a
+  real-kernel rendering divergence would cause (fail-closed on
+  apply/teardown for a legacy host — loud, kernel intact, remediable
+  by hand-deleting the residue), and that the multi-node evidence
+  environment never exercises it (fresh hosts, no legacy rules). No
+  code change.
+- **"Nothing was modified" scoped truthfully (NIT).** The ambiguity
+  error of the three-way socket discriminator now reads "No fabric
+  state and no ownership-journal state was modified" — strictly, the
+  plan JSON is persisted before the discriminator runs
+  (journal-before-mutate), so the unscoped claim was true only for
+  kernel state and the ownership journal. Contract §3.10 case 3
+  wording scoped the same way; the error-text assertion updated.
+- **Root-leg `ss` hard-failure branch covered (NIT).** The existing
+  `socket_placement_check_failure_fails_closed` injects a substring
+  `ss -uln` failure, which the fabric-ns leg (issued first on every
+  healthy apply) consumes; the ROOT-ns leg's `Err` branch — reachable
+  only when the fabric-ns leg is positive — had no direct test. New
+  test `root_leg_ss_hard_failure_fails_closed` seeds an ns-born wg
+  (positive fabric leg) and injects a failure for the bare root
+  `ss -uln` only, via the new `RecordingRunner::fail_on_exact`
+  test-kit helper (the root line is a strict suffix of the namespaced
+  line, so substring injection cannot target it). Coverage pin,
+  declared honestly: the branch exists and fails closed correctly at
+  4e246c3 — only the test (and the helper) are new.
+
 ### Fixed (review round 7)
 - **Three-way socket-placement discriminator (MAJOR).** The round-6
   runtime verification healed whenever `ss -uln` inside the fabric

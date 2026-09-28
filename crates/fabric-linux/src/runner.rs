@@ -206,6 +206,14 @@ pub struct RecordingRunner {
     /// per call (one RTM_DELNEIGH), like the real kernel.
     fdb: BTreeMap<(String, String, String), usize>,
     failures: Vec<String>,
+    /// Failures matched against the FULL joined command line (equality,
+    /// not substring). Needed where a target command line is a strict
+    /// SUBSTRING of another: the root-namespace `ss -uln` leg of the
+    /// socket-placement discriminator is a suffix of the fabric-ns leg
+    /// `ip netns exec <ns> ss -uln`, so a substring injection can only
+    /// ever hit the fabric leg first. An exact-line injection pins the
+    /// root leg alone.
+    exact_failures: Vec<String>,
 }
 
 impl RecordingRunner {
@@ -220,6 +228,7 @@ impl RecordingRunner {
             iptables: BTreeMap::new(),
             fdb: BTreeMap::new(),
             failures: Vec::new(),
+            exact_failures: Vec::new(),
         }
     }
 
@@ -240,6 +249,14 @@ impl RecordingRunner {
     /// Inject a failure for any command whose joined line contains `pattern`.
     pub fn fail_on(&mut self, pattern: impl Into<String>) {
         self.failures.push(pattern.into());
+    }
+
+    /// Inject a failure for any command whose joined line EQUALS `line`
+    /// — see `exact_failures` for why substring matching is not enough
+    /// when the target line is a substring of another (the bare
+    /// root-ns `ss -uln` vs `ip netns exec <ns> ss -uln`).
+    pub fn fail_on_exact(&mut self, line: impl Into<String>) {
+        self.exact_failures.push(line.into());
     }
 
     /// Seed a FOREIGN UDP listener on `port` in `netns` (`None` = the
@@ -466,7 +483,7 @@ impl RecordingRunner {
 
     fn should_fail(&self, program: &str, args: &[&str]) -> bool {
         let joined = format!("{program} {}", args.join(" "));
-        self.failures.iter().any(|p| joined.contains(p))
+        self.failures.iter().any(|p| joined.contains(p)) || self.exact_failures.contains(&joined)
     }
 
     /// Interpret `ip` arguments starting at `rest`. `ns` is the network
