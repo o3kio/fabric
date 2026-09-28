@@ -30,6 +30,7 @@ hygiene. Normative sources:
 | `fabric-plan` | Portable, serde-serializable plan types: `Vni`, `PublicKey`, `FabricHostIdentity`, `FabricPeer`, `FabricVniBinding`, `StretchedL2Plan`, plan validation, SHA-256 fingerprint. No I/O. |
 | `fabric-linux` | The Linux provider: `FabricCommand` runner seam (+ real subprocess runner and a recorded fake-kernel runner), deterministic IFNAMSIZ-safe naming, WireGuard key hygiene, ownership/plan journals, `LinuxFabricProvider` (`apply_plan` / `remove_network` / `remove_fabric_if_unused`). |
 | `fabric-conformance` | The shared anti-drift conformance suite both products run in CI. |
+| `fabric-evidence` | Privileged per-host evidence binary for the multi-host gate (`evidence/run-multinode.sh`): identity/apply/tenant-up/probe/neighbors/teardown/leak-check against the real provider. |
 
 ## What is shared — and what is not
 
@@ -76,7 +77,15 @@ cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --worksp
 ```
 
 Workspace lints: `unsafe_code` forbidden; `clippy::unwrap_used`,
-`clippy::expect_used`, `clippy::panic` denied — including tests.
+`clippy::expect_used` and `clippy::panic` denied — including tests.
+
+## Multi-host evidence
+
+The privileged evidence gate (three hosts, real WireGuard handshakes,
+cross-host ARP/ping with real MACs, encrypted-underlay capture, zero-leak
+teardown) lives in [`evidence/`](evidence/README.md) — see
+`evidence/run-multinode.sh`. It is required before any production evidence
+claim.
 
 ## Provenance
 

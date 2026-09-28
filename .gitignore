@@ -1,3 +1,6 @@
 /target
 Cargo.lock.bak
 *.swp
+
+# evidence harness runtime artifacts (results and pcaps are never committed)
+/evidence/results/
