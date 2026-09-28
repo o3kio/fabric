@@ -35,7 +35,13 @@ attachment, VNI binding allocation, placement, FIPs, lifecycle.
 
 1. The sole input is a validated `StretchedL2Plan` (see `fabric-plan`).
    Plans are serde-serializable, versioned by generation numbers, and carry
-   a SHA-256 content fingerprint.
+   a SHA-256 content fingerprint. Plan deserialization is strict:
+   unknown fields are rejected (`deny_unknown_fields` on the plan, peer,
+   and endpoint types), so a control plane compiling against a newer plan
+   schema fails loudly instead of silently dropping fields. The peer list
+   must not contain duplicate public keys — peers are keyed by public key
+   during realization, and a duplicate would silently drop a peer from the
+   WireGuard set.
 2. The peer list is the **bounded HER flood list**: exactly the enrolled
    hosts that currently host at least one endpoint of the network, derived
    from accepted control-plane placement state — never from ARP/FDB
@@ -70,19 +76,42 @@ attachment, VNI binding allocation, placement, FIPs, lifecycle.
 ### 3.1 Journal before mutate
 The plan is persisted under the provider state root
 (`plans/<network_id>.json`) before any kernel mutation. The ownership
-journal (`ownership.json`) is updated after mutations succeed.
+journal (`ownership.json`) is updated after mutations succeed. Both
+journals are written crash-durably: the content is fsynced before the
+atomic rename, and the parent directory is fsynced after it, so a power
+loss cannot leave an empty or half-written journal in place of a valid
+one.
 
-### 3.2 Idempotency
+### 3.2 Idempotency and re-assertion
 Re-applying an unchanged plan performs observations and diff-free
 reconciliation only. It must not recreate existing objects. Peer
 reconfiguration with identical parameters is permitted (WireGuard `set` is
 idempotent).
 
+Reconciliation is **re-assertive, not create-only**: enslavement
+(`ip link set <vxlan|port veth> master <bridge>`), link state
+(`ip link set ... up`), the per-network MTUs (VXLAN, consumer veth,
+fabric-side port veth — all `tenant_mtu`), the underlay attachment
+(addressing via `ip addr replace`, link state, default route via
+`ip route replace`), and the local transport /32 on the WireGuard
+interface are re-asserted on **every** apply. All of these verbs are
+idempotent; a crash between object creation and any of these steps — or a
+mutated plan field such as `tenant_mtu` — heals on the next apply instead
+of leaving a half-plumbed network that reports as healthy. Only the
+WireGuard private key and listen port remain guarded by their
+create/configure flags (re-asserting them would be harmless but is
+unnecessary).
+
 ### 3.3 Fail-closed on foreign state
 If a kernel object exists where the provider expects to create one — or an
-observed object (e.g. a VXLAN device) carries different identity (VNI,
-port) than the plan — the provider MUST reject the plan with a foreign
-state error. It MUST NOT adopt, overwrite, or delete the object.
+observed object carries different identity than the plan — the provider
+MUST reject the plan with a foreign state error. It MUST NOT adopt,
+overwrite, or delete the object. VXLAN identity is verified at the token
+level: the tokens following `id`, `dstport`, and `local` in
+`ip -d link show` output must equal the plan's VNI, the configured VXLAN
+port, and the plan's local transport IP exactly. Substring matching is
+forbidden — `id 100` must not accept a foreign `id 1000`, and a foreign
+destination port or local address is equally rejected.
 
 ### 3.4 Ownership fencing
 The provider only deletes objects it recorded in its ownership journal.
@@ -93,27 +122,50 @@ closed.
 ### 3.5 Key hygiene
 - One keypair per host; generated with `wg genkey` if absent; adopted
   as-is if present (never overwritten).
-- Stored 0600 via atomic create under the state root.
+- Stored 0600 via atomic create under the state root. The temp file is
+  created with `O_CREAT|O_EXCL` and mode 0600 in one step, so it never
+  exists world-readable and cannot be pre-created or pre-planted (e.g. as
+  a symlink); a stale temp from an earlier crash is removed and the
+  create retried once.
 - Referenced by **file path** in commands (`wg set <if> private-key <path>`)
   or piped via **stdin** (`wg pubkey`). Never in argv, never in serialized
   plans/ownership/errors.
 - Survives network and fabric teardown.
 
 ### 3.6 Bounded flood list
-HER entries (`bridge fdb replace 00:00:00:00:00:00 dev <vxlan> dst <ip>`)
-exist only for the plan's peer set, diffed against ownership on every
-apply. Stale entries are removed when the peer set shrinks.
+HER entries (`bridge fdb append 00:00:00:00:00:00 dev <vxlan> dst <ip>`)
+exist only for the plan's peer set. Every desired entry is **appended on
+every apply** — `append` is idempotent per (dev, mac, dst), and diffing
+adds against the journal would leave a recreated (post-reboot) VXLAN with
+an empty fdb and dead BUM flooding while the apply reports green.
+Entries present in the journal but no longer desired are deleted on every
+apply (tolerating already-absent entries). `replace` is never used: the
+kernel rejects it for non-unicast entries, and it would clobber the other
+remotes.
 
 ### 3.7 Learning stays on
 VXLAN devices are created **without** `nolearning`: the kernel performs MAC
 learning; unknown unicast, ARP, and DHCP are flooded to the bounded peer
 list. This is what makes the network one literal VLAN across hosts.
 
-### 3.8 Teardown ordering
+### 3.8 Teardown ordering and convergence
 Network teardown removes, in order: HER flood entries, attachment veth
 pair, VXLAN device, fabric-side bridge; then reconciles the WireGuard peer
 set against remaining live plans. Fabric teardown (netns, WireGuard,
 underlay veths, NAT rules) is permitted only when zero networks are owned.
+
+Teardown is idempotent and converges to the desired end state: deleting an
+object that is already absent is success (a deletion whose stderr
+indicates the object does not exist — missing device, missing namespace,
+missing rule or entry — counts as done; any other failure is a hard
+error). When the fabric namespace itself is absent, all ns-scoped
+deletions are skipped: a kernel that was rebooted while the journals
+survived must still tear down cleanly. The plan journal file and the
+ownership entry are removed **unconditionally** — regardless of which
+object deletions were tolerated — so an interrupted teardown always
+converges on retry instead of wedging the ownership entry forever. A kept
+WireGuard peer that moves to a new fabric transport IP has its stale /32
+route withdrawn before the new one is installed.
 
 ### 3.9 No site-local bridging
 The provider never bridges fabric traffic into site-local switches; the
@@ -124,8 +176,14 @@ enslaves to its own tenant bridge under its own anti-spoof policy.
 
 Every provider integration MUST pass `fabric-conformance::run_suite()`
 (reference fake-kernel runner) in CI, covering: plan validation, idempotent
-replay, flood-list scoping, foreign-state rejection, teardown cleanliness,
-key non-leakage, peer withdrawal, and fabric-removal fencing.
+replay, flood-list scoping, foreign-state rejection (including prefix-VNI
+rejection), teardown cleanliness, key non-leakage, peer withdrawal, and
+fabric-removal fencing — plus the hardening cases: teardown convergence
+after a simulated kernel restart, re-apply healing of partial state,
+flood-list shrinking, and MTU/addressing re-assertion. The fake kernel
+models the real `ip`/`bridge` failure semantics (missing devices,
+duplicate names, missing namespaces, missing fdb/route entries), so a
+permissive provider flow fails the suite rather than silently passing.
 
 The privileged multi-host gate (three real hosts, real handshakes,
 cleartext underlay capture proving encryption, zero-leak teardown) is a

@@ -55,6 +55,7 @@ impl fmt::Debug for PublicKey {
 
 /// A `host:port` underlay endpoint advertised by an enrolled host.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnderlayEndpoint {
     pub host: String,
     pub port: u16,
@@ -71,9 +72,17 @@ impl UnderlayEndpoint {
                 "endpoint {raw:?} has an empty host"
             )));
         }
+        if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(PlanError::Invalid(format!(
+                "endpoint {raw:?} host contains whitespace or control characters"
+            )));
+        }
         let port: u16 = port
             .parse()
             .map_err(|_| PlanError::Invalid(format!("endpoint {raw:?} has an invalid port")))?;
+        if port == 0 {
+            return Err(PlanError::Invalid(format!("endpoint {raw:?} has port 0")));
+        }
         Ok(Self {
             host: host.to_string(),
             port,
@@ -115,6 +124,7 @@ pub struct FabricHostIdentity {
 /// network, derived by the control plane from accepted placement state — never
 /// from ARP, FDB observations, or traffic.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FabricPeer {
     pub host_id: String,
     pub public_key: PublicKey,
@@ -195,6 +205,53 @@ mod tests {
         assert_eq!(ep.port, 65001);
         assert!(UnderlayEndpoint::parse("no-port").is_err());
         assert!(UnderlayEndpoint::parse("host:notaport").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_rejects_empty_host_whitespace_and_port_zero() {
+        assert!(UnderlayEndpoint::parse(":65001").is_err(), "empty host");
+        assert!(
+            UnderlayEndpoint::parse("bad host:65001").is_err(),
+            "host with whitespace"
+        );
+        assert!(
+            UnderlayEndpoint::parse("bad\nhost:65001").is_err(),
+            "host with control characters"
+        );
+        assert!(UnderlayEndpoint::parse("host:0").is_err(), "port 0");
+        assert!(UnderlayEndpoint::parse("203.0.113.7:1").is_ok());
+    }
+
+    #[test]
+    fn endpoint_json_with_unknown_field_is_rejected() -> Result<(), PlanError> {
+        let ep = UnderlayEndpoint::parse("203.0.113.7:65001")?;
+        let raw = format!(
+            "{{\"host\":\"203.0.113.7\",\"port\":65001,\"surprise\":true,\"other\":{}}}",
+            serde_json::to_string(&ep).map_err(|e| PlanError::Fingerprint(e.to_string()))?
+        );
+        assert!(
+            serde_json::from_str::<UnderlayEndpoint>(&raw).is_err(),
+            "endpoints with unknown fields must fail to deserialize"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_json_with_unknown_field_is_rejected() -> Result<(), PlanError> {
+        let peer = FabricPeer {
+            host_id: "host-02".to_string(),
+            public_key: key()?,
+            underlay_endpoint: UnderlayEndpoint::parse("203.0.113.7:65001")?,
+            fabric_transport_ip: Ipv4Addr::new(198, 18, 0, 2),
+        };
+        let mut value =
+            serde_json::to_value(&peer).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        value["surprise"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<FabricPeer>(value).is_err(),
+            "peers with unknown fields must fail to deserialize"
+        );
         Ok(())
     }
 

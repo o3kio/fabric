@@ -131,7 +131,9 @@ struct FakeLink {
     kind: String,
     vni: Option<u32>,
     dstport: Option<u16>,
+    local: Option<String>,
     mtu: Option<u32>,
+    addrs: std::collections::BTreeSet<String>,
 }
 
 /// An in-memory fake kernel plus call journal.
@@ -143,6 +145,10 @@ pub struct RecordingRunner {
     calls: Vec<CommandCall>,
     netns: std::collections::BTreeSet<String>,
     links: BTreeMap<String, FakeLink>,
+    /// Routing-table entries (destination strings; the fake kernel models
+    /// one global table, which is sufficient because the provider only
+    /// manages routes inside the fabric namespace).
+    routes: std::collections::BTreeSet<String>,
     /// Forwarding-table entries: (device, mac, dst) triples. Flood entries
     /// share the all-zeros MAC with one row per remote.
     fdb: std::collections::BTreeSet<(String, String, String)>,
@@ -156,6 +162,7 @@ impl RecordingRunner {
             calls: Vec::new(),
             netns: std::collections::BTreeSet::new(),
             links: BTreeMap::new(),
+            routes: std::collections::BTreeSet::new(),
             fdb: std::collections::BTreeSet::new(),
             failures: Vec::new(),
         }
@@ -183,6 +190,20 @@ impl RecordingRunner {
     /// True when the fake kernel currently holds a link named `name`.
     pub fn has_link(&self, name: &str) -> bool {
         self.links.contains_key(name)
+    }
+
+    /// True when the fake kernel holds a route with destination `dest`
+    /// (e.g. `198.18.0.2/32` or `default`).
+    pub fn has_route(&self, dest: &str) -> bool {
+        self.routes.contains(dest)
+    }
+
+    /// True when link `dev` currently carries the address `addr`
+    /// (e.g. `198.18.0.1/32`).
+    pub fn has_addr(&self, dev: &str, addr: &str) -> bool {
+        self.links
+            .get(dev)
+            .is_some_and(|link| link.addrs.contains(addr))
     }
 
     /// The fake kernel's current MTU for a link, when the link exists and
@@ -302,6 +323,7 @@ impl RecordingRunner {
                 kind: "generic".to_string(),
                 ..FakeLink::default()
             };
+            let mut peer_name: Option<&str> = None;
             let mut i = 3;
             while i < rest.len() {
                 match rest[i] {
@@ -323,27 +345,108 @@ impl RecordingRunner {
                         }
                         i += 2;
                     }
+                    "local" => {
+                        if let Some(local) = rest.get(i + 1) {
+                            link.local = Some((*local).to_string());
+                        }
+                        i += 2;
+                    }
                     "peer" => {
                         // `peer name <name>`: a veth pair creates both ends.
                         if let (Some(&"name"), Some(peer)) = (rest.get(i + 1), rest.get(i + 2)) {
-                            self.links.insert((*peer).to_string(), FakeLink::default());
+                            peer_name = Some(peer);
+                            i += 3;
+                        } else {
+                            i += 1;
                         }
-                        i += 1;
                     }
                     _ => i += 1,
                 }
+            }
+            // The kernel refuses to create an existing name.
+            if self.links.contains_key(name) {
+                return command_error("RTNETLINK answers: File exists");
+            }
+            if let Some(peer) = peer_name {
+                if self.links.contains_key(peer) {
+                    return command_error("RTNETLINK answers: File exists");
+                }
+                self.links.insert(peer.to_string(), FakeLink::default());
             }
             self.links.insert(name.to_string(), link);
             return CommandOutput::ok();
         }
         // link del NAME (deleting a device drops its forwarding entries,
-        // as the kernel does)
+        // as the kernel does). Deleting a missing device fails like the
+        // real `ip` — providers must tolerate that explicitly.
         if rest.first() == Some(&"link") && matches!(rest.get(1), Some(&"del") | Some(&"delete")) {
             if let Some(name) = rest.get(2) {
+                if !self.links.contains_key(*name) {
+                    return missing_device(name);
+                }
                 self.links.remove(*name);
                 self.fdb.retain(|(dev, _, _)| dev != name);
             }
             return CommandOutput::ok();
+        }
+        // addr add|replace|del ADDR dev DEV
+        if rest.first() == Some(&"addr") {
+            let op = rest.get(1).copied().unwrap_or("");
+            let addr = rest.get(2).copied().unwrap_or("");
+            let dev = arg_after(rest, "dev").unwrap_or("");
+            let Some(link) = self.links.get_mut(dev) else {
+                return missing_device(dev);
+            };
+            return match op {
+                "add" => {
+                    if link.addrs.contains(addr) {
+                        command_error("RTNETLINK answers: File exists")
+                    } else {
+                        link.addrs.insert(addr.to_string());
+                        CommandOutput::ok()
+                    }
+                }
+                "replace" => {
+                    // Same-address re-assert is the idempotent path. The
+                    // fake models one primary address per host part: a
+                    // replaced address displaces an existing one with the
+                    // same host part (the provider's /32 transport moves
+                    // exactly once per plan change).
+                    let host_part = addr.split('/').next().unwrap_or(addr);
+                    link.addrs.retain(|existing| {
+                        existing.split('/').next().unwrap_or(existing) != host_part
+                    });
+                    link.addrs.insert(addr.to_string());
+                    CommandOutput::ok()
+                }
+                "del" => {
+                    if link.addrs.remove(addr) {
+                        CommandOutput::ok()
+                    } else {
+                        command_error("RTNETLINK answers: No such file or directory")
+                    }
+                }
+                _ => CommandOutput::ok(),
+            };
+        }
+        // route replace <dest...> | route del <dest...>
+        if rest.first() == Some(&"route") {
+            let op = rest.get(1).copied().unwrap_or("");
+            let dest = rest.get(2).copied().unwrap_or("");
+            return match op {
+                "replace" => {
+                    self.routes.insert(dest.to_string());
+                    CommandOutput::ok()
+                }
+                "del" => {
+                    if self.routes.remove(dest) {
+                        CommandOutput::ok()
+                    } else {
+                        command_error("RTNETLINK answers: No such file or directory")
+                    }
+                }
+                _ => CommandOutput::ok(),
+            };
         }
         // link set NAME mtu N | link set NAME name NEW
         if rest.first() == Some(&"link") && rest.get(1) == Some(&"set") {
@@ -392,9 +495,16 @@ impl RecordingRunner {
                         "vxlan" => {
                             let vni = link.vni.unwrap_or(0);
                             let dstport = link.dstport.unwrap_or(0);
-                            stdout.push_str(&format!(
-                                "    vxlan id {vni} dstport {dstport} learning\n"
-                            ));
+                            // Shape mirrors the real `ip -d link show`:
+                            // `vxlan id <vni> [local <ip>] ... dstport <p>`.
+                            match link.local.as_ref() {
+                                Some(local) => stdout.push_str(&format!(
+                                    "    vxlan id {vni} local {local} dstport {dstport} learning\n"
+                                )),
+                                None => stdout.push_str(&format!(
+                                    "    vxlan id {vni} dstport {dstport} learning\n"
+                                )),
+                            }
                         }
                         "wireguard" => stdout.push_str("    wireguard\n"),
                         _ => stdout.push_str("    link/ether\n"),
@@ -513,8 +623,14 @@ impl FabricCommand for RecordingRunner {
         }
         match program {
             "ip" => {
-                // Strip `netns exec NS` prefix.
+                // Strip `netns exec NS` prefix. A missing namespace fails
+                // like the real `ip netns exec`.
                 if args.first() == Some(&"netns") && args.get(1) == Some(&"exec") {
+                    if let Some(ns) = args.get(2).filter(|ns| !self.netns.contains(**ns)) {
+                        return Ok(command_error(&format!(
+                            "Cannot open network namespace \"{ns}\""
+                        )));
+                    }
                     match args.get(3) {
                         Some(&"ip") => return Ok(self.ip(&args[4..])),
                         Some(&"bridge") => return Ok(self.bridge(&args[4..])),
@@ -687,5 +803,99 @@ mod tests {
         let out = ok_or_err_out(runner.run("ip", &["link", "del", "vx0"]));
         assert!(out.success, "link deletion failed: {}", out.stderr);
         assert!(!runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+    }
+
+    #[test]
+    fn deleting_a_missing_link_fails_like_the_kernel() {
+        let mut runner = RecordingRunner::new();
+        let out = ok_or_err_out(runner.run("ip", &["link", "del", "gone0"]));
+        assert!(
+            !out.success,
+            "the real kernel fails to delete a missing link"
+        );
+        assert!(
+            out.stderr.contains("does not exist"),
+            "stderr must name the missing device: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn creating_an_existing_link_fails_like_the_kernel() {
+        let mut runner = RecordingRunner::new();
+        vxlan(&mut runner);
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "link", "add", "vx0", "type", "vxlan", "id", "4711", "dstport", "4789",
+            ],
+        ));
+        assert!(!out.success, "the real kernel refuses duplicate names");
+        assert!(out.stderr.contains("File exists"));
+        // The existing peer name of a veth pair is equally refused.
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &["link", "add", "new0", "type", "veth", "peer", "name", "vx0"],
+        ));
+        assert!(!out.success, "duplicate veth peer names must be refused");
+        assert!(out.stderr.contains("File exists"));
+    }
+
+    #[test]
+    fn netns_exec_into_a_missing_namespace_fails() {
+        let mut runner = RecordingRunner::new();
+        let out = ok_or_err_out(runner.run("ip", &["netns", "exec", "nope", "ip", "link"]));
+        assert!(
+            !out.success,
+            "the real kernel cannot exec into a missing netns"
+        );
+        assert!(
+            out.stderr.contains("Cannot open network namespace"),
+            "stderr must name the failure: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn addr_and_route_semantics() {
+        let mut runner = RecordingRunner::new();
+        assert!(
+            ok_or_err_out(runner.run("ip", &["link", "add", "wg0", "type", "wireguard"])).success
+        );
+        assert!(
+            ok_or_err_out(runner.run("ip", &["addr", "replace", "198.18.0.1/32", "dev", "wg0"]))
+                .success
+        );
+        assert!(runner.has_addr("wg0", "198.18.0.1/32"));
+        // Replace of the same address is the idempotent re-assert path.
+        assert!(
+            ok_or_err_out(runner.run("ip", &["addr", "replace", "198.18.0.1/32", "dev", "wg0"]))
+                .success
+        );
+        assert!(runner.has_addr("wg0", "198.18.0.1/32"));
+        // `add` of an existing address fails; `del` of a missing one too.
+        assert!(
+            !ok_or_err_out(runner.run("ip", &["addr", "add", "198.18.0.1/32", "dev", "wg0"]))
+                .success
+        );
+        assert!(
+            ok_or_err_out(runner.run("ip", &["addr", "del", "198.18.0.1/32", "dev", "wg0"]))
+                .success
+        );
+        assert!(
+            !ok_or_err_out(runner.run("ip", &["addr", "del", "198.18.0.1/32", "dev", "wg0"]))
+                .success
+        );
+
+        assert!(
+            ok_or_err_out(runner.run("ip", &["route", "replace", "198.18.0.2/32", "dev", "wg0"]))
+                .success
+        );
+        assert!(runner.has_route("198.18.0.2/32"));
+        assert!(ok_or_err_out(runner.run("ip", &["route", "del", "198.18.0.2/32"])).success);
+        assert!(!runner.has_route("198.18.0.2/32"));
+        let out = ok_or_err_out(runner.run("ip", &["route", "del", "198.18.0.2/32"]));
+        assert!(!out.success, "deleting a missing route must fail");
+        assert!(out.stderr.contains("No such file or directory"));
     }
 }

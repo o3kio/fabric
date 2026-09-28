@@ -15,8 +15,9 @@
 #      VXLAN-over-WireGuard encapsulation — regression evidence for the
 #      WireGuard-MTU provider fix (contract §2.3).
 #   4. Encryption: only WireGuard UDP (port 65001) is visible on the
-#      underlay; a capture filtered for plaintext ARP/ICMP sees no
-#      tenant-addressed packets while tenant traffic flows.
+#      underlay; one combined capture in a single traffic window shows
+#      both that WG UDP flowed and that no tenant-addressed (10.42.0.0/24)
+#      packets appear in cleartext.
 #   5. Idempotent re-apply, zero-leak teardown in every host, and survival
 #      of the host keypair across fabric teardown (by design).
 #
@@ -401,38 +402,37 @@ else
   fail "wg_udp_captured" "no udp packets captured on h2's underlay"
 fi
 
-# Warm h1's underlay ARP entry for h2 so the cleartext check below is not
-# polluted by docker-bridge housekeeping ARP (172.31.250.0/24).
+# Warm h1's underlay ARP entry for h2 so the capture below is not polluted
+# by docker-bridge housekeeping ARP (172.31.250.0/24).
 hexec h1 ping -c 1 -w 2 "${CONN_IP[h2]}" >/dev/null 2>&1 || true
 
-# Text capture 1: WireGuard UDP must be visible on the underlay.
-"${DOCKER[@]}" exec fev-h2 timeout 10 tcpdump -i eth0 -c 20 -l -n udp port "$WG_PORT" \
-  >"$RESULTS_DIR/tcpdump-wg-udp.txt" 2>/dev/null &
-UDP_PID=$!
-fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 5 --deadline 8 >/dev/null || true
-wait "$UDP_PID" || true
-if [[ -s "$RESULTS_DIR/tcpdump-wg-udp.txt" ]]; then
-  pass "wg_udp_visible_on_underlay" "encrypted WG UDP $WG_PORT observed on the wire"
+# Combined capture in ONE traffic window: the same packets must show
+# WireGuard UDP (port 65001) AND no tenant-addressed (10.42.0.0/24)
+# cleartext. Two separate captures could pass vacuously — the cleartext
+# capture might simply have missed the traffic window and seen nothing at
+# all. The full capture is recorded in the results dir.
+"${DOCKER[@]}" exec fev-h2 timeout 15 tcpdump -i eth0 -c 40 -l -n \
+  'udp port 65001 or arp or icmp' \
+  >"$RESULTS_DIR/tcpdump-underlay-combined.txt" 2>/dev/null &
+COMBINED_PID=$!
+fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 10 --deadline 10 >/dev/null || true
+wait "$COMBINED_PID" || true
+CAPTURE="$RESULTS_DIR/tcpdump-underlay-combined.txt"
+wg_lines="$(grep -Ec '\.65001:|udp port 65001' "$CAPTURE" || true)"
+tenant_leak="$(grep -c '10\.42\.' "$CAPTURE" || true)"
+if [[ "$wg_lines" -ge 1 ]]; then
+  pass "wg_udp_visible_on_underlay" \
+    "encrypted WG UDP $WG_PORT observed on the underlay ($wg_lines capture lines)"
 else
-  fail "wg_udp_visible_on_underlay" "no WG UDP $WG_PORT seen on h2's underlay"
+  fail "wg_udp_visible_on_underlay" \
+    "no WG UDP $WG_PORT seen on h2's underlay: $(cat "$CAPTURE")"
 fi
-
-# Text capture 2: plaintext ARP/ICMP on the underlay. The fabric's tenant
-# traffic (10.42.0.0/24) must NEVER appear in cleartext; underlay control
-# ARP from the docker bridge (172.31.250.0/24) is not tenant leakage.
-"${DOCKER[@]}" exec fev-h2 timeout 10 tcpdump -i eth0 -c 10 -n 'arp or icmp' \
-  >"$RESULTS_DIR/tcpdump-cleartext.txt" 2>/dev/null &
-CLEAR_PID=$!
-fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 5 --deadline 8 >/dev/null || true
-wait "$CLEAR_PID" || true
-tenant_leak="$(grep -c '10\.42\.' "$RESULTS_DIR/tcpdump-cleartext.txt" || true)"
-total_lines="$(grep -c . "$RESULTS_DIR/tcpdump-cleartext.txt" || true)"
 if [[ "$tenant_leak" -eq 0 ]]; then
   pass "no_cleartext_tenant_traffic" \
-    "zero tenant-addressed arp/icmp packets on the underlay (capture lines: $total_lines)"
+    "zero tenant-addressed packets in the combined capture (wg lines: $wg_lines)"
 else
   fail "no_cleartext_tenant_traffic" \
-    "$tenant_leak plaintext tenant packets captured: $(cat "$RESULTS_DIR/tcpdump-cleartext.txt")"
+    "$tenant_leak plaintext tenant packets captured: $(cat "$CAPTURE")"
 fi
 
 # 7e. idempotency: replaying the same plan must create nothing.

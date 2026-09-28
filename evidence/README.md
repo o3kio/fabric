@@ -48,11 +48,22 @@ is always kept). It exits nonzero if any assertion failed.
 | `near_mtu_ping` | An ICMP payload of 1300 bytes (1328 on the wire) crosses the segment: 1328 ≤ tenant MTU 1380; encapsulated 1378 ≤ fabric MTU 1440; +60 WireGuard overhead = 1438 ≤ 1500 underlay. Regression evidence for the WireGuard-MTU fix (contract §2.3). |
 | `wg_mtu_is_1440` | The WireGuard interface carries the plan's fabric MTU (not the kernel default 1420). |
 | `wg_udp_captured`, `wg_udp_visible_on_underlay` | Encrypted WireGuard UDP (port 65001) is what is actually on the underlay wire. |
-| `no_cleartext_tenant_traffic` | While tenant ARP/ICMP flows over the fabric, an underlay capture filtered for plaintext ARP/ICMP contains **zero tenant-addressed packets**. |
+| `no_cleartext_tenant_traffic` | While tenant traffic flows over the fabric, an underlay capture filtered for plaintext ARP/ICMP contains **zero tenant-addressed packets**. |
 | `reapply_idempotent` | Replaying an unchanged plan creates no objects (contract §3.2). |
 | `bum_arp_reflooded` | After flushing h1's tenant neighbor table, ARP resolves again over the fabric — BUM flooding works, not just cached unicast. |
 | `tenant_down_*`, `teardown_*`, `fabric_down_*`, `leak_check_*` | Full teardown in every host; the leak check verifies zero fabric objects remain in the kernel (no netns, no prefixed links, no underlay NAT rules, no routes via the host underlay veth). |
 | `key_survives_*` | The host private key file survives fabric teardown by design (contract §3.5). Presence is recorded; content is never displayed. |
+
+Note on the encryption assertions: `wg_udp_visible_on_underlay` and
+`no_cleartext_tenant_traffic` are derived from **one combined capture**
+(`tcpdump -i eth0 -c 40 -l -n 'udp port 65001 or arp or icmp'`) taken in a
+single traffic window, recorded in full as
+`results/<timestamp>/tcpdump-underlay-combined.txt`. The assertion requires
+both (a) at least one WireGuard-UDP line — proving the capture actually
+observed the fabric's traffic — and (b) zero tenant-addressed
+(`10.42.0.0/24`) lines. Two separate captures could pass vacuously: a
+cleartext-only capture that simply missed the traffic window would contain
+no tenant packets for the wrong reason.
 
 ## Prerequisites
 

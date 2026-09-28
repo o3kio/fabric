@@ -41,6 +41,8 @@ pub struct TenantUpReport {
 pub struct TenantDownReport {
     pub removed_netns: bool,
     pub removed_bridge: bool,
+    /// True when the host end WAS removed — transitively with the tenant
+    /// netns, or by the explicit deletion when the netns was already gone.
     pub removed_host_end: bool,
     /// The provider-owned consumer veth, deliberately NOT touched here
     /// (`remove_network` owns and removes it).
@@ -201,13 +203,16 @@ pub fn tenant_down<R: FabricCommand>(
     if removed_netns {
         run_checked(runner, "ip", &["netns", "del", tenant_ns])?;
     }
-    // The host end only survives when the netns was already gone.
+    // The host end only survives when the netns was already gone; delete
+    // it explicitly in that case.
     let host_end = format!("{bridge}-p");
     let host_show = runner.run("ip", &["link", "show", host_end.as_str()])?;
-    let removed_host_end = host_show.success;
     if host_show.success {
         run_checked(runner, "ip", &["link", "del", host_end.as_str()])?;
     }
+    // True when the host end WAS removed: transitively with the netns, or
+    // by the explicit deletion above.
+    let removed_host_end = removed_netns || host_show.success;
     // The bridge detaches (never deletes) its enslaved ports; the
     // provider-owned consumer veth is removed by remove_network.
     let bridge_show = runner.run("ip", &["link", "show", bridge])?;
@@ -446,6 +451,10 @@ mod tests {
         assert!(down.removed_netns);
         assert!(down.removed_bridge);
         assert!(
+            down.removed_host_end,
+            "the host end must be reported as removed (with the netns)"
+        );
+        assert!(
             env.runner.has_link(&up.consumer_veth),
             "the provider-owned consumer veth must survive tenant-down"
         );
@@ -457,6 +466,10 @@ mod tests {
         let replay = tenant_down(&mut env.runner, &env.config, "evidence-net", "brten", "tns")?;
         assert!(!replay.removed_netns);
         assert!(!replay.removed_bridge);
+        assert!(
+            !replay.removed_host_end,
+            "nothing is removed on an idempotent replay"
+        );
         env.cleanup();
         Ok(())
     }

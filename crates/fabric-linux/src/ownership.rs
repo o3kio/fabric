@@ -7,7 +7,8 @@
 //! against observed kernel state, and foreign state fails closed.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -100,11 +101,25 @@ impl FabricOwnership {
     }
 }
 
-/// Atomic write with default file mode (temp file + rename).
+/// Crash-durable atomic write: temp file, fsync, rename, fsync parent.
+///
+/// The file is fsynced before the rename so the content is durable, and
+/// the parent directory is fsynced after the rename so the rename itself
+/// survives a power loss. A directory that cannot be fsynced surfaces as
+/// an error (`File::open` + `sync_all` works for directories on Linux).
+/// Used for both the ownership journal and the plan journal.
 pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), FabricError> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, contents)?;
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
     fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        let dir = File::open(parent)?;
+        dir.sync_all()?;
+    }
     Ok(())
 }
 
@@ -130,6 +145,9 @@ mod tests {
         let loaded = FabricOwnership::load_or_default(&path)?;
         assert_eq!(loaded, ownership);
         assert!(!path.join("nonexistent").exists());
+        // The temp file must not survive the atomic write.
+        let tmp = path.with_extension("tmp");
+        assert!(!tmp.exists(), "no temp file may remain after save");
 
         let _unused = fs::remove_dir_all(&root);
         Ok(())

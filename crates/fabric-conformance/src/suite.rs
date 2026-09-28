@@ -4,7 +4,9 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fabric_linux::{FabricError, FabricLinuxConfig, LinuxFabricProvider, RecordingRunner};
+use fabric_linux::{
+    FabricCommand, FabricError, FabricLinuxConfig, LinuxFabricProvider, RecordingRunner,
+};
 use fabric_plan::{PublicKey, StretchedL2Plan, UnderlayEndpoint, Vni};
 
 /// One named conformance case result.
@@ -128,28 +130,47 @@ fn cases() -> Vec<(String, Case)> {
             "wireguard_mtu_follows_max_fabric_mtu".to_string(),
             case_wireguard_mtu,
         ),
+        (
+            "teardown_after_restart_converges".to_string(),
+            case_teardown_after_restart,
+        ),
+        (
+            "reapply_heals_partial_state".to_string(),
+            case_reapply_heals_partial_state,
+        ),
+        ("flood_list_shrinks".to_string(), case_flood_list_shrinks),
+        (
+            "foreign_state_rejects_prefix_vni".to_string(),
+            case_foreign_state_rejects_prefix_vni,
+        ),
     ]
 }
 
-fn test_key() -> Result<PublicKey, fabric_plan::PlanError> {
-    PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=")
+/// A deterministic, distinct, validly-shaped public key per host. Plans
+/// reject duplicate public keys (peers are keyed by them), so multi-peer
+/// cases must not share one key.
+fn key_for(host: &str) -> Result<PublicKey, fabric_plan::PlanError> {
+    let mut material = String::from("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=");
+    let seed = host.as_bytes().last().copied().unwrap_or(b'0');
+    let letter = char::from(b'A' + (seed % 26));
+    material.replace_range(42..=42, &letter.to_string());
+    PublicKey::new(material)
 }
 
 fn plan_for(
     vni: u32,
     peers: &[(&str, [u8; 4])],
 ) -> Result<StretchedL2Plan, fabric_plan::PlanError> {
-    let key = test_key()?;
     let endpoint = UnderlayEndpoint::parse("198.51.100.10:65001")?;
-    let peers = peers
-        .iter()
-        .map(|(host, ip)| fabric_plan::FabricPeer {
+    let mut built: Vec<fabric_plan::FabricPeer> = Vec::new();
+    for (host, ip) in peers {
+        built.push(fabric_plan::FabricPeer {
             host_id: (*host).to_string(),
-            public_key: key.clone(),
+            public_key: key_for(host)?,
             underlay_endpoint: endpoint.clone(),
             fabric_transport_ip: Ipv4Addr::from(*ip),
-        })
-        .collect();
+        });
+    }
     Ok(StretchedL2Plan {
         fabric_domain_id: "fab-1".to_string(),
         local_host_id: "host-01".to_string(),
@@ -159,7 +180,7 @@ fn plan_for(
         binding_generation: 1,
         tenant_mtu: 1370,
         fabric_mtu: 1420,
-        peers,
+        peers: built,
         plan_generation: 1,
     })
 }
@@ -483,6 +504,231 @@ fn case_wireguard_mtu() -> Result<(), FabricError> {
         )));
     }
     Ok(())
+}
+
+/// A teardown after a kernel restart (fresh kernel, surviving journals)
+/// must succeed with zero residue, and a later apply must fully recreate.
+fn case_teardown_after_restart() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("restart")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let network_id = plan.network_id.clone();
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    env.take_runner_back(provider);
+
+    // A rebooted kernel: fresh fake, SAME durable state root (ownership
+    // and plan journals survive).
+    env.runner = RecordingRunner::new();
+    let mut provider = env.provider()?;
+    provider.remove_network(&network_id)?;
+
+    // Zero residue in the (fresh) kernel and the journals.
+    let ns_absent = !provider.runner().has_netns(&ns);
+    let links_absent = [
+        names.vxlan(&network_id),
+        names.fabric_bridge(&network_id),
+        names.fabric_port_veth(&network_id),
+        names.consumer_port_veth(&network_id),
+        names.wireguard_interface(),
+        names.host_underlay_veth(),
+    ]
+    .iter()
+    .all(|name| !provider.runner().has_link(name));
+    let fdb_absent = !provider.runner().has_fdb_entry(
+        &names.vxlan(&network_id),
+        "00:00:00:00:00:00",
+        "198.18.0.2",
+    );
+    let ownership_empty = provider.ownership().networks.is_empty();
+    let plan_gone = !env.config.plan_path(&network_id).exists();
+
+    // A clean host must converge to Ok(true) with zero residue errors.
+    let fabric_removed = provider.remove_fabric_if_unused()?;
+
+    // Re-applying the same plan on the fresh kernel must fully recreate
+    // and re-populate the HER flood list (unconditional append).
+    let report = provider.apply_plan(&plan)?;
+    let flood_healed = provider.runner().has_fdb_entry(
+        &names.vxlan(&network_id),
+        "00:00:00:00:00:00",
+        "198.18.0.2",
+    );
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if !ns_absent || !links_absent || !fdb_absent {
+        return Err(FabricError::Invalid(
+            "teardown after restart left kernel residue".to_string(),
+        ));
+    }
+    if !ownership_empty || !plan_gone {
+        return Err(FabricError::Invalid(
+            "teardown after restart left journal residue".to_string(),
+        ));
+    }
+    if !fabric_removed {
+        return Err(FabricError::Invalid(
+            "fabric removal must converge on a clean host".to_string(),
+        ));
+    }
+    if !report.created_network || !report.created_fabric {
+        return Err(FabricError::Invalid(
+            "re-apply after restart must recreate the fabric and network".to_string(),
+        ));
+    }
+    if !flood_healed {
+        return Err(FabricError::Invalid(
+            "HER flood entries must be re-appended after kernel loss".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A re-apply must heal partial state: a lost bridge is recreated and the
+/// VXLAN re-enslaved (enslavement is an unconditional re-assert).
+fn case_reapply_heals_partial_state() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("heal")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let bridge = names.fabric_bridge(&plan.network_id);
+    let vxlan = names.vxlan(&plan.network_id);
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    env.take_runner_back(provider);
+
+    // Simulate a crash/partial state: only the fabric-side bridge is lost.
+    let out = env
+        .runner
+        .run("ip", &["netns", "exec", &ns, "ip", "link", "del", &bridge])?;
+    if !out.success {
+        env.cleanup();
+        return Err(FabricError::Command(format!(
+            "could not delete the fabric bridge for the test: {}",
+            out.stderr.trim()
+        )));
+    }
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    let bridge_recreated = provider.runner().has_link(&bridge);
+    let master_cmd = format!("ip netns exec {ns} ip link set {vxlan} master {bridge}");
+    let master_asserts = provider
+        .runner()
+        .calls()
+        .iter()
+        .filter(|call| call.joined() == master_cmd)
+        .count();
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if !bridge_recreated {
+        return Err(FabricError::Invalid(
+            "re-apply must recreate a lost fabric bridge".to_string(),
+        ));
+    }
+    if master_asserts < 2 {
+        return Err(FabricError::Invalid(format!(
+            "enslavement must be re-asserted on every apply (saw {master_asserts} of '{master_cmd}')"
+        )));
+    }
+    Ok(())
+}
+
+/// Shrinking the peer set must delete the removed peer's flood entry from
+/// the kernel while the kept one remains.
+fn case_flood_list_shrinks() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("shrink")?;
+    let two_peers = plan_for(
+        100,
+        &[("host-02", [198, 18, 0, 2]), ("host-03", [198, 18, 0, 3])],
+    )
+    .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let one_peer = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let vxlan = names.vxlan(&two_peers.network_id);
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&two_peers)?;
+    provider.apply_plan(&one_peer)?;
+    let kept = provider
+        .runner()
+        .has_fdb_entry(&vxlan, "00:00:00:00:00:00", "198.18.0.2");
+    let removed = provider
+        .runner()
+        .has_fdb_entry(&vxlan, "00:00:00:00:00:00", "198.18.0.3");
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if removed {
+        return Err(FabricError::Invalid(
+            "the removed peer's flood entry must be deleted from the kernel".to_string(),
+        ));
+    }
+    if !kept {
+        return Err(FabricError::Invalid(
+            "the kept peer's flood entry must remain".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A foreign VXLAN whose VNI merely extends the plan's VNI as a string
+/// prefix (1000 vs 100) must be rejected — token-exact identity checks.
+fn case_foreign_state_rejects_prefix_vni() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("prefix-vni")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let vxlan = names.vxlan(&plan.network_id);
+
+    // Pre-create a foreign VXLAN at the deterministic name: same dstport
+    // and local IP as the plan would use, VNI 1000 (a strict prefix
+    // extension of the plan's 100 under substring matching).
+    let out = env.runner.run(
+        "ip",
+        &[
+            "link",
+            "add",
+            vxlan.as_str(),
+            "type",
+            "vxlan",
+            "id",
+            "1000",
+            "dstport",
+            "4789",
+            "local",
+            "198.18.0.1",
+            "dev",
+            names.wireguard_interface().as_str(),
+        ],
+    )?;
+    if !out.success {
+        env.cleanup();
+        return Err(FabricError::Command(format!(
+            "could not pre-create the foreign vxlan for the test: {}",
+            out.stderr.trim()
+        )));
+    }
+
+    let mut provider = env.provider()?;
+    let result = provider.apply_plan(&plan);
+    env.take_runner_back(provider);
+    env.cleanup();
+    match result {
+        Err(FabricError::ForeignState { .. }) => Ok(()),
+        Err(other) => Err(other),
+        Ok(_) => Err(FabricError::Invalid(
+            "a foreign VXLAN with prefix-matching VNI was adopted instead of rejected".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
