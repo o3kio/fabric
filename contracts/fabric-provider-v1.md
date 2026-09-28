@@ -216,8 +216,13 @@ journal flag, which old journals deserialize as `false` — is healed by a
 one-time, idempotent procedure: a stray root-namespace interface of the
 same name is swept tolerantly, but **only when the journal shows the
 provider owns (or owned) fabric state** — journal-before-mutate means a
-genuine legacy add-then-crash-before-move stray implies a journal; on a
-fresh host (no journal) a colliding root-namespace link is foreign state
+genuine legacy add-then-crash-before-move stray implies a journal, with
+one exception: the released v0.1.0/v0.1.1 code saved the ownership
+journal only at the end of apply, so a crash on the very first apply in
+the add→move window leaves a stray with an empty journal; that state
+wedges fail-closed and requires manual cleanup (it is no worse than the
+released baseline, which also wedged). On a fresh host (no journal) a
+colliding root-namespace link is foreign state
 and is never deleted, and the both-namespaces check below fails closed
 on it instead. Every VXLAN recorded in the ownership journal is deleted
 **first** (their `dev <wg>` underlay binding dies with the old

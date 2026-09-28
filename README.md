@@ -8,11 +8,11 @@ real MACs, identically on the same hypervisor and across hypervisors.
 
 Status: **hardened provider + green multi-host evidence gate.** The
 fake-kernel conformance suite and the 35-assertion multi-host evidence run
-(three real kernels via privileged docker: real ARP/ICMP with real MACs,
-encrypted underlay, zero-leak teardown, WG socket in the fabric netns) both
-pass at HEAD. Consumed by O3K and CHV via git tag. Cross-machine runs over
-real networks remain the final production gate (see `evidence/README.md` →
-Limitations).
+(three real host instances — privileged containers on one physical kernel:
+real ARP/ICMP with real MACs, encrypted underlay, zero-leak teardown, WG
+socket in the fabric netns) both pass at HEAD. Consumed by O3K and CHV via
+git tag. Cross-machine runs over real networks remain the final production
+gate (see `evidence/README.md` → Limitations).
 
 ## Design (one paragraph)
 

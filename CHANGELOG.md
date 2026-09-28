@@ -35,10 +35,10 @@
   semantics (per-ns link placement, counting fdb entries with one-per-del
   removal, real kernel error strings), so a too-permissive provider cannot
   pass the conformance suite.
-- Conformance suite extended with hardening cases (teardown convergence after
-  a simulated reboot, re-apply healing, interrupted-heal slices, flood-list
-  shrinking and duplicate convergence, MTU/addressing re-assertion) and new
-  plan-identity validation.
+- Hardening tests across the conformance suite and the `fabric-linux` unit
+  tests: teardown convergence after a simulated reboot, re-apply healing,
+  interrupted-heal slices at every crash window, flood-list shrinking and
+  duplicate convergence, ownership-gated root-ns sweeps.
 - Evidence harness: cargo is located through the build user's login shell when
   run via `sudo`; post-failure diagnostics (nat counters, conntrack, wg show,
   per-ns sockets) are captured to the results dir; the WG socket-placement

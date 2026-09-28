@@ -269,14 +269,20 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             //
             // The sweep is gated on OWNERSHIP EVIDENCE (contract §3.10):
             // journal-before-mutate means every object the old code ever
-            // created was preceded by a journal write, so a genuine
-            // legacy add-then-crash-before-move stray implies a journal
-            // that shows we own(ed) fabric state. On a fresh host (no
-            // journal) a root-ns link with our deterministic name is
-            // FOREIGN state and must not be deleted here — the
-            // both-namespaces collision check in the healthy path below
-            // fails closed on it instead once the ns-scoped interface
-            // exists.
+            // created was preceded by an ownership-journal write, so a
+            // genuine legacy add-then-crash-before-move stray implies a
+            // journal that shows we own(ed) fabric state. ONE EXCEPTION:
+            // the released v0.1.0/v0.1.1 code saved the ownership journal
+            // only at the END of apply, so a crash on the very FIRST
+            // apply in the add→move window leaves a stray with an empty
+            // journal — that state wedges fail-closed here and on the
+            // collision check below (manual cleanup is the remedy; it is
+            // no worse than the released baseline, which also wedged).
+            // On a fresh host (no journal) a root-ns link with our
+            // deterministic name is FOREIGN state and must not be
+            // deleted here — the both-namespaces collision check in the
+            // healthy path below fails closed on it instead once the
+            // ns-scoped interface exists.
             if self.owns_fabric_state() {
                 self.run_tolerant("ip", &["link", "del", &wg])?;
             }
