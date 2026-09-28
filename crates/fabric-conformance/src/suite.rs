@@ -151,6 +151,10 @@ fn cases() -> Vec<(String, Case)> {
             "foreign_state_rejects_prefix_vni".to_string(),
             case_foreign_state_rejects_prefix_vni,
         ),
+        (
+            "flood_duplicates_of_desired_dst_converge".to_string(),
+            case_flood_duplicates_converge,
+        ),
     ]
 }
 
@@ -835,6 +839,74 @@ fn case_foreign_state_rejects_prefix_vni() -> Result<(), FabricError> {
             "a foreign VXLAN with prefix-matching VNI was adopted instead of rejected".to_string(),
         )),
     }
+}
+
+/// Pre-existing duplicates of a still-desired destination (the
+/// Launchpad #1531013 fleet state) must converge to exactly one entry:
+/// reconciliation is instance-count aware — each `bridge fdb del`
+/// removes exactly one instance — so the duplicated destination is
+/// issued count−1 tolerant deletes. The fake kernel is seeded
+/// mid-lifecycle (after a converged apply) to model a fleet that
+/// accumulated the duplicate under older code.
+fn case_flood_duplicates_converge() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("fdb-dupe-seed")?;
+    let plan = plan_for(
+        100,
+        &[("host-02", [198, 18, 0, 2]), ("host-03", [198, 18, 0, 3])],
+    )
+    .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let vxlan = names.vxlan(&plan.network_id);
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    env.take_runner_back(provider);
+
+    // Seed the fake mid-lifecycle: one desired destination now has two
+    // instances (duplicate append), the other one.
+    let out = env.runner.run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &ns,
+            "bridge",
+            "fdb",
+            "append",
+            "00:00:00:00:00:00",
+            "dev",
+            vxlan.as_str(),
+            "dst",
+            "198.18.0.2",
+        ],
+    )?;
+    if !out.success {
+        env.cleanup();
+        return Err(FabricError::Command(format!(
+            "could not seed the duplicate flood entry: {}",
+            out.stderr.trim()
+        )));
+    }
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    let count_2 = provider
+        .runner()
+        .fdb_entry_count(&vxlan, "00:00:00:00:00:00", "198.18.0.2");
+    let count_3 = provider
+        .runner()
+        .fdb_entry_count(&vxlan, "00:00:00:00:00:00", "198.18.0.3");
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if count_2 != 1 || count_3 != 1 {
+        return Err(FabricError::Invalid(format!(
+            "duplicate HER flood entries must converge to exactly one per \
+             desired destination (198.18.0.2: {count_2}, 198.18.0.3: {count_3})"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

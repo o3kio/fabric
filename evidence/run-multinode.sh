@@ -348,8 +348,11 @@ done
 # interface created in the root ns and moved would leave its socket in
 # the root ns — where the fabric's DNAT rules do not apply — and peer
 # traffic would be sent un-NAT'ed into a black hole. ss(8) lists
-# listening UDP sockets per network namespace, so both sides of the
-# invariant are directly observable here.
+# listening UDP sockets per network namespace, so the namespace side of
+# the invariant is directly observable; and because ss alone proves
+# only "a listener", `wg show <wg>` inside the fabric namespace is
+# additionally required to succeed and report the configured listen
+# port, proving the listener belongs to our WireGuard device.
 for h in "${HOSTS[@]}"; do
   ns_ss="$(hexec "$h" ip netns exec "$PREFIX-fabric" ss -uln)"
   root_ss="$(hexec "$h" ss -uln)"
@@ -357,11 +360,28 @@ for h in "${HOSTS[@]}"; do
   printf '%s\n' "$root_ss" >"$RESULTS_DIR/ss-root-ns-$h.txt"
   ns_listening="$(printf '%s\n' "$ns_ss" | grep -E ":${WG_PORT}\b" || true)"
   root_listening="$(printf '%s\n' "$root_ss" | grep -E ":${WG_PORT}\b" || true)"
-  if [[ -n "$ns_listening" && -z "$root_listening" ]]; then
-    pass "wg_socket_in_fabric_ns_$h" "WG UDP $WG_PORT listens in $PREFIX-fabric ns, not in root ns"
+  # ss(8) alone proves only "a listener on the port inside the
+  # namespace" — not that the listener belongs to OUR WireGuard device.
+  # Prove socket ownership: `wg show <wg>` inside the fabric namespace
+  # must succeed and report the configured listen port (a wg device
+  # whose UDP socket is bound elsewhere, or a foreign socket on the
+  # port, cannot satisfy this).
+  wg_ns_show=""
+  if wg_ns_show="$(hexec "$h" ip netns exec "$PREFIX-fabric" wg show "$PREFIX-wg" 2>&1)"; then
+    printf '%s\n' "$wg_ns_show" >"$RESULTS_DIR/wg-show-fabric-ns-$h.txt"
+  else
+    wg_show_rc=$?
+    printf 'wg show %s exited %s\n' "$PREFIX-wg" "$wg_show_rc" \
+      >"$RESULTS_DIR/wg-show-fabric-ns-$h.txt"
+  fi
+  wg_port_reported="$(printf '%s\n' "$wg_ns_show" \
+    | grep -E "listening port: ${WG_PORT}$" || true)"
+  if [[ -n "$ns_listening" && -z "$root_listening" && -n "$wg_port_reported" ]]; then
+    pass "wg_socket_in_fabric_ns_$h" \
+      "WG device $PREFIX-wg reports listen port $WG_PORT in $PREFIX-fabric ns; UDP $WG_PORT listens there, not in root ns"
   else
     fail "wg_socket_in_fabric_ns_$h" \
-      "ns match: '${ns_listening:-<none>}', root match: '${root_listening:-<none>}'"
+      "ns match: '${ns_listening:-<none>}', root match: '${root_listening:-<none>}', wg-reported port: '${wg_port_reported:-<none>}'"
   fi
 done
 

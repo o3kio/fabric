@@ -12,8 +12,10 @@
 //! state, MTUs, and the local transport address are re-asserted on every
 //! apply (all through idempotent `replace`/`set` verbs), and the HER
 //! flood list is reconciled against the OBSERVED forwarding state
-//! (append-missing / delete-unwanted — the kernel does not guarantee
-//! `bridge fdb append` deduplication), so a crash between two mutations
+//! (append-missing / delete-unwanted / deduplicate — the kernel does
+//! not guarantee `bridge fdb append` deduplication, and each
+//! `bridge fdb del` removes exactly one instance), so a crash between
+//! two mutations
 //! — or a kernel that lost state — heals on the next apply. Teardown is
 //! idempotent in the same sense: deleting an object that is already
 //! absent is success, and the journals always converge to the desired
@@ -264,7 +266,34 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             // placement for us, so it is swept tolerantly — absence is
             // the normal case — before the interface is created inside
             // the namespace.
-            self.run_tolerant("ip", &["link", "del", &wg])?;
+            //
+            // The sweep is gated on OWNERSHIP EVIDENCE (contract §3.10):
+            // journal-before-mutate means every object the old code ever
+            // created was preceded by a journal write, so a genuine
+            // legacy add-then-crash-before-move stray implies a journal
+            // that shows we own(ed) fabric state. On a fresh host (no
+            // journal) a root-ns link with our deterministic name is
+            // FOREIGN state and must not be deleted here — the
+            // both-namespaces collision check in the healthy path below
+            // fails closed on it instead once the ns-scoped interface
+            // exists.
+            if self.owns_fabric_state() {
+                self.run_tolerant("ip", &["link", "del", &wg])?;
+            }
+            // Crash-window recovery for a LEGACY journal (born-in-ns
+            // flag not yet set) whose WireGuard was lost entirely —
+            // including the crash window of a heal that deleted the wg
+            // BEFORE the recorded VXLANs. Every recorded VXLAN binds
+            // `dev <wg>`, and that underlay reference died with the old
+            // interface, so the recorded VXLANs are stale even though
+            // identity verification cannot see the binding (contract
+            // §3.3): they are deleted tolerantly, by journal-recorded
+            // name, before the replacement wg exists. This apply's
+            // network re-creates its VXLAN below; other networks heal
+            // on their next apply.
+            if !self.ownership.wireguard_born_in_fabric_ns && !self.ownership.networks.is_empty() {
+                self.delete_recorded_vxlans(&ns)?;
+            }
             self.ns_run_checked(&ns, "ip", &["link", "add", &wg, "type", "wireguard"])?;
             created_wireguard = true;
         } else if !self.ownership.wireguard_born_in_fabric_ns {
@@ -277,29 +306,30 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             // from inside the namespace. Every per-network VXLAN device
             // recorded in the ownership journal is deleted as well: the
             // VXLANs bind `dev <wg>`, and that underlay reference breaks
-            // when the wg is deleted; the ensure_network pass of this
-            // apply re-creates the applied network's VXLAN (other live
-            // networks heal on their next apply). This is a one-time
-            // WireGuard session drop + re-handshake on upgrade. All
-            // deletions are tolerant, so a heal interrupted anywhere
-            // simply re-runs: the flag is only set once the replacement
-            // link exists AND is fully configured below.
+            // when the wg is deleted. This is a one-time WireGuard
+            // session drop + re-handshake on upgrade. All deletions are
+            // tolerant, so a heal interrupted anywhere simply re-runs:
+            // the flag is only set once the replacement link exists AND
+            // is fully configured below.
+            //
+            // ORDER (contract §3.10): the recorded VXLANs are deleted
+            // BEFORE the ns-scoped wg. A heal interrupted between the
+            // two then finds the wg absent with the flag still unset,
+            // and the wg-absent branch above recreates the wg AND (for
+            // a legacy journal) sweeps any recorded VXLANs the crash
+            // left behind — every interruption slice converges. The
+            // reverse order (wg first) would orphan the VXLANs forever:
+            // the wg-absent recovery would set the flag and never
+            // delete them, while identity verification keeps passing
+            // them green on a dead `dev` binding.
             //
             // The root-namespace sweep runs first (tolerantly): a
             // legacy-crash stray may coexist with the ns-scoped link, and
             // a stray that survives the heal would wedge the next apply
             // at the both-namespaces fail-closed check.
             self.run_tolerant("ip", &["link", "del", &wg])?;
+            self.delete_recorded_vxlans(&ns)?;
             self.ns_run_tolerant(&ns, "ip", &["link", "del", &wg])?;
-            let recorded_vxlans: Vec<String> = self
-                .ownership
-                .networks
-                .values()
-                .map(|entry| entry.vxlan_name.clone())
-                .collect();
-            for vxlan in &recorded_vxlans {
-                self.ns_run_tolerant(&ns, "ip", &["link", "del", vxlan])?;
-            }
             self.ns_run_checked(&ns, "ip", &["link", "add", &wg, "type", "wireguard"])?;
             created_wireguard = true;
         } else {
@@ -747,20 +777,37 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         // kernels that do not dedup. Desired destinations absent from
         // `bridge fdb show dev <vxlan>` are appended (with `append`,
         // never `replace` — the kernel rejects `replace` on non-unicast
-        // MACs, and replace semantics would clobber the other remotes);
-        // observed all-zeros destinations that are no longer desired are
-        // deleted, tolerating already-absent entries. A kernel that lost
-        // the fdb (a recreated VXLAN, a reboot) converges because the
-        // observed set is empty and every desired entry is re-appended —
-        // the journal is never consulted, so reconciliation also catches
-        // entries the journal does not know about.
+        // MACs, and replace semantics would clobber the other remotes).
+        //
+        // Reconciliation is INSTANCE-COUNT aware: the show prints one
+        // line per entry instance, and each `bridge fdb del` removes
+        // exactly ONE instance (one RTM_DELNEIGH), so a destination
+        // observed N times is issued N−1 tolerant deletes when it is
+        // still desired and N when it is not. Collapsing the observed
+        // table into a set would make N>1 accumulated duplicates of a
+        // still-desired destination — the exact fleet state this
+        // reconciliation exists to fix — indistinguishable from 1, and
+        // the duplicates would persist forever. A kernel that lost the
+        // fdb (a recreated VXLAN, a reboot) converges because the
+        // observed table is empty and every desired entry is
+        // re-appended — the journal is never consulted, so
+        // reconciliation also catches entries the journal does not know
+        // about.
         let desired: BTreeSet<Ipv4Addr> = plan.flood_list();
         let observed = self.ns_fdb_show_flood(&ns, &vxlan)?;
-        for ip in desired.difference(&observed) {
-            self.ns_fdb_append(&ns, &vxlan, ip)?;
+        for ip in &desired {
+            if !observed.contains_key(ip) {
+                self.ns_fdb_append(&ns, &vxlan, ip)?;
+            }
         }
-        for ip in observed.difference(&desired) {
-            self.ns_fdb_del(&ns, &vxlan, ip)?;
+        for (ip, count) in &observed {
+            // Converge to exactly one instance when the destination is
+            // desired, zero when it is not: `keep` is the number of
+            // instances that must remain.
+            let keep = usize::from(desired.contains(ip));
+            for _ in keep..*count {
+                self.ns_fdb_del(&ns, &vxlan, ip)?;
+            }
         }
 
         self.ownership.networks.insert(
@@ -779,6 +826,36 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     }
 
     // ---- helpers ----------------------------------------------------------
+
+    /// True when the ownership journal shows this host owns (or owned)
+    /// shared fabric state — the evidence that gates root-namespace
+    /// stray sweeps (see the WireGuard section of [`Self::ensure_fabric`]).
+    fn owns_fabric_state(&self) -> bool {
+        self.ownership.fabric_configured || !self.ownership.networks.is_empty()
+    }
+
+    /// Tolerantly delete every per-network VXLAN recorded in the
+    /// ownership journal, by journal-recorded name (ownership fencing:
+    /// deterministic names are hints, the journal is proof).
+    ///
+    /// Used by the legacy heal and its crash-window recovery: a VXLAN
+    /// binds its underlay to `dev <wg>` at creation, and that reference
+    /// dies with the wg — identity verification cannot see the binding
+    /// (contract §3.3), so a VXLAN that outlived its wg cannot be
+    /// repaired in place, only deleted and re-created by the next apply
+    /// of its network.
+    fn delete_recorded_vxlans(&mut self, ns: &str) -> Result<(), FabricError> {
+        let recorded: Vec<String> = self
+            .ownership
+            .networks
+            .values()
+            .map(|entry| entry.vxlan_name.clone())
+            .collect();
+        for vxlan in &recorded {
+            self.ns_run_tolerant(ns, "ip", &["link", "del", vxlan])?;
+        }
+        Ok(())
+    }
 
     fn live_plans(&self) -> Result<Vec<StretchedL2Plan>, FabricError> {
         let mut plans = Vec::new();
@@ -855,9 +932,11 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
 
     /// Run a deletion and treat "object already absent" as success.
     ///
-    /// Used only on teardown paths, where the desired end state of the
-    /// command is already reached when the object is gone. Any other
-    /// failure is a hard error (fail closed).
+    /// Used on the teardown paths AND on the creation/heal sweeps (the
+    /// root-ns stray sweep, the legacy heal's VXLAN/wg deletions, and
+    /// the duplicate flood-entry deletes), where an absent object
+    /// equally means the desired end state is already reached. Any
+    /// other failure is a hard error (fail closed).
     fn run_tolerant(&mut self, program: &str, args: &[&str]) -> Result<(), FabricError> {
         let output = self.runner.run(program, args)?;
         if output.success || object_already_absent(&output.stderr) {
@@ -920,17 +999,22 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     }
 
     /// The observed all-zeros (BUM) flood destinations on `vxlan`, read
-    /// from `bridge fdb show dev <vxlan>`.
+    /// from `bridge fdb show dev <vxlan>`, WITH the number of entry
+    /// instances observed per destination.
     ///
     /// This is the reconciliation input for the HER flood list: the
     /// kernel's forwarding table is the source of truth, not the journal.
+    /// The per-destination instance COUNT is kept (not collapsed into a
+    /// set) because the kernel does not guarantee `append` deduplication
+    /// and each `bridge fdb del` removes exactly one instance — the
+    /// reconciliation needs N to converge N accumulated duplicates.
     /// Fails closed when the show itself fails (the provider cannot know
     /// what to append or delete).
     fn ns_fdb_show_flood(
         &mut self,
         ns: &str,
         vxlan: &str,
-    ) -> Result<BTreeSet<Ipv4Addr>, FabricError> {
+    ) -> Result<BTreeMap<Ipv4Addr, usize>, FabricError> {
         let output = self.ns_run(ns, "bridge", &["fdb", "show", "dev", vxlan])?;
         if !output.success {
             return Err(FabricError::Command(format!(
@@ -941,7 +1025,7 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         // iproute2 line shape (one line per entry instance):
         // `<mac> dev <dev> dst <ip> [self permanent]`. Lines that do not
         // match are ignored (e.g. local entries without a dst).
-        let mut observed = BTreeSet::new();
+        let mut observed: BTreeMap<Ipv4Addr, usize> = BTreeMap::new();
         for line in output.stdout.lines() {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             let token_after = |flag: &str| -> Option<&str> {
@@ -957,7 +1041,7 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
                 continue;
             }
             if let Some(dst) = token_after("dst").and_then(|dst| dst.parse::<Ipv4Addr>().ok()) {
-                observed.insert(dst);
+                *observed.entry(dst).or_insert(0) += 1;
             }
         }
         Ok(observed)
@@ -985,7 +1069,10 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         )
     }
 
-    /// Delete one HER flood entry, tolerating an already-absent entry.
+    /// Delete ONE instance of one HER flood entry — each `bridge fdb del`
+    /// (one RTM_DELNEIGH) removes exactly one instance, so the
+    /// count-aware reconciliation issues one call per instance that must
+    /// go — tolerating an already-absent entry.
     fn ns_fdb_del(&mut self, ns: &str, vxlan: &str, ip: &Ipv4Addr) -> Result<(), FabricError> {
         let dst = ip.to_string();
         self.ns_run_tolerant(
@@ -1169,6 +1256,46 @@ mod tests {
 
     fn plan_error(e: PlanError) -> FabricError {
         FabricError::Invalid(e.to_string())
+    }
+
+    /// Rewrite the ownership journal in the legacy format (field absent)
+    /// — exactly the state a pre-fix deployment presents.
+    fn strip_born_flag(config: &FabricLinuxConfig) -> Result<(), FabricError> {
+        let journal = config.ownership_path();
+        let raw = fs::read_to_string(&journal)?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| FabricError::Ownership(e.to_string()))?;
+        let removed = value
+            .as_object_mut()
+            .ok_or_else(|| FabricError::Invalid("journal is not an object".to_string()))?
+            .remove("wireguard_born_in_fabric_ns");
+        if removed.is_none() {
+            return Err(FabricError::Invalid(
+                "the applied journal must carry the born-in-ns flag".to_string(),
+            ));
+        }
+        fs::write(
+            &journal,
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| FabricError::Ownership(e.to_string()))?,
+        )?;
+        Ok(())
+    }
+
+    /// A fabric peer with a public key deterministically derived from the
+    /// host id (plans reject duplicate public keys, so multi-peer tests
+    /// must not share one key).
+    fn peer_for(host: &str, ip: [u8; 4]) -> Result<FabricPeer, PlanError> {
+        let mut material = "K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=".to_string();
+        let seed = host.as_bytes().last().copied().unwrap_or(b'0');
+        let letter = char::from(b'A' + (seed % 26));
+        material.replace_range(42..=42, &letter.to_string());
+        Ok(FabricPeer {
+            host_id: host.to_string(),
+            public_key: PublicKey::new(material)?,
+            underlay_endpoint: UnderlayEndpoint::parse("198.51.100.10:65001")?,
+            fabric_transport_ip: Ipv4Addr::from(ip),
+        })
     }
 
     // ---- C1: exact (token-level) VXLAN identity verification ------------
@@ -1707,20 +1834,7 @@ mod tests {
 
         // Rewrite the ownership journal in the legacy format (field
         // absent): exactly the state a pre-fix deployment presents.
-        let journal = config.ownership_path();
-        let raw = fs::read_to_string(&journal)?;
-        let mut value: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| FabricError::Ownership(e.to_string()))?;
-        let removed = value
-            .as_object_mut()
-            .ok_or_else(|| FabricError::Invalid("journal is not an object".to_string()))?
-            .remove("wireguard_born_in_fabric_ns");
-        assert!(removed.is_some(), "the applied journal must carry the flag");
-        fs::write(
-            &journal,
-            serde_json::to_string_pretty(&value)
-                .map_err(|e| FabricError::Ownership(e.to_string()))?,
-        )?;
+        strip_born_flag(&config)?;
 
         // Healing apply of net-a.
         let before_heal = runner.calls().len();
@@ -1777,6 +1891,27 @@ mod tests {
                 .iter()
                 .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_b}")),
             "the heal must delete every recorded vxlan, not just the applied one"
+        );
+        // MAJOR-1: the recorded VXLANs must be deleted BEFORE the
+        // ns-scoped wg. With the reverse (pre-fix) order, a crash
+        // between the wg delete and the VXLAN deletes orphans the VXLANs
+        // forever: the wg-absent recovery sets the flag and never
+        // deletes them, while identity verification keeps passing them
+        // green on a dead `dev <wg>` binding.
+        let index_of = |needle: &str| heal_slice.iter().position(|line| line == needle);
+        let (Some(wg_del_at), Some(vxlan_a_at), Some(vxlan_b_at)) = (
+            index_of(&format!("ip netns exec {ns} ip link del {wg}")),
+            index_of(&format!("ip netns exec {ns} ip link del {vxlan_a}")),
+            index_of(&format!("ip netns exec {ns} ip link del {vxlan_b}")),
+        ) else {
+            return Err(Box::new(FabricError::Invalid(
+                "heal ordering assertions could not find the deletion calls".to_string(),
+            )));
+        };
+        assert!(
+            vxlan_a_at < wg_del_at && vxlan_b_at < wg_del_at,
+            "the recorded vxlans must be deleted before the ns-scoped wg \
+             (crash-window convergence, contract §3.10)"
         );
         assert!(
             heal_slice.iter().any(|line| line.contains(&format!(
@@ -1966,9 +2101,16 @@ mod tests {
 
         let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
         let result = provider.apply_plan(&plan);
+        // MINOR-1: the foreign root-ns link must SURVIVE the failed
+        // apply — the healthy path never deletes, it only fails closed.
+        let foreign_survived = provider.runner().has_link(&wg);
         drop(provider);
 
         let _unused = fs::remove_dir_all(&root);
+        assert!(
+            foreign_survived,
+            "a foreign root-ns wg must never be deleted by a failed apply"
+        );
         match result {
             Err(FabricError::ForeignState { .. }) => Ok(()),
             other => Err(Box::new(FabricError::Invalid(format!(
@@ -2114,6 +2256,451 @@ mod tests {
         assert_eq!(
             appends_on_replay, 0,
             "a fully-converged flood list must produce zero appends"
+        );
+        Ok(())
+    }
+
+    // ---- MAJOR-1: interrupted-heal crash windows -------------------------
+
+    /// MAJOR-1 slice (a): a heal interrupted AFTER the recorded-VXLAN
+    /// deletes but BEFORE the wg delete (pre-seeded: wg present, legacy
+    /// journal, VXLANs absent) converges on the next apply — the heal
+    /// re-enters and finishes, the applied network's VXLAN is
+    /// re-created, and the born-in-ns flag is set. The other network's
+    /// VXLAN heals on its own next apply.
+    #[test]
+    fn interrupted_heal_after_vxlan_deletes_converges() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("heal-crashtest-a")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan_a = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let plan_b = test_plan("net-b", 200, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let vxlan_a = names.vxlan(&plan_a.network_id);
+        let vxlan_b = names.vxlan(&plan_b.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan_a)?;
+        provider.apply_plan(&plan_b)?;
+        assert!(provider.ownership().wireguard_born_in_fabric_ns);
+        let mut runner = provider.into_runner();
+
+        // Legacy journal (flag stripped) + crash residue: the heal's
+        // VXLAN deletes ran, the wg delete did not.
+        strip_born_flag(&config)?;
+        for vxlan in [&vxlan_a, &vxlan_b] {
+            let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", vxlan])?;
+            assert!(
+                out.success,
+                "could not pre-delete {vxlan} for the test: {}",
+                out.stderr
+            );
+        }
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let report = provider.apply_plan(&plan_a)?;
+        let flag = provider.ownership().wireguard_born_in_fabric_ns;
+        let vxlan_a_back = provider.runner().has_link(&vxlan_a);
+        let vxlan_b_still_gone = !provider.runner().has_link(&vxlan_b);
+        let flood_a = provider
+            .runner()
+            .fdb_entry_count(&vxlan_a, FLOOD_MAC, "198.18.0.2");
+
+        // The other network converges on its next apply.
+        provider.apply_plan(&plan_b)?;
+        let vxlan_b_back = provider.runner().has_link(&vxlan_b);
+        let flood_b = provider
+            .runner()
+            .fdb_entry_count(&vxlan_b, FLOOD_MAC, "198.18.0.2");
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            report.created_fabric,
+            "the interrupted heal must finish: the wg is re-created"
+        );
+        assert!(flag, "the heal must record the born-in-ns flag");
+        assert!(
+            vxlan_a_back,
+            "the applied network's vxlan must be re-created in the same apply"
+        );
+        assert!(
+            vxlan_b_still_gone,
+            "the other network's vxlan heals on its own next apply, not this one"
+        );
+        assert_eq!(
+            flood_a, 1,
+            "the re-created vxlan's flood list must be rebuilt exactly once"
+        );
+        assert!(vxlan_b_back, "net-b's next apply must re-create its vxlan");
+        assert_eq!(
+            flood_b, 1,
+            "net-b's flood list must be rebuilt exactly once"
+        );
+        Ok(())
+    }
+
+    /// MAJOR-1 slice (b): the crash window of the OLD heal order — the
+    /// wg was deleted, the recorded VXLANs were not (pre-seeded: wg
+    /// absent, legacy journal, VXLANs present, journal records both
+    /// networks). The next apply takes the wg-absent branch: it must
+    /// delete the stale VXLANs (their `dev <wg>` binding died with the
+    /// old interface and identity verification cannot see that),
+    /// re-create the wg inside the namespace plus this network's VXLAN,
+    /// and set the flag. A second apply must be a pure no-op replay.
+    #[test]
+    fn interrupted_heal_after_wg_delete_converges() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("heal-crashtest-b")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan_a = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let plan_b = test_plan("net-b", 200, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let vxlan_a = names.vxlan(&plan_a.network_id);
+        let vxlan_b = names.vxlan(&plan_b.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan_a)?;
+        provider.apply_plan(&plan_b)?;
+        assert!(provider.ownership().wireguard_born_in_fabric_ns);
+        let mut runner = provider.into_runner();
+
+        // Legacy journal (flag stripped) + the OLD order's crash
+        // residue: the wg is gone, the recorded VXLANs survived it.
+        strip_born_flag(&config)?;
+        let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
+        assert!(
+            out.success,
+            "could not pre-delete the wg for the test: {}",
+            out.stderr
+        );
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let report = provider.apply_plan(&plan_a)?;
+        let flag = provider.ownership().wireguard_born_in_fabric_ns;
+        let slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let vxlan_a_back = provider.runner().has_link(&vxlan_a);
+        let vxlan_b_gone = !provider.runner().has_link(&vxlan_b);
+        let flood_a = provider
+            .runner()
+            .fdb_entry_count(&vxlan_a, FLOOD_MAC, "198.18.0.2");
+
+        // The second apply must be a pure no-op replay.
+        let before_replay = provider.runner().calls().len();
+        let replay_report = provider.apply_plan(&plan_a)?;
+        let replay_slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before_replay)
+            .map(|call| call.joined())
+            .collect();
+        let flood_a_after = provider
+            .runner()
+            .fdb_entry_count(&vxlan_a, FLOOD_MAC, "198.18.0.2");
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            report.created_fabric,
+            "the wg-absent recovery must re-create the WireGuard interface"
+        );
+        assert!(flag, "the recovery must record the born-in-ns flag");
+        // The stale, binding-dead VXLANs are swept by journal-recorded
+        // name BEFORE the replacement wg exists...
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_a}")),
+            "the stale recorded vxlan of the applied network must be deleted"
+        );
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_b}")),
+            "every stale recorded vxlan must be deleted, not just the applied one"
+        );
+        // ...the wg is re-created inside the namespace...
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
+            "the wg must be re-created inside the fabric namespace"
+        );
+        // ...and this network's VXLAN is re-created on the NEW wg.
+        assert!(
+            slice.iter().any(|line| line.contains(&format!(
+                "ip netns exec {ns} ip link add {vxlan_a} type vxlan"
+            ))),
+            "the applied network's vxlan must be re-created on the new wg"
+        );
+        assert!(vxlan_a_back, "the applied network's vxlan must exist again");
+        assert!(
+            vxlan_b_gone,
+            "the other network's stale vxlan must be gone (it heals on its \
+             own next apply, it must not be adopted with a dead binding)"
+        );
+        assert_eq!(
+            flood_a, 1,
+            "the re-created vxlan's flood list must be rebuilt exactly once"
+        );
+        assert!(
+            !replay_report.created_fabric && !replay_report.created_network,
+            "the second apply must not re-create anything"
+        );
+        assert!(
+            !replay_slice.iter().any(|line| line.contains(" link add ")),
+            "the second apply must not create links: {replay_slice:?}"
+        );
+        assert!(
+            !replay_slice.iter().any(|line| line.contains(" link del ")),
+            "the second apply must not delete links: {replay_slice:?}"
+        );
+        assert_eq!(
+            flood_a_after, 1,
+            "the second apply must not duplicate flood entries"
+        );
+        Ok(())
+    }
+
+    // ---- MINOR-1: root-ns stray sweep gating -----------------------------
+
+    /// On a fresh host (empty journal) the root-ns stray sweep must NOT
+    /// run: a root-ns link with our deterministic name is FOREIGN state
+    /// there, and journal-before-mutate means a genuine legacy
+    /// add-then-crash stray always implies a journal that shows we
+    /// own(ed) fabric state. In the fake kernel the sweep is a tolerated
+    /// no-op when no link exists, so the gate is observable through the
+    /// recorded call journal: the pre-fix code issued the root-ns
+    /// deletion on EVERY fresh apply.
+    #[test]
+    fn root_stray_sweep_is_skipped_on_a_fresh_host() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("stray-gate-fresh")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        let joined: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .map(|call| call.joined())
+            .collect();
+        let flag = provider.ownership().wireguard_born_in_fabric_ns;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            !joined
+                .iter()
+                .any(|line| line == &format!("ip link del {wg}")),
+            "a fresh host (empty journal) must not run the root-ns stray sweep: \
+             a colliding root link would be foreign state"
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
+            "the wg must still be created inside the fabric namespace"
+        );
+        assert!(flag, "the creation must be journaled");
+        Ok(())
+    }
+
+    /// The other side of the gate: when the journal shows we own(ed)
+    /// fabric state, a lost ns-scoped wg re-apply DOES run the root-ns
+    /// stray sweep (a legacy add-then-crash stray is ours to clean) and
+    /// re-creates the wg inside the namespace — while the recorded
+    /// VXLANs are NOT deleted, because the born-in-ns flag is set (no
+    /// heal pending; the belt-and-braces VXLAN sweep is scoped to
+    /// legacy journals).
+    #[test]
+    fn root_stray_sweep_runs_with_ownership_evidence() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("stray-gate-owned")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let vxlan = names.vxlan(&plan.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        assert!(provider.ownership().wireguard_born_in_fabric_ns);
+        let mut runner = provider.into_runner();
+
+        // The ns-scoped wg is lost (kernel crash / operator) while the
+        // journal survives: the next apply takes the wg-absent branch.
+        let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
+        assert!(
+            out.success,
+            "could not pre-delete the wg for the test: {}",
+            out.stderr
+        );
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let report = provider.apply_plan(&plan)?;
+        let slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let vxlan_kept = provider.runner().has_link(&vxlan);
+        let flag = provider.ownership().wireguard_born_in_fabric_ns;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip link del {wg}")),
+            "with ownership evidence in the journal, the root-ns stray \
+             sweep must run before the wg is re-created"
+        );
+        assert!(
+            slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
+            "the wg must be re-created inside the fabric namespace"
+        );
+        assert!(
+            report.created_fabric && !report.created_network,
+            "only the wg is re-created; the network state is untouched"
+        );
+        assert!(
+            vxlan_kept,
+            "with the born-in-ns flag set, a lost wg must NOT delete the \
+             recorded vxlans (no heal pending)"
+        );
+        assert!(flag);
+        Ok(())
+    }
+
+    // ---- MAJOR-2: duplicate convergence ----------------------------------
+
+    /// Pre-existing duplicates of still-desired destinations — the
+    /// Launchpad #1531013 fleet state — converge to exactly one entry:
+    /// reconciliation counts instances per destination and issues
+    /// count−1 tolerant `bridge fdb del` operations (each removes
+    /// exactly one instance), while the healthy destination is left
+    /// alone. Collapsing the observed table to a set (the pre-fix
+    /// behavior) makes the duplicate indistinguishable from 1 and it
+    /// persists forever.
+    #[test]
+    fn flood_duplicates_of_desired_destinations_converge() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("flood-dupe-conv")?;
+        let config = FabricLinuxConfig::new(&root);
+        let mut plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        plan.peers.push(peer_for("host-03", [198, 18, 0, 3])?);
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let vxlan = names.vxlan(&plan.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        assert_eq!(
+            provider
+                .runner()
+                .fdb_entry_count(&vxlan, FLOOD_MAC, "198.18.0.2"),
+            1
+        );
+        assert_eq!(
+            provider
+                .runner()
+                .fdb_entry_count(&vxlan, FLOOD_MAC, "198.18.0.3"),
+            1
+        );
+        let mut runner = provider.into_runner();
+
+        // Pre-seed the fleet state: one desired destination has
+        // accumulated a duplicate (count 2), the other is healthy.
+        let out = runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &ns,
+                "bridge",
+                "fdb",
+                "append",
+                FLOOD_MAC,
+                "dev",
+                vxlan.as_str(),
+                "dst",
+                "198.18.0.2",
+            ],
+        )?;
+        assert!(
+            out.success,
+            "could not seed the duplicate flood entry: {}",
+            out.stderr
+        );
+        assert_eq!(
+            runner.fdb_entry_count(&vxlan, FLOOD_MAC, "198.18.0.2"),
+            2,
+            "seeding sanity: the duplicate must be observable"
+        );
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        provider.apply_plan(&plan)?;
+        let count_2 = provider
+            .runner()
+            .fdb_entry_count(&vxlan, FLOOD_MAC, "198.18.0.2");
+        let count_3 = provider
+            .runner()
+            .fdb_entry_count(&vxlan, FLOOD_MAC, "198.18.0.3");
+        let dels_of_duplicate = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .filter(|call| {
+                call.joined().contains("fdb del") && call.joined().contains("dst 198.18.0.2")
+            })
+            .count();
+        let appends_on_heal = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .filter(|call| call.joined().contains("fdb append"))
+            .count();
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert_eq!(
+            count_2, 1,
+            "a duplicated desired destination must converge to exactly one entry"
+        );
+        assert_eq!(
+            count_3, 1,
+            "the healthy destination must stay at exactly one entry"
+        );
+        assert_eq!(
+            dels_of_duplicate, 1,
+            "exactly count-1 tolerant deletes must be issued for the \
+             duplicated destination (one instance per del)"
+        );
+        assert_eq!(
+            appends_on_heal, 0,
+            "present desired destinations must not be re-appended"
         );
         Ok(())
     }

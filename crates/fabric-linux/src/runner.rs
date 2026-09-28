@@ -163,8 +163,8 @@ pub struct RecordingRunner {
     /// append "adds a new fdb entry with an already known LLADDR ...
     /// added multiple times"; Launchpad #1531013 documented fleets
     /// accumulating duplicate all-zeros flood entries) — so duplicate
-    /// appends are visible to tests. `del` removes the entry with all
-    /// its instances.
+    /// appends are visible to tests. `del` removes exactly ONE instance
+    /// per call (one RTM_DELNEIGH), like the real kernel.
     fdb: BTreeMap<(String, String, String), usize>,
     failures: Vec<String>,
 }
@@ -258,8 +258,10 @@ impl RecordingRunner {
     /// kernel does not guarantee per-(dev, mac, dst) deduplication —
     /// bridge(8) documents that entries "added multiple times" pile up,
     /// and field reports show duplicate all-zeros flood entries), `add` of
-    /// an existing entry fails, and `del` removes the entry with all its
-    /// instances. `fdb show [dev <dev>]` prints one line per instance,
+    /// an existing entry fails, and `del` removes exactly ONE instance
+    /// per call (decrement-or-remove, one RTM_DELNEIGH — a destination
+    /// that accumulated N duplicates needs N deletes to disappear
+    /// entirely). `fdb show [dev <dev>]` prints one line per instance,
     /// like the real `bridge fdb show`.
     fn bridge(&mut self, rest: &[&str]) -> CommandOutput {
         if rest.first() != Some(&"fdb") {
@@ -322,11 +324,20 @@ impl RecordingRunner {
                 }
             },
             "del" => {
-                // Removes the entry with ALL its instances.
-                if self.fdb.remove(&entry).is_some() {
-                    CommandOutput::ok()
-                } else {
-                    command_error("RTNETLINK answers: No such file or directory")
+                // One RTM_DELNEIGH removes exactly ONE instance: a
+                // destination that accumulated N duplicate entries needs
+                // N deletes to disappear entirely (the real kernel
+                // behaves the same way).
+                match self.fdb.get_mut(&entry) {
+                    Some(count) if *count > 1 => {
+                        *count -= 1;
+                        CommandOutput::ok()
+                    }
+                    Some(_) => {
+                        self.fdb.remove(&entry);
+                        CommandOutput::ok()
+                    }
+                    None => command_error("RTNETLINK answers: No such file or directory"),
                 }
             }
             "replace" => {
@@ -851,11 +862,13 @@ mod tests {
     }
 
     #[test]
-    fn fdb_append_accumulates_and_del_removes_all_instances() {
+    fn fdb_append_accumulates_and_del_removes_one_instance_per_call() {
         // The kernel does NOT guarantee append deduplication (bridge(8);
-        // Launchpad #1531013): each append adds an instance, and `del`
-        // removes the entry with all of them. Duplicate counts are
-        // observable through `fdb_entry_count` and in `fdb show` output.
+        // Launchpad #1531013): each append adds an instance. Each
+        // `bridge fdb del` (one RTM_DELNEIGH) removes exactly ONE
+        // instance — a destination that accumulated N duplicates needs N
+        // deletes to disappear entirely. Duplicate counts are observable
+        // through `fdb_entry_count` and in `fdb show` output.
         let mut runner = RecordingRunner::new();
         vxlan(&mut runner);
         assert!(fdb(&mut runner, "append", "198.18.0.2").success);
@@ -878,12 +891,20 @@ mod tests {
             2,
             "duplicated entries show as duplicated lines"
         );
+        // One del removes ONE instance: the duplicate shrinks to 1...
         assert!(fdb(&mut runner, "del", "198.18.0.2").success);
-        assert!(!runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+        assert_eq!(
+            runner.fdb_entry_count("vx0", "00:00:00:00:00:00", "198.18.0.2"),
+            1,
+            "del removes exactly one instance"
+        );
+        assert!(runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+        // ...and the last del removes the entry outright.
+        assert!(fdb(&mut runner, "del", "198.18.0.2").success);
         assert_eq!(
             runner.fdb_entry_count("vx0", "00:00:00:00:00:00", "198.18.0.2"),
             0,
-            "del removes every instance"
+            "the final del removes the last instance"
         );
         let out = fdb(&mut runner, "del", "198.18.0.2");
         assert!(!out.success, "deleting a missing entry must fail");

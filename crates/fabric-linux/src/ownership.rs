@@ -60,8 +60,13 @@ pub struct FabricOwnership {
     /// fabric underlay — the provider repairs that by delete + re-create
     /// from inside the namespace. Journals written before this field
     /// existed parse as `false` (`serde(default)`), which triggers the
-    /// one-time legacy heal; the field is additive, so old and new
-    /// journal formats remain mutually readable.
+    /// one-time legacy heal. The field is additive, so READING is
+    /// compatible in both directions (serde ignores the unknown field in
+    /// old code, `serde(default)` fills the absent field in new code) —
+    /// but round-trips through OLD code are not format-preserving: old
+    /// code parsing a new journal silently strips the unknown flag on its
+    /// next save, so a downgrade followed by a re-upgrade re-triggers the
+    /// one-time heal (one WireGuard session drop).
     #[serde(default)]
     pub wireguard_born_in_fabric_ns: bool,
     /// WireGuard peers currently configured (union over live plans).
@@ -178,9 +183,12 @@ mod tests {
     fn legacy_journal_without_socket_placement_flag_parses()
     -> Result<(), Box<dyn std::error::Error>> {
         // A journal written before `wireguard_born_in_fabric_ns` existed
-        // must keep parsing (as false — the legacy-heal trigger), and the
-        // unknown-field tolerance is symmetric: this field is additive,
-        // never a format break.
+        // must keep parsing (as false — the legacy-heal trigger). The
+        // field is additive, so READING is compatible in both directions
+        // — but not round-tripping: old code reading a NEW journal parses
+        // it fine and then strips the unknown flag on its next save, so a
+        // downgrade + re-upgrade re-triggers the one-time heal (one WG
+        // session drop). Never a format break, though.
         let root = std::env::temp_dir().join(format!(
             "fabric-own-legacy-{}-{}",
             std::process::id(),

@@ -111,7 +111,13 @@ level: the tokens following `id`, `dstport`, and `local` in
 `ip -d link show` output must equal the plan's VNI, the configured VXLAN
 port, and the plan's local transport IP exactly. Substring matching is
 forbidden — `id 100` must not accept a foreign `id 1000`, and a foreign
-destination port or local address is equally rejected.
+destination port or local address is equally rejected. Identity
+verification covers the `id`, `dstport`, and `local` tokens only; it
+does **not** verify the VXLAN's `dev <wg>` underlay binding (the
+binding is not visible in the parsed tokens). A VXLAN whose lower
+device was replaced therefore cannot be repaired in place — it must be
+deleted and re-created, which the legacy heal (§3.10) does by
+journal-recorded name.
 
 ### 3.4 Ownership fencing
 The provider only deletes objects it recorded in its ownership journal.
@@ -151,9 +157,16 @@ Duplicates both violate the bounded-peer-set invariant and double-flood
 BUM traffic to the same remote. Reconciliation keeps the healing property
 that motivated re-assertion in the first place: a recreated (post-reboot)
 VXLAN with an empty fdb has every desired entry appended as missing,
-while a healthy replay appends nothing and deletes nothing, so repeated
-applies converge to exactly one entry per desired destination. Deleting
-an unwanted entry that is already absent is tolerated as done.
+while a healthy replay appends nothing and deletes nothing.
+Reconciliation is **instance-count aware**: `bridge fdb show` prints one
+line per entry instance, and each `bridge fdb del` removes exactly one
+instance (one RTM_DELNEIGH), so a destination observed N times is issued
+N−1 tolerant deletes when it is still desired and N when it is not.
+Pre-existing duplicates of a still-desired destination — the exact fleet
+state this guards against — therefore converge in a single apply, and
+repeated applies converge to exactly one entry per desired destination
+and zero per undesired one. Deleting an entry that is already absent is
+tolerated as done.
 
 ### 3.7 Learning stays on
 VXLAN devices are created **without** `nolearning`: the kernel performs MAC
@@ -201,15 +214,30 @@ Legacy state — journals written by provider versions predating this
 invariant, detectable via the absent `wireguard_born_in_fabric_ns`
 journal flag, which old journals deserialize as `false` — is healed by a
 one-time, idempotent procedure: a stray root-namespace interface of the
-same name is swept tolerantly, the namespace-scoped interface is deleted,
-every VXLAN recorded in the ownership journal is deleted (their fdb state
-belongs to the old interface; each network fully heals on its own next
-apply), the interface is recreated from inside the fabric namespace with
-the private key and listen port forced, and the journal flag is set only
-after the key/port configuration succeeds, so an interrupted heal re-runs
-to convergence. If an interface of the WireGuard name exists in **both**
-the root and the fabric namespace, the provider fails closed (foreign
-state) rather than guessing which one is its own.
+same name is swept tolerantly, but **only when the journal shows the
+provider owns (or owned) fabric state** — journal-before-mutate means a
+genuine legacy add-then-crash-before-move stray implies a journal; on a
+fresh host (no journal) a colliding root-namespace link is foreign state
+and is never deleted, and the both-namespaces check below fails closed
+on it instead. Every VXLAN recorded in the ownership journal is deleted
+**first** (their `dev <wg>` underlay binding dies with the old
+interface, and identity verification cannot see that — §3.3; each
+network fully heals on its own next apply), then the namespace-scoped
+interface is deleted, and the interface is recreated from inside the
+fabric namespace with the private key and listen port forced. The
+journal flag is set only after the key/port configuration succeeds.
+This deletion order makes every interruption slice of the heal
+convergent: interrupted before the interface deletion, the next apply
+re-enters the heal and finishes; interrupted after it, the next apply
+takes the WireGuard-absent path, which recreates the interface inside
+the namespace and — when the journal is legacy (flag unset) and still
+records networks — also tolerantly deletes the recorded VXLANs, the
+same way. That wg-absent branch covers a legacy fabric whose WireGuard
+was lost entirely, including the crash window of heal implementations
+that deleted the interface before the VXLANs. If an interface of the
+WireGuard name exists in **both** the root and the fabric namespace,
+the provider fails closed (foreign state) rather than guessing which
+one is its own.
 
 ## 4. Conformance
 
@@ -221,7 +249,8 @@ scoping, foreign-state rejection (including prefix-VNI rejection),
 teardown cleanliness, key non-leakage, peer withdrawal, and
 fabric-removal fencing — plus the hardening cases: teardown convergence
 after a simulated kernel restart, re-apply healing of partial state,
-flood-list shrinking, and MTU/addressing re-assertion. The fake kernel
+flood-list shrinking, duplicate flood-entry convergence, and
+MTU/addressing re-assertion. The fake kernel
 models the real `ip`/`bridge`/`wg` failure and placement semantics
 (missing devices, duplicate names, missing namespaces, missing
 fdb/route entries with real kernel error strings, per-namespace link
