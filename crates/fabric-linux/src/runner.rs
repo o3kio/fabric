@@ -126,6 +126,12 @@ impl FabricCommand for RealCommandRunner {
 }
 
 /// A recorded link in the fake kernel.
+///
+/// `netns` models the namespace the link lives in (None = root). It is
+/// set at creation (`ip netns exec NS ip link add ...` places the link
+/// in NS; a bare `ip link add` places it in the root namespace) and
+/// updated by `ip link set <link> netns <ns>`. Deletion is by global
+/// name — a simplification, since the fake has one name table.
 #[derive(Clone, Debug, Default)]
 struct FakeLink {
     kind: String,
@@ -133,6 +139,7 @@ struct FakeLink {
     dstport: Option<u16>,
     local: Option<String>,
     mtu: Option<u32>,
+    netns: Option<String>,
     addrs: std::collections::BTreeSet<String>,
 }
 
@@ -149,9 +156,16 @@ pub struct RecordingRunner {
     /// one global table, which is sufficient because the provider only
     /// manages routes inside the fabric namespace).
     routes: std::collections::BTreeSet<String>,
-    /// Forwarding-table entries: (device, mac, dst) triples. Flood entries
-    /// share the all-zeros MAC with one row per remote.
-    fdb: std::collections::BTreeSet<(String, String, String)>,
+    /// Forwarding-table entries: (device, mac, dst) triples with an
+    /// instance count. Flood entries share the all-zeros MAC with one
+    /// row per remote. `append` increments the count — the kernel does
+    /// NOT guarantee per-(dev, mac, dst) deduplication (bridge(8):
+    /// append "adds a new fdb entry with an already known LLADDR ...
+    /// added multiple times"; Launchpad #1531013 documented fleets
+    /// accumulating duplicate all-zeros flood entries) — so duplicate
+    /// appends are visible to tests. `del` removes the entry with all
+    /// its instances.
+    fdb: BTreeMap<(String, String, String), usize>,
     failures: Vec<String>,
 }
 
@@ -163,7 +177,7 @@ impl RecordingRunner {
             netns: std::collections::BTreeSet::new(),
             links: BTreeMap::new(),
             routes: std::collections::BTreeSet::new(),
-            fdb: std::collections::BTreeSet::new(),
+            fdb: BTreeMap::new(),
             failures: Vec::new(),
         }
     }
@@ -218,10 +232,20 @@ impl RecordingRunner {
     }
 
     /// True when the fake kernel holds the forwarding-table entry
-    /// `(dev, mac, dst)`.
+    /// `(dev, mac, dst)` (one or more instances).
     pub fn has_fdb_entry(&self, dev: &str, mac: &str, dst: &str) -> bool {
+        self.fdb_entry_count(dev, mac, dst) > 0
+    }
+
+    /// The number of instances of the forwarding-table entry
+    /// `(dev, mac, dst)` the fake kernel currently holds. A count above
+    /// one means duplicate `append`s accumulated — exactly what the
+    /// real kernel may do (it does not guarantee append dedup).
+    pub fn fdb_entry_count(&self, dev: &str, mac: &str, dst: &str) -> usize {
         self.fdb
-            .contains(&(dev.to_string(), mac.to_string(), dst.to_string()))
+            .get(&(dev.to_string(), mac.to_string(), dst.to_string()))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Interpret `bridge` arguments starting at `rest` (after any
@@ -230,20 +254,35 @@ impl RecordingRunner {
     /// Models the kernel's forwarding-table rules closely enough to catch
     /// verb-level mistakes a real kernel rejects: `replace` is refused for
     /// non-unicast entries (the kernel error that motivated the provider's
-    /// use of `append` for HER flood lists), `append` is idempotent per
-    /// (dev, mac, dst), and `del` of a missing entry fails.
+    /// use of `append` for HER flood lists), `append` ACCUMULATES (the
+    /// kernel does not guarantee per-(dev, mac, dst) deduplication —
+    /// bridge(8) documents that entries "added multiple times" pile up,
+    /// and field reports show duplicate all-zeros flood entries), `add` of
+    /// an existing entry fails, and `del` removes the entry with all its
+    /// instances. `fdb show [dev <dev>]` prints one line per instance,
+    /// like the real `bridge fdb show`.
     fn bridge(&mut self, rest: &[&str]) -> CommandOutput {
         if rest.first() != Some(&"fdb") {
             return CommandOutput::ok();
         }
         let op = rest.get(1).copied().unwrap_or("");
         if op == "show" {
-            let stdout = self
-                .fdb
-                .iter()
-                .map(|(dev, mac, dst)| format!("{mac} dev {dev} dst {dst} self permanent"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // `bridge fdb show [dev <dev>]`: without a dev filter, every
+            // entry; with one, only that device's entries (the real
+            // command filters the same way).
+            let dev_filter = arg_after(rest, "dev").map(str::to_string);
+            let mut stdout = String::new();
+            for ((dev, mac, dst), count) in &self.fdb {
+                if dev_filter
+                    .as_deref()
+                    .is_some_and(|filter| filter != dev.as_str())
+                {
+                    continue;
+                }
+                for _ in 0..*count {
+                    stdout.push_str(&format!("{mac} dev {dev} dst {dst} self permanent\n"));
+                }
+            }
             return CommandOutput {
                 success: true,
                 stdout,
@@ -257,10 +296,10 @@ impl RecordingRunner {
         if dev.is_empty() {
             return command_error("bridge: insufficient arguments");
         }
-        let Some(link) = self.links.get(dev) else {
-            return command_error("Cannot find device");
-        };
-        if link.kind != "vxlan" {
+        if !self.links.contains_key(dev) {
+            return command_error(&format!("Cannot find device \"{dev}\""));
+        }
+        if self.links.get(dev).is_some_and(|link| link.kind != "vxlan") {
             return command_error("Operation not supported: fdb with dst requires a vxlan device");
         }
         if !is_unicast_mac(mac) && op == "replace" {
@@ -269,19 +308,22 @@ impl RecordingRunner {
         let entry = (dev.to_string(), mac.to_string(), dst.to_string());
         match op {
             "append" => {
-                self.fdb.insert(entry);
+                // The kernel does not dedup: each append adds an instance.
+                *self.fdb.entry(entry).or_insert(0) += 1;
                 CommandOutput::ok()
             }
-            "add" => {
-                if self.fdb.contains(&entry) {
+            "add" => match self.fdb.entry(entry) {
+                std::collections::btree_map::Entry::Occupied(_) => {
                     command_error("RTNETLINK answers: File exists")
-                } else {
-                    self.fdb.insert(entry);
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(1);
                     CommandOutput::ok()
                 }
-            }
+            },
             "del" => {
-                if self.fdb.remove(&entry) {
+                // Removes the entry with ALL its instances.
+                if self.fdb.remove(&entry).is_some() {
                     CommandOutput::ok()
                 } else {
                     command_error("RTNETLINK answers: No such file or directory")
@@ -289,8 +331,9 @@ impl RecordingRunner {
             }
             "replace" => {
                 let mac_owned = mac.to_string();
-                self.fdb.retain(|(d, m, _)| !(d == dev && *m == mac_owned));
-                self.fdb.insert(entry);
+                self.fdb
+                    .retain(|(d, m, _), _| !(d == dev && *m == mac_owned));
+                self.fdb.insert(entry, 1);
                 CommandOutput::ok()
             }
             _ => command_error("bridge: unknown fdb operation"),
@@ -310,9 +353,12 @@ impl RecordingRunner {
         self.failures.iter().any(|p| joined.contains(p))
     }
 
-    /// Interpret `ip` arguments starting at `rest` (after any
-    /// `netns exec NS` prefix already stripped).
-    fn ip(&mut self, rest: &[&str]) -> CommandOutput {
+    /// Interpret `ip` arguments starting at `rest`. `ns` is the network
+    /// namespace the command executes in (`Some(..)` for
+    /// `ip netns exec NS ip ...`, `None` for a root-namespace call); it
+    /// decides where created links are placed and which links a
+    /// namespace-scoped `link show` observes.
+    fn ip(&mut self, ns: Option<&str>, rest: &[&str]) -> CommandOutput {
         // Normalize: drop a leading `-d` detail flag, remembering it.
         let detail = rest.first() == Some(&"-d");
         let rest = if detail { &rest[1..] } else { rest };
@@ -321,6 +367,9 @@ impl RecordingRunner {
             let name = rest[2];
             let mut link = FakeLink {
                 kind: "generic".to_string(),
+                // A link is born in the namespace the add runs in; its
+                // WireGuard socket (if any) binds there for life.
+                netns: ns.map(str::to_string),
                 ..FakeLink::default()
             };
             let mut peer_name: Option<&str> = None;
@@ -371,21 +420,26 @@ impl RecordingRunner {
                 if self.links.contains_key(peer) {
                     return command_error("RTNETLINK answers: File exists");
                 }
-                self.links.insert(peer.to_string(), FakeLink::default());
+                let peer_link = FakeLink {
+                    netns: ns.map(str::to_string),
+                    ..FakeLink::default()
+                };
+                self.links.insert(peer.to_string(), peer_link);
             }
             self.links.insert(name.to_string(), link);
             return CommandOutput::ok();
         }
         // link del NAME (deleting a device drops its forwarding entries,
         // as the kernel does). Deleting a missing device fails like the
-        // real `ip` — providers must tolerate that explicitly.
+        // real `ip` ("Cannot find device") — providers must tolerate
+        // that explicitly.
         if rest.first() == Some(&"link") && matches!(rest.get(1), Some(&"del") | Some(&"delete")) {
             if let Some(name) = rest.get(2) {
                 if !self.links.contains_key(*name) {
-                    return missing_device(name);
+                    return cannot_find_device(name);
                 }
                 self.links.remove(*name);
-                self.fdb.retain(|(dev, _, _)| dev != name);
+                self.fdb.retain(|(dev, _, _), _| dev != name);
             }
             return CommandOutput::ok();
         }
@@ -395,7 +449,7 @@ impl RecordingRunner {
             let addr = rest.get(2).copied().unwrap_or("");
             let dev = arg_after(rest, "dev").unwrap_or("");
             let Some(link) = self.links.get_mut(dev) else {
-                return missing_device(dev);
+                return cannot_find_device(dev);
             };
             return match op {
                 "add" => {
@@ -439,16 +493,21 @@ impl RecordingRunner {
                     CommandOutput::ok()
                 }
                 "del" => {
+                    // The real `ip` fails with "No such process" when the
+                    // route is absent (and "FIB table does not exist" on
+                    // an entirely empty table) — both verified on kernel
+                    // 6.8. The provider's tolerant deletions must match
+                    // those strings, never the fdb wording.
                     if self.routes.remove(dest) {
                         CommandOutput::ok()
                     } else {
-                        command_error("RTNETLINK answers: No such file or directory")
+                        command_error("RTNETLINK answers: No such process")
                     }
                 }
                 _ => CommandOutput::ok(),
             };
         }
-        // link set NAME mtu N | link set NAME name NEW
+        // link set NAME mtu N | link set NAME name NEW | link set NAME netns NS
         if rest.first() == Some(&"link") && rest.get(1) == Some(&"set") {
             if let (Some(name), Some(op)) = (rest.get(2), rest.get(3)) {
                 match *op {
@@ -462,7 +521,7 @@ impl RecordingRunner {
                             (Some(_), None) => {
                                 command_error(&format!("invalid MTU value for \"{name}\""))
                             }
-                            (None, _) => missing_device(name),
+                            (None, _) => cannot_find_device(name),
                         };
                     }
                     "name" => {
@@ -472,9 +531,21 @@ impl RecordingRunner {
                             self.links.insert((*new_name).to_string(), link);
                             return CommandOutput::ok();
                         }
-                        return missing_device(name);
+                        return cannot_find_device(name);
                     }
-                    // up/down/netns/master/addr: accepted, not modeled.
+                    "netns" => {
+                        // `ip link set NAME netns NS` moves the link into
+                        // NS (the placement — never the WireGuard socket,
+                        // which stays bound in the creating namespace).
+                        return match (rest.get(4), self.links.get_mut(*name)) {
+                            (Some(target), Some(link)) => {
+                                link.netns = Some((*target).to_string());
+                                CommandOutput::ok()
+                            }
+                            _ => cannot_find_device(name),
+                        };
+                    }
+                    // up/down/master/addr: accepted, not modeled.
                     _ => {}
                 }
             }
@@ -485,6 +556,17 @@ impl RecordingRunner {
             if let (Some(name), Some(link)) =
                 (rest.get(2), rest.get(2).and_then(|n| self.links.get(*n)))
             {
+                // A real kernel's `link show` only observes links in the
+                // command's own namespace. The fake keeps one global
+                // name table, so this is modeled by placement: a ROOT-ns
+                // `link show` does not see namespace-placed links (like
+                // the real kernel), while a namespace-scoped `link show`
+                // sees every link (a deliberate, documented quirk the
+                // `foreign_state_rejects_prefix_vni` conformance case
+                // relies on — see its comment).
+                if ns.is_none() && link.netns.is_some() {
+                    return missing_device(name);
+                }
                 let mut stdout = format!(
                     "{}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu {} state UP\n",
                     name,
@@ -559,9 +641,17 @@ fn command_error(message: &str) -> CommandOutput {
     }
 }
 
-/// The `ip` "device does not exist" failure.
+/// The `ip` "device does not exist" failure of `link show` (real
+/// wording, verified on kernel 6.8 / iproute2 6.1).
 fn missing_device(name: &str) -> CommandOutput {
     command_error(&format!("Device \"{name}\" does not exist."))
+}
+
+/// The `ip` "Cannot find device" failure of mutations (`link del`,
+/// `link set`, `addr ...`) on a missing device (real wording, verified
+/// on kernel 6.8 / iproute2 6.1).
+fn cannot_find_device(name: &str) -> CommandOutput {
+    command_error(&format!("Cannot find device \"{name}\""))
 }
 
 fn is_observation(args: &[String]) -> bool {
@@ -624,7 +714,8 @@ impl FabricCommand for RecordingRunner {
         match program {
             "ip" => {
                 // Strip `netns exec NS` prefix. A missing namespace fails
-                // like the real `ip netns exec`.
+                // like the real `ip netns exec`; otherwise the namespace
+                // is the scope the inner command runs in.
                 if args.first() == Some(&"netns") && args.get(1) == Some(&"exec") {
                     if let Some(ns) = args.get(2).filter(|ns| !self.netns.contains(**ns)) {
                         return Ok(command_error(&format!(
@@ -632,7 +723,7 @@ impl FabricCommand for RecordingRunner {
                         )));
                     }
                     match args.get(3) {
-                        Some(&"ip") => return Ok(self.ip(&args[4..])),
+                        Some(&"ip") => return Ok(self.ip(args.get(2).copied(), &args[4..])),
                         Some(&"bridge") => return Ok(self.bridge(&args[4..])),
                         _ => return Ok(CommandOutput::ok()),
                     }
@@ -658,11 +749,25 @@ impl FabricCommand for RecordingRunner {
                 }
                 if args.first() == Some(&"netns") && args.get(1) == Some(&"del") {
                     if let Some(ns) = args.get(2) {
+                        if !self.netns.contains(*ns) {
+                            // Real wording (iproute2, verified on 6.8):
+                            // removing a namespace that does not exist
+                            // fails on the missing namespace file.
+                            return Ok(command_error(&format!(
+                                "Cannot remove namespace file \"/run/netns/{ns}\": \
+                                 No such file or directory"
+                            )));
+                        }
+                        // Deleting a namespace destroys the links placed
+                        // in it, like the real kernel.
+                        let ns_name = (*ns).to_string();
                         self.netns.remove(*ns);
+                        self.links
+                            .retain(|_, link| link.netns.as_deref() != Some(ns_name.as_str()));
                     }
                     return Ok(CommandOutput::ok());
                 }
-                Ok(self.ip(args))
+                Ok(self.ip(None, args))
             }
             "wg" => {
                 if args.first() == Some(&"genkey") {
@@ -746,18 +851,82 @@ mod tests {
     }
 
     #[test]
-    fn fdb_append_is_idempotent_and_del_removes() {
+    fn fdb_append_accumulates_and_del_removes_all_instances() {
+        // The kernel does NOT guarantee append deduplication (bridge(8);
+        // Launchpad #1531013): each append adds an instance, and `del`
+        // removes the entry with all of them. Duplicate counts are
+        // observable through `fdb_entry_count` and in `fdb show` output.
         let mut runner = RecordingRunner::new();
         vxlan(&mut runner);
         assert!(fdb(&mut runner, "append", "198.18.0.2").success);
         assert!(fdb(&mut runner, "append", "198.18.0.2").success);
-        assert!(runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+        assert_eq!(
+            runner.fdb_entry_count("vx0", "00:00:00:00:00:00", "198.18.0.2"),
+            2,
+            "duplicate appends must be visible"
+        );
         assert!(fdb(&mut runner, "append", "198.18.0.3").success);
         assert!(runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.3"));
+        // `fdb show` prints one line per instance.
+        let show = ok_or_err_out(runner.run("bridge", &["fdb", "show"]));
+        assert!(show.success);
+        assert_eq!(
+            show.stdout
+                .lines()
+                .filter(|l| l.contains("dst 198.18.0.2"))
+                .count(),
+            2,
+            "duplicated entries show as duplicated lines"
+        );
         assert!(fdb(&mut runner, "del", "198.18.0.2").success);
         assert!(!runner.has_fdb_entry("vx0", "00:00:00:00:00:00", "198.18.0.2"));
+        assert_eq!(
+            runner.fdb_entry_count("vx0", "00:00:00:00:00:00", "198.18.0.2"),
+            0,
+            "del removes every instance"
+        );
         let out = fdb(&mut runner, "del", "198.18.0.2");
         assert!(!out.success, "deleting a missing entry must fail");
+        assert!(
+            out.stderr.contains("No such file or directory"),
+            "real fdb del wording: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn fdb_show_filters_by_device() {
+        let mut runner = RecordingRunner::new();
+        vxlan(&mut runner);
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "link", "add", "vx1", "type", "vxlan", "id", "4712", "dstport", "4789",
+            ],
+        ));
+        assert!(out.success, "second vxlan creation failed: {}", out.stderr);
+        assert!(fdb(&mut runner, "append", "198.18.0.2").success);
+        let out = ok_or_err_out(runner.run(
+            "bridge",
+            &[
+                "fdb",
+                "append",
+                "00:00:00:00:00:00",
+                "dev",
+                "vx1",
+                "dst",
+                "198.18.0.9",
+            ],
+        ));
+        assert!(out.success, "append to vx1 failed: {}", out.stderr);
+        let out = ok_or_err_out(runner.run("bridge", &["fdb", "show", "dev", "vx1"]));
+        assert!(out.success);
+        assert!(
+            !out.stdout.contains("198.18.0.2"),
+            "the dev filter must hide other devices' entries: {}",
+            out.stdout
+        );
+        assert!(out.stdout.contains("198.18.0.9"));
     }
 
     #[test]
@@ -814,8 +983,73 @@ mod tests {
             "the real kernel fails to delete a missing link"
         );
         assert!(
-            out.stderr.contains("does not exist"),
-            "stderr must name the missing device: {}",
+            out.stderr.contains("Cannot find device"),
+            "stderr must name the missing device like the real ip: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn netns_scoped_link_add_places_the_link_in_the_namespace() {
+        let mut runner = RecordingRunner::new();
+        let out = ok_or_err_out(runner.run("ip", &["netns", "add", "nsx"]));
+        assert!(out.success, "netns add failed: {}", out.stderr);
+        // A link created from inside a namespace is placed there.
+        let out = ok_or_err_out(runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                "nsx",
+                "ip",
+                "link",
+                "add",
+                "wgx",
+                "type",
+                "wireguard",
+            ],
+        ));
+        assert!(out.success, "ns-scoped link add failed: {}", out.stderr);
+        // A namespace-scoped show observes it...
+        let out =
+            ok_or_err_out(runner.run("ip", &["netns", "exec", "nsx", "ip", "link", "show", "wgx"]));
+        assert!(out.success, "ns-scoped show must see the link");
+        // ...but the ROOT namespace does not (real kernel semantics).
+        let out = ok_or_err_out(runner.run("ip", &["link", "show", "wgx"]));
+        assert!(
+            !out.success,
+            "a root-ns show must not see a namespace-placed link"
+        );
+        assert!(out.stderr.contains("does not exist"));
+
+        // `ip link set <link> netns <ns>` moves the placement...
+        let out = ok_or_err_out(runner.run("ip", &["link", "add", "wgroot", "type", "wireguard"]));
+        assert!(out.success, "root link add failed: {}", out.stderr);
+        let out = ok_or_err_out(runner.run("ip", &["link", "show", "wgroot"]));
+        assert!(out.success, "a root-created link is visible in the root ns");
+        let out = ok_or_err_out(runner.run("ip", &["link", "set", "wgroot", "netns", "nsx"]));
+        assert!(out.success, "netns move failed: {}", out.stderr);
+        let out = ok_or_err_out(runner.run("ip", &["link", "show", "wgroot"]));
+        assert!(
+            !out.success,
+            "a moved link is no longer visible in the root ns"
+        );
+
+        // ...and deleting the namespace destroys its links.
+        let out = ok_or_err_out(runner.run("ip", &["netns", "del", "nsx"]));
+        assert!(out.success, "netns del failed: {}", out.stderr);
+        assert!(!runner.has_link("wgx"), "ns links die with the netns");
+        assert!(!runner.has_link("wgroot"));
+    }
+
+    #[test]
+    fn deleting_a_missing_netns_fails_like_the_kernel() {
+        let mut runner = RecordingRunner::new();
+        let out = ok_or_err_out(runner.run("ip", &["netns", "del", "gone-ns"]));
+        assert!(!out.success, "the real ip fails to remove a missing netns");
+        assert!(
+            out.stderr.contains("No such file or directory"),
+            "stderr must name the missing namespace file: {}",
             out.stderr
         );
     }
@@ -896,6 +1130,10 @@ mod tests {
         assert!(!runner.has_route("198.18.0.2/32"));
         let out = ok_or_err_out(runner.run("ip", &["route", "del", "198.18.0.2/32"]));
         assert!(!out.success, "deleting a missing route must fail");
-        assert!(out.stderr.contains("No such file or directory"));
+        assert!(
+            out.stderr.contains("No such process"),
+            "real route-del wording (not the fdb wording): {}",
+            out.stderr
+        );
     }
 }

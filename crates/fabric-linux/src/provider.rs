@@ -10,12 +10,14 @@
 //!
 //! Reconciliation is re-assertive, not create-only: enslavement, link
 //! state, MTUs, and the local transport address are re-asserted on every
-//! apply (all through idempotent `replace`/`set` verbs), and every desired
-//! HER flood entry is re-appended on every apply, so a crash between two
-//! mutations — or a kernel that lost state — heals on the next apply.
-//! Teardown is idempotent in the same sense: deleting an object that is
-//! already absent is success, and the journals always converge to the
-//! desired end state.
+//! apply (all through idempotent `replace`/`set` verbs), and the HER
+//! flood list is reconciled against the OBSERVED forwarding state
+//! (append-missing / delete-unwanted — the kernel does not guarantee
+//! `bridge fdb append` deduplication), so a crash between two mutations
+//! — or a kernel that lost state — heals on the next apply. Teardown is
+//! idempotent in the same sense: deleting an object that is already
+//! absent is success, and the journals always converge to the desired
+//! end state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -157,6 +159,13 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
     /// Like [`Self::remove_network`], this converges idempotently: absent
     /// objects count as removed, so a host whose kernel never saw the
     /// fabric (or lost it across a reboot) still reports `Ok(true)`.
+    ///
+    /// Naming caveat: the shared-fabric object names (WireGuard link,
+    /// host underlay veth, iptables rules) are re-rendered from the
+    /// CURRENT configuration, not from the journal — so a `name_prefix`
+    /// (or port) change between create and teardown leaves the
+    /// old-prefix shared objects behind. Network-scoped objects are
+    /// immune: they are deleted by their journal-recorded names.
     pub fn remove_fabric_if_unused(&mut self) -> Result<bool, FabricError> {
         if !self.ownership.networks.is_empty() {
             return Ok(false);
@@ -187,6 +196,9 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         }
 
         self.ownership.fabric_configured = false;
+        // The WireGuard link is gone with the namespace; the born-in-ns
+        // claim must not outlive it (a later re-apply re-establishes it).
+        self.ownership.wireguard_born_in_fabric_ns = false;
         self.ownership.peers.clear();
         self.ownership.save(&self.config.ownership_path())?;
         Ok(true)
@@ -224,16 +236,95 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         }
 
         // WireGuard interface.
+        //
+        // INVARIANT (contract §3.10): the interface MUST be created from
+        // INSIDE the fabric namespace. A WireGuard interface's UDP socket
+        // binds in the namespace the interface was CREATED in, and that
+        // binding is immutable for the interface's lifetime — moving the
+        // link into another namespace (or toggling it down/up inside the
+        // new namespace) never moves the socket. Empirically verified on
+        // kernel 6.8: `ip link add w type wireguard` in the root ns
+        // followed by `ip link set w netns <ns>` leaves the listening
+        // socket in the ROOT ns. The underlay DNAT rule then rewrites
+        // every NEW inbound UDP flow to the fabric-side underlay address
+        // — into the fabric namespace, where nothing listens — so those
+        // flows are silently black-holed (the kernel answers with a
+        // conntrack-reverse-NAT'd ICMP port-unreachable and the wg never
+        // sees the packet). Pairs survive only while a peer's outbound
+        // conntrack reply-tuple shields the flow from the NAT table,
+        // which makes the failure intermittent and timing-dependent.
         let wg_show = self.ns_run(&ns, "ip", &["link", "show", &wg])?;
-        let created_wireguard = !wg_show.success;
-        if created_wireguard {
-            self.run_checked("ip", &["link", "add", &wg, "type", "wireguard"])?;
-            self.run_checked("ip", &["link", "set", &wg, "netns", &ns])?;
+        let wg_in_ns = wg_show.success;
+        let mut created_wireguard = false;
+        if !wg_in_ns {
+            // No WireGuard interface inside the fabric namespace. A stray
+            // link with our deterministic name may sit in the ROOT
+            // namespace (the legacy create-then-move sequence, crashed
+            // between add and move): it can never carry a usable socket
+            // placement for us, so it is swept tolerantly — absence is
+            // the normal case — before the interface is created inside
+            // the namespace.
+            self.run_tolerant("ip", &["link", "del", &wg])?;
+            self.ns_run_checked(&ns, "ip", &["link", "add", &wg, "type", "wireguard"])?;
+            created_wireguard = true;
+        } else if !self.ownership.wireguard_born_in_fabric_ns {
+            // LEGACY HEAL (one-time upgrade; contract §3.10): the wg link
+            // lives in the fabric namespace, but the journal predates the
+            // born-in-fabric-ns invariant — the interface was created in
+            // the root namespace and moved in, so its UDP socket is bound
+            // in the ROOT namespace and the creating-netns binding cannot
+            // be repaired in place. The only fix is delete + re-create
+            // from inside the namespace. Every per-network VXLAN device
+            // recorded in the ownership journal is deleted as well: the
+            // VXLANs bind `dev <wg>`, and that underlay reference breaks
+            // when the wg is deleted; the ensure_network pass of this
+            // apply re-creates the applied network's VXLAN (other live
+            // networks heal on their next apply). This is a one-time
+            // WireGuard session drop + re-handshake on upgrade. All
+            // deletions are tolerant, so a heal interrupted anywhere
+            // simply re-runs: the flag is only set once the replacement
+            // link exists AND is fully configured below.
+            //
+            // The root-namespace sweep runs first (tolerantly): a
+            // legacy-crash stray may coexist with the ns-scoped link, and
+            // a stray that survives the heal would wedge the next apply
+            // at the both-namespaces fail-closed check.
+            self.run_tolerant("ip", &["link", "del", &wg])?;
+            self.ns_run_tolerant(&ns, "ip", &["link", "del", &wg])?;
+            let recorded_vxlans: Vec<String> = self
+                .ownership
+                .networks
+                .values()
+                .map(|entry| entry.vxlan_name.clone())
+                .collect();
+            for vxlan in &recorded_vxlans {
+                self.ns_run_tolerant(&ns, "ip", &["link", "del", vxlan])?;
+            }
+            self.ns_run_checked(&ns, "ip", &["link", "add", &wg, "type", "wireguard"])?;
+            created_wireguard = true;
+        } else {
+            // Healthy path. Fail closed when a link with our
+            // deterministic name ALSO exists in the root namespace:
+            // that is foreign state (two interfaces, one name) —
+            // never adopted, never deleted here.
+            let root_show = self.run("ip", &["link", "show", &wg])?;
+            if root_show.success {
+                return Err(FabricError::ForeignState {
+                    object: wg.clone(),
+                    expected: "the WireGuard link to exist only inside the fabric namespace"
+                        .to_string(),
+                    observed: format!(
+                        "a link with the same name also exists in the root namespace: {}",
+                        root_show.stdout.trim()
+                    ),
+                });
+            }
         }
 
-        // Key and listen port: on creation, or the first apply after a
-        // crash that lost the configured flag while the link survived.
-        // (Re-asserting these would be harmless but is not needed.)
+        // Key and listen port: on creation, the legacy heal (the fresh
+        // link has no key), or the first apply after a crash that lost
+        // the configured flag while the link survived. (Re-asserting
+        // these would be harmless but is not needed.)
         if created_wireguard || !self.ownership.fabric_configured {
             let key_path =
                 keys::ensure_private_key(&self.config.private_key_path(), &mut self.runner)?;
@@ -242,6 +333,17 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             let port = self.config.wireguard_port().to_string();
             self.ns_run_checked(&ns, "wg", &["set", &wg, "listen-port", port.as_str()])?;
             self.ownership.fabric_configured = true;
+        }
+        if created_wireguard {
+            // The interface inside the fabric namespace was born there
+            // and is now fully configured (key + listen port): record
+            // the invariant in the journal so later applies take the
+            // healthy path. Persisted immediately — after the mutation,
+            // before the rest of the apply — so a crash anywhere later
+            // still converges: with the flag unset the next apply simply
+            // re-runs the (idempotent) creation/heal.
+            self.ownership.wireguard_born_in_fabric_ns = true;
+            self.ownership.save(&self.config.ownership_path())?;
         }
         // The local transport address is a mutable plan field: re-assert
         // it on every apply (`ip addr replace` is idempotent) so a plan
@@ -634,26 +736,30 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
 
         // Bounded head-end replication flood list.
         //
-        // Every desired entry is APPENDED on every apply: `append` is
-        // idempotent per (dev, mac, dst), and diffing against the journal
-        // would leave a recreated (post-reboot) VXLAN without flood
-        // entries — a green apply with dead BUM flooding. Entries in the
-        // journal but no longer desired are deleted (tolerantly: they may
-        // already be gone). Flood entries share the all-zeros
-        // (non-unicast) MAC, so adds MUST use `append` — the kernel
-        // rejects `replace` on non-unicast entries, and replace semantics
-        // would in any case clobber the other remotes.
+        // Reconciled against the OBSERVED forwarding state, not against
+        // the journal and not by blind re-append: bridge(8) documents
+        // that `append` "adds a new fdb entry with an already known
+        // LLADDR ... added multiple times", and field reports
+        // (Launchpad #1531013) show fleets accumulating duplicate
+        // all-zeros flood entries — the kernel does NOT guarantee
+        // per-(dev, mac, dst) deduplication, so unconditionally
+        // re-appending on every apply grows the table without bound on
+        // kernels that do not dedup. Desired destinations absent from
+        // `bridge fdb show dev <vxlan>` are appended (with `append`,
+        // never `replace` — the kernel rejects `replace` on non-unicast
+        // MACs, and replace semantics would clobber the other remotes);
+        // observed all-zeros destinations that are no longer desired are
+        // deleted, tolerating already-absent entries. A kernel that lost
+        // the fdb (a recreated VXLAN, a reboot) converges because the
+        // observed set is empty and every desired entry is re-appended —
+        // the journal is never consulted, so reconciliation also catches
+        // entries the journal does not know about.
         let desired: BTreeSet<Ipv4Addr> = plan.flood_list();
-        let current: BTreeSet<Ipv4Addr> = self
-            .ownership
-            .networks
-            .get(&plan.network_id)
-            .map(|entry| entry.flood_peers.iter().copied().collect())
-            .unwrap_or_default();
-        for ip in &desired {
+        let observed = self.ns_fdb_show_flood(&ns, &vxlan)?;
+        for ip in desired.difference(&observed) {
             self.ns_fdb_append(&ns, &vxlan, ip)?;
         }
-        for ip in current.difference(&desired) {
+        for ip in observed.difference(&desired) {
             self.ns_fdb_del(&ns, &vxlan, ip)?;
         }
 
@@ -813,8 +919,55 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         }
     }
 
-    /// Append one HER flood entry (`append` is idempotent per
-    /// (dev, mac, dst); the kernel rejects `replace` here).
+    /// The observed all-zeros (BUM) flood destinations on `vxlan`, read
+    /// from `bridge fdb show dev <vxlan>`.
+    ///
+    /// This is the reconciliation input for the HER flood list: the
+    /// kernel's forwarding table is the source of truth, not the journal.
+    /// Fails closed when the show itself fails (the provider cannot know
+    /// what to append or delete).
+    fn ns_fdb_show_flood(
+        &mut self,
+        ns: &str,
+        vxlan: &str,
+    ) -> Result<BTreeSet<Ipv4Addr>, FabricError> {
+        let output = self.ns_run(ns, "bridge", &["fdb", "show", "dev", vxlan])?;
+        if !output.success {
+            return Err(FabricError::Command(format!(
+                "ip netns exec {ns} bridge fdb show dev {vxlan} failed: {}",
+                output.stderr.trim()
+            )));
+        }
+        // iproute2 line shape (one line per entry instance):
+        // `<mac> dev <dev> dst <ip> [self permanent]`. Lines that do not
+        // match are ignored (e.g. local entries without a dst).
+        let mut observed = BTreeSet::new();
+        for line in output.stdout.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let token_after = |flag: &str| -> Option<&str> {
+                tokens
+                    .iter()
+                    .position(|t| *t == flag)
+                    .and_then(|i| tokens.get(i + 1).copied())
+            };
+            if tokens.first() != Some(&FLOOD_MAC) {
+                continue;
+            }
+            if token_after("dev") != Some(vxlan) {
+                continue;
+            }
+            if let Some(dst) = token_after("dst").and_then(|dst| dst.parse::<Ipv4Addr>().ok()) {
+                observed.insert(dst);
+            }
+        }
+        Ok(observed)
+    }
+
+    /// Append one HER flood entry. `append` (never `replace` — the
+    /// kernel rejects replace on non-unicast MACs); the caller reconciles
+    /// against observed state so a destination is only appended when it
+    /// is absent, because the kernel does not guarantee append
+    /// deduplication.
     fn ns_fdb_append(&mut self, ns: &str, vxlan: &str, ip: &Ipv4Addr) -> Result<(), FabricError> {
         let dst = ip.to_string();
         self.ns_run_checked(
@@ -856,10 +1009,16 @@ fn path_arg(path: &Path) -> Result<String, FabricError> {
 /// Verify an observed VXLAN device matches the plan identity; fail closed on
 /// foreign state.
 ///
-/// The `ip -d link show` output is token-parsed: the tokens following
-/// `id`, `dstport`, and `local` must match the plan's VNI, the configured
-/// VXLAN port, and the plan's local transport IP exactly. Substring
-/// matching would let VNI 100 accept a foreign VNI 1000.
+/// The `ip -d link show` output is token-parsed. The search is anchored
+/// to the `vxlan` paragraph — the detail block that begins with the
+/// literal `vxlan` token — because `ip -d link show` output for other
+/// link kinds carries its own tokens (a bridge detail line starts with
+/// `id <bridge-id>`); tokens in the link header before the paragraph are
+/// never consulted. Within the paragraph, the tokens following `id`,
+/// `dstport`, and `local` must match the plan's VNI, the configured
+/// VXLAN port, and the plan's local transport IP exactly (the iproute2
+/// format assumption: `vxlan id <vni> [local <ip>] ... dstport <p>`).
+/// Substring matching would let VNI 100 accept a foreign VNI 1000.
 fn verify_vxlan_identity(
     name: &str,
     plan: &StretchedL2Plan,
@@ -867,11 +1026,23 @@ fn verify_vxlan_identity(
     observed: &str,
 ) -> Result<(), FabricError> {
     let tokens: Vec<&str> = observed.split_whitespace().collect();
+    // Anchor to the vxlan detail paragraph: everything before the
+    // literal `vxlan` token is link-header noise.
+    let paragraph = match tokens.iter().position(|t| *t == "vxlan") {
+        Some(pos) => &tokens[pos..],
+        None => {
+            return Err(FabricError::ForeignState {
+                object: name.to_string(),
+                expected: "a vxlan detail paragraph in `ip -d link show`".to_string(),
+                observed: observed.trim().to_string(),
+            });
+        }
+    };
     let token_after = |flag: &str| -> Option<&str> {
-        tokens
+        paragraph
             .iter()
             .position(|t| *t == flag)
-            .and_then(|i| tokens.get(i + 1).copied())
+            .and_then(|i| paragraph.get(i + 1).copied())
     };
     let mismatch = |field: &str, expected_value: &str| FabricError::ForeignState {
         object: name.to_string(),
@@ -902,16 +1073,45 @@ fn verify_vxlan_identity(
 /// stderr fragments indicating that the object a deletion targets is
 /// already absent — the desired end state of the command is reached.
 ///
+/// Every pattern is a REAL kernel/iproute2 wording, verified on kernel
+/// 6.8 / iproute2 6.1:
+///
+/// - `ip link del` / `ip link set` / `ip addr` on a missing device:
+///   `Cannot find device "x"`; `ip link show` says
+///   `Device "x" does not exist.` instead (both kept — iproute2
+///   wording varies by verb and version).
+/// - `ip route del` of a missing route: `RTNETLINK answers: No such
+///   process` (NOT the fdb's "No such file or directory" — this exact
+///   mismatch once made teardown hard-fail on real kernels in the
+///   reboot/lost-ns scenarios the tolerance was written for). An
+///   entirely empty routing table yields `FIB table does not exist`,
+///   which equally means the route is gone.
+/// - `bridge fdb del` of a missing entry:
+///   `RTNETLINK answers: No such file or directory`.
+/// - `ip netns del` of a missing namespace:
+///   `Cannot remove namespace file "...": No such file or directory`.
+/// - `ip netns exec` into a namespace lost between check and delete:
+///   `Cannot open network namespace`.
+/// - `iptables -D` of a rule that is not present: `Bad rule`.
+///
 /// Kept in the provider (not the fake kernel) on purpose: the fake fails
 /// like the real `ip`/`iptables`, and only the provider decides that an
 /// absent object means success during teardown.
 fn object_already_absent(stderr: &str) -> bool {
     const ABSENT_PATTERNS: &[&str] = &[
-        // `ip link del` on a missing device (iproute2 wording varies).
+        // `ip link del|set` / `ip addr` on a missing device, and
+        // `bridge fdb ... dev` on a missing device.
         "Cannot find device",
+        // `ip link show` of a missing device (iproute2 wording varies).
         "does not exist",
-        // `bridge fdb del` / `ip route del` of a missing entry.
+        // `bridge fdb del` of a missing entry, and `ip netns del` of a
+        // missing namespace (via the shared "No such file or directory"
+        // suffix).
         "No such file or directory",
+        // `ip route del` of a missing route (real kernels; see above).
+        "No such process",
+        // `ip route del` against an entirely empty routing table.
+        "FIB table does not exist",
         // `ip netns exec` into a namespace lost between check and delete.
         "Cannot open network namespace",
         // `iptables -D` of a rule that is not present.
@@ -1427,6 +1627,493 @@ mod tests {
         assert_eq!(
             mtu_sets, 2,
             "every apply re-asserts the WireGuard MTU (benign, like addr replace)"
+        );
+        Ok(())
+    }
+
+    // ---- CRITICAL: WireGuard socket binds in the creating namespace ----
+
+    /// Regression test for the socket-placement bug: the WireGuard
+    /// interface MUST be created from inside the fabric namespace
+    /// (`ip netns exec <ns> ip link add ...`), never created in the root
+    /// namespace and moved in — the UDP socket binds in the creating
+    /// namespace and never follows the interface, so a root-ns creation
+    /// leaves the listener outside the fabric underlay where the DNAT
+    /// rule black-holes every NEW inbound flow.
+    #[test]
+    fn wireguard_is_created_inside_the_fabric_namespace() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("wg-in-ns")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        let joined: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .map(|call| call.joined())
+            .collect();
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        let ns_add = format!("ip netns exec {ns} ip link add {wg} type wireguard");
+        assert!(
+            joined.iter().any(|line| line == &ns_add),
+            "the WireGuard interface must be created inside the fabric namespace: {ns_add}"
+        );
+        let root_add = format!("ip link add {wg} type wireguard");
+        assert!(
+            !joined.iter().any(|line| line == &root_add),
+            "the WireGuard interface must NOT be created in the root namespace"
+        );
+        let root_move = format!("ip link set {wg} netns {ns}");
+        assert!(
+            !joined.iter().any(|line| line == &root_move),
+            "the WireGuard interface must NOT be moved into the fabric namespace \
+             (the socket never follows)"
+        );
+        Ok(())
+    }
+
+    /// A deployment running the pre-fix code has the wg link inside the
+    /// fabric namespace with its UDP socket bound in the ROOT namespace
+    /// (creating_netns is immutable), journaled without the
+    /// born-in-fabric-ns flag. Re-apply must heal: delete the wg and
+    /// every recorded VXLAN (they bind `dev <wg>`), re-create the wg
+    /// inside the namespace, force key/port configuration, and record
+    /// the flag — then a further apply is a pure no-op replay.
+    #[test]
+    fn legacy_wireguard_socket_placement_is_healed() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("wg-heal")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan_a = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let plan_b = test_plan("net-b", 200, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let vxlan_a = names.vxlan(&plan_a.network_id);
+        let vxlan_b = names.vxlan(&plan_b.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan_a)?;
+        provider.apply_plan(&plan_b)?;
+        assert!(provider.ownership().wireguard_born_in_fabric_ns);
+        let runner = provider.into_runner();
+
+        // Rewrite the ownership journal in the legacy format (field
+        // absent): exactly the state a pre-fix deployment presents.
+        let journal = config.ownership_path();
+        let raw = fs::read_to_string(&journal)?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| FabricError::Ownership(e.to_string()))?;
+        let removed = value
+            .as_object_mut()
+            .ok_or_else(|| FabricError::Invalid("journal is not an object".to_string()))?
+            .remove("wireguard_born_in_fabric_ns");
+        assert!(removed.is_some(), "the applied journal must carry the flag");
+        fs::write(
+            &journal,
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| FabricError::Ownership(e.to_string()))?,
+        )?;
+
+        // Healing apply of net-a.
+        let before_heal = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let heal_report = provider.apply_plan(&plan_a)?;
+        let healed_flag = provider.ownership().wireguard_born_in_fabric_ns;
+        let heal_slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before_heal)
+            .map(|call| call.joined())
+            .collect();
+        let vxlan_b_gone = !provider.runner().has_link(&vxlan_b);
+        let flood_a = provider
+            .runner()
+            .fdb_entry_count(&vxlan_a, FLOOD_MAC, "198.18.0.2");
+
+        assert!(
+            heal_report.created_fabric,
+            "the heal re-creates the WireGuard interface"
+        );
+        assert!(healed_flag, "the journal must record the heal");
+        // The wg is deleted (namespace-scoped, plus the root-ns stray
+        // sweep) and re-created INSIDE the namespace.
+        assert!(
+            heal_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {wg}")),
+            "the heal must delete the legacy wg inside the namespace"
+        );
+        assert!(
+            heal_slice
+                .iter()
+                .any(|line| line == &format!("ip link del {wg}")),
+            "the heal must sweep a possible root-ns stray first"
+        );
+        assert!(
+            heal_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
+            "the heal must re-create the wg inside the namespace"
+        );
+        // Every recorded VXLAN is deleted (they bind dev <wg>); the
+        // applied network's VXLAN is re-created in the same apply.
+        assert!(
+            heal_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_a}")),
+            "the heal must delete the applied network's vxlan"
+        );
+        assert!(
+            heal_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link del {vxlan_b}")),
+            "the heal must delete every recorded vxlan, not just the applied one"
+        );
+        assert!(
+            heal_slice.iter().any(|line| line.contains(&format!(
+                "ip netns exec {ns} ip link add {vxlan_a} type vxlan"
+            ))),
+            "the applied network's vxlan must be re-created in the same apply"
+        );
+        assert!(
+            vxlan_b_gone,
+            "the other network's vxlan heals on its own next apply, not this one"
+        );
+        // The fresh link has no key: key and listen port are forced.
+        assert!(
+            heal_slice.iter().any(
+                |line| line.starts_with(&format!("ip netns exec {ns} wg set {wg} private-key"))
+            ),
+            "the heal must re-configure the private key"
+        );
+        assert!(
+            heal_slice
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} wg set {wg} listen-port 65001")),
+            "the heal must re-configure the listen port"
+        );
+        assert_eq!(
+            flood_a, 1,
+            "the re-created vxlan's flood list must be rebuilt exactly once"
+        );
+
+        // The other network converges on its next apply.
+        let before_b = provider.runner().calls().len();
+        provider.apply_plan(&plan_b)?;
+        let b_slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before_b)
+            .map(|call| call.joined())
+            .collect();
+        let vxlan_b_back = provider.runner().has_link(&vxlan_b);
+        let flood_b = provider
+            .runner()
+            .fdb_entry_count(&vxlan_b, FLOOD_MAC, "198.18.0.2");
+        assert!(
+            b_slice.iter().any(|line| line.contains(&format!(
+                "ip netns exec {ns} ip link add {vxlan_b} type vxlan"
+            ))),
+            "net-b's next apply must re-create its vxlan"
+        );
+        assert!(vxlan_b_back);
+        assert_eq!(
+            flood_b, 1,
+            "net-b's flood list must be rebuilt exactly once"
+        );
+
+        // After the heal, an unchanged-plan apply is a pure no-op replay:
+        // no object creation, no deletion, no duplicate flood entries.
+        let before_replay = provider.runner().calls().len();
+        let replay_report = provider.apply_plan(&plan_a)?;
+        let replay_slice: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before_replay)
+            .map(|call| call.joined())
+            .collect();
+        let flood_a_after = provider
+            .runner()
+            .fdb_entry_count(&vxlan_a, FLOOD_MAC, "198.18.0.2");
+        let flag_after = provider.ownership().wireguard_born_in_fabric_ns;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            !replay_report.created_fabric && !replay_report.created_network,
+            "post-heal replay must not re-create anything"
+        );
+        assert!(
+            !replay_slice.iter().any(|line| line.contains(" link add ")),
+            "post-heal replay must not create links: {replay_slice:?}"
+        );
+        assert!(
+            !replay_slice.iter().any(|line| line.contains(" link del ")),
+            "post-heal replay must not delete links: {replay_slice:?}"
+        );
+        assert_eq!(
+            flood_a_after, 1,
+            "post-heal replays must not duplicate flood entries"
+        );
+        assert!(flag_after);
+        Ok(())
+    }
+
+    /// The legacy create-then-move sequence crashed between add and move:
+    /// a stray WireGuard link with our deterministic name sits in the
+    /// ROOT namespace and the fabric namespace has none. Apply must
+    /// clear the stray and create the interface inside the namespace.
+    #[test]
+    fn stray_root_namespace_wireguard_is_swept_on_create() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = test_root("wg-stray")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+
+        // Pre-seed the crash residue: a root-ns WireGuard link.
+        let mut runner = RecordingRunner::new();
+        let out = runner.run("ip", &["link", "add", &wg, "type", "wireguard"])?;
+        assert!(out.success, "could not pre-seed the stray: {}", out.stderr);
+        let preseed_len = runner.calls().len();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        provider.apply_plan(&plan)?;
+        let joined: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(preseed_len)
+            .map(|call| call.joined())
+            .collect();
+        let flag = provider.ownership().wireguard_born_in_fabric_ns;
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        // The stray was swept (tolerant root-ns deletion)...
+        assert!(
+            joined
+                .iter()
+                .any(|line| line == &format!("ip link del {wg}")),
+            "the root-ns stray must be swept before creation"
+        );
+        // ...and the interface was created inside the namespace, never
+        // in the root namespace.
+        assert!(
+            joined
+                .iter()
+                .any(|line| line == &format!("ip netns exec {ns} ip link add {wg} type wireguard")),
+            "the wg must be created inside the fabric namespace"
+        );
+        assert!(
+            !joined
+                .iter()
+                .any(|line| line == &format!("ip link add {wg} type wireguard")),
+            "the wg must NOT be created in the root namespace"
+        );
+        assert!(flag, "the creation must be journaled");
+        Ok(())
+    }
+
+    /// A WireGuard link with our deterministic name existing in the root
+    /// namespace while the journal claims a healthy fabric (the link is
+    /// also visible from the fabric namespace — on a real kernel that
+    /// means one link per namespace) is foreign state: fail closed,
+    /// never adopt and never delete.
+    #[test]
+    fn root_and_fabric_namespace_wireguard_collision_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("wg-collision")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        assert!(provider.ownership().wireguard_born_in_fabric_ns);
+        let mut runner = provider.into_runner();
+
+        // Foreign state: the wg link exists in the ROOT namespace (here:
+        // the namespace-placed link was replaced by a root-placed one —
+        // on a real kernel this is the both-namespaces collision).
+        let out = runner.run("ip", &["netns", "exec", &ns, "ip", "link", "del", &wg])?;
+        assert!(
+            out.success,
+            "could not drop the wg for the test: {}",
+            out.stderr
+        );
+        let out = runner.run("ip", &["link", "add", &wg, "type", "wireguard"])?;
+        assert!(
+            out.success,
+            "could not pre-seed the root-ns wg: {}",
+            out.stderr
+        );
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let result = provider.apply_plan(&plan);
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        match result {
+            Err(FabricError::ForeignState { .. }) => Ok(()),
+            other => Err(Box::new(FabricError::Invalid(format!(
+                "a root-ns wg alongside the fabric-ns wg must fail closed, got {other:?}"
+            )))),
+        }
+    }
+
+    /// Real `ip route del` of a nonexistent route fails with
+    /// "RTNETLINK answers: No such process" (kernel 6.8, verified) — not
+    /// the fdb's "No such file or directory". The tolerant withdrawal of
+    /// a stale peer route must swallow that exact wording, or teardown
+    /// wedges on real kernels in the reboot/lost-state scenarios it was
+    /// written for.
+    #[test]
+    fn stale_route_deletion_tolerates_already_missing_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("route-missing")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan_a = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let mut plan_b = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        plan_b.peers[0].fabric_transport_ip = Ipv4Addr::new(198, 18, 0, 9);
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan_a)?;
+        assert!(provider.runner().has_route("198.18.0.2/32"));
+        let mut runner = provider.into_runner();
+
+        // The kernel lost the route (reboot / partial teardown) while
+        // the journals survive: configure_peers' stale-route withdrawal
+        // now deletes an already-absent route.
+        let out = runner.run(
+            "ip",
+            &["netns", "exec", &ns, "ip", "route", "del", "198.18.0.2/32"],
+        )?;
+        assert!(
+            out.success,
+            "could not drop the route for the test: {}",
+            out.stderr
+        );
+        assert!(!runner.has_route("198.18.0.2/32"));
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let healed = provider.apply_plan(&plan_b);
+        let new_route = match &healed {
+            Ok(_) => provider.runner().has_route("198.18.0.9/32"),
+            Err(_) => false,
+        };
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        healed?;
+        assert!(
+            new_route,
+            "the peer's new transport /32 must be routed despite the \
+             pre-missing stale route"
+        );
+        Ok(())
+    }
+
+    /// The HER flood list reconciles against the OBSERVED forwarding
+    /// state, so entries the journal does not know about (injected here,
+    /// e.g. by an operator or an old buggy apply) are deleted too, and
+    /// desired entries present exactly once are left alone — no blind
+    /// re-append, no duplicates.
+    #[test]
+    fn flood_list_reconciles_against_observed_state() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("flood-observed")?;
+        let config = FabricLinuxConfig::new(&root);
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let vxlan = names.vxlan(&plan.network_id);
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+        assert_eq!(
+            provider
+                .runner()
+                .fdb_entry_count(&vxlan, FLOOD_MAC, "198.18.0.2"),
+            1
+        );
+        let mut runner = provider.into_runner();
+
+        // Inject a flood destination that is neither desired nor
+        // journaled.
+        let out = runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &ns,
+                "bridge",
+                "fdb",
+                "append",
+                FLOOD_MAC,
+                "dev",
+                vxlan.as_str(),
+                "dst",
+                "198.18.0.99",
+            ],
+        )?;
+        assert!(
+            out.success,
+            "could not inject the foreign flood entry: {}",
+            out.stderr
+        );
+        assert!(
+            runner.has_fdb_entry(&vxlan, FLOOD_MAC, "198.18.0.99"),
+            "injection sanity"
+        );
+
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        provider.apply_plan(&plan)?;
+        let foreign_gone = !provider
+            .runner()
+            .has_fdb_entry(&vxlan, FLOOD_MAC, "198.18.0.99");
+        let desired_kept = provider
+            .runner()
+            .fdb_entry_count(&vxlan, FLOOD_MAC, "198.18.0.2");
+        let appends_on_replay = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .filter(|call| call.joined().contains("fdb append"))
+            .count();
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            foreign_gone,
+            "an observed-but-undesired flood entry must be deleted even \
+             though the journal does not know it"
+        );
+        assert_eq!(
+            desired_kept, 1,
+            "an already-present desired entry must not be re-appended"
+        );
+        assert_eq!(
+            appends_on_replay, 0,
+            "a fully-converged flood list must produce zero appends"
         );
         Ok(())
     }

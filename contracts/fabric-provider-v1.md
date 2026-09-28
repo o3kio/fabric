@@ -134,14 +134,26 @@ closed.
 
 ### 3.6 Bounded flood list
 HER entries (`bridge fdb append 00:00:00:00:00:00 dev <vxlan> dst <ip>`)
-exist only for the plan's peer set. Every desired entry is **appended on
-every apply** — `append` is idempotent per (dev, mac, dst), and diffing
-adds against the journal would leave a recreated (post-reboot) VXLAN with
-an empty fdb and dead BUM flooding while the apply reports green.
-Entries present in the journal but no longer desired are deleted on every
-apply (tolerating already-absent entries). `replace` is never used: the
-kernel rejects it for non-unicast entries, and it would clobber the other
-remotes.
+exist only for the plan's peer set, and the provider reconciles the flood
+list against **observed** state on every apply: it ensures every desired
+entry exists, then reads `bridge fdb show dev <vxlan>` and deletes every
+all-zeros remote entry whose destination is not in the desired set.
+Reconciliation is append-missing / delete-unwanted — `replace` is never
+used (the kernel rejects it for non-unicast entries, and it would clobber
+the other remotes).
+
+Reconciling against observation, rather than blindly re-appending, is
+required because `bridge fdb append` is **not** guaranteed idempotent per
+(dev, mac, dst): bridge(8) documents `append` as adding a new entry
+"without deleting any existing one", and real kernels have accumulated
+duplicate all-zeros flood entries this way (Ubuntu Launchpad #1531013).
+Duplicates both violate the bounded-peer-set invariant and double-flood
+BUM traffic to the same remote. Reconciliation keeps the healing property
+that motivated re-assertion in the first place: a recreated (post-reboot)
+VXLAN with an empty fdb has every desired entry appended as missing,
+while a healthy replay appends nothing and deletes nothing, so repeated
+applies converge to exactly one entry per desired destination. Deleting
+an unwanted entry that is already absent is tolerated as done.
 
 ### 3.7 Learning stays on
 VXLAN devices are created **without** `nolearning`: the kernel performs MAC
@@ -157,8 +169,8 @@ underlay veths, NAT rules) is permitted only when zero networks are owned.
 Teardown is idempotent and converges to the desired end state: deleting an
 object that is already absent is success (a deletion whose stderr
 indicates the object does not exist — missing device, missing namespace,
-missing rule or entry — counts as done; any other failure is a hard
-error). When the fabric namespace itself is absent, all ns-scoped
+missing rule or entry, or a missing route (`RTNETLINK answers: No such
+process`) — counts as done; any other failure is a hard error). When the fabric namespace itself is absent, all ns-scoped
 deletions are skipped: a kernel that was rebooted while the journals
 survived must still tear down cleanly. The plan journal file and the
 ownership entry are removed **unconditionally** — regardless of which
@@ -172,22 +184,56 @@ The provider never bridges fabric traffic into site-local switches; the
 only tenant-side exposure is the consumer attachment veth, which the host
 enslaves to its own tenant bridge under its own anti-spoof policy.
 
+### 3.10 WireGuard socket placement
+The WireGuard interface is created from **inside** the fabric namespace
+(`ip netns exec <fabric-ns> ip link add <wg> type wireguard`). A
+WireGuard interface's UDP socket binds in the namespace where the
+interface is **created** and never follows a later
+`ip link set netns` — verified empirically on kernel 6.8, including that
+a down/up toggle inside the destination namespace does not re-bind it.
+An interface created in the root namespace and then moved into the
+fabric namespace therefore leaves its listening socket in the root
+namespace, where the fabric's underlay DNAT rules do not apply: inbound
+encrypted flows are DNAT'ed toward the fabric namespace, where no socket
+listens, and are black-holed.
+
+Legacy state — journals written by provider versions predating this
+invariant, detectable via the absent `wireguard_born_in_fabric_ns`
+journal flag, which old journals deserialize as `false` — is healed by a
+one-time, idempotent procedure: a stray root-namespace interface of the
+same name is swept tolerantly, the namespace-scoped interface is deleted,
+every VXLAN recorded in the ownership journal is deleted (their fdb state
+belongs to the old interface; each network fully heals on its own next
+apply), the interface is recreated from inside the fabric namespace with
+the private key and listen port forced, and the journal flag is set only
+after the key/port configuration succeeds, so an interrupted heal re-runs
+to convergence. If an interface of the WireGuard name exists in **both**
+the root and the fabric namespace, the provider fails closed (foreign
+state) rather than guessing which one is its own.
+
 ## 4. Conformance
 
 Every provider integration MUST pass `fabric-conformance::run_suite()`
 (reference fake-kernel runner) in CI, covering: plan validation, idempotent
-replay, flood-list scoping, foreign-state rejection (including prefix-VNI
-rejection), teardown cleanliness, key non-leakage, peer withdrawal, and
+replay, WireGuard creation inside the fabric namespace, flood-list
+reconciliation without duplicates after repeated replays, flood-list
+scoping, foreign-state rejection (including prefix-VNI rejection),
+teardown cleanliness, key non-leakage, peer withdrawal, and
 fabric-removal fencing — plus the hardening cases: teardown convergence
 after a simulated kernel restart, re-apply healing of partial state,
 flood-list shrinking, and MTU/addressing re-assertion. The fake kernel
-models the real `ip`/`bridge` failure semantics (missing devices,
-duplicate names, missing namespaces, missing fdb/route entries), so a
-permissive provider flow fails the suite rather than silently passing.
+models the real `ip`/`bridge`/`wg` failure and placement semantics
+(missing devices, duplicate names, missing namespaces, missing
+fdb/route entries with real kernel error strings, per-namespace link
+placement, counting fdb entries), so a permissive provider flow fails
+the suite rather than silently passing.
 
-The privileged multi-host gate (three real hosts, real handshakes,
-cleartext underlay capture proving encryption, zero-leak teardown) is a
-separate harness planned in this repository; it is required before any
+The privileged multi-host gate (three real hosts on one kernel, real
+WireGuard handshakes, cross-host L2 and near-MTU tenant traffic,
+cleartext underlay capture proving encryption, per-host assertion that
+the WireGuard UDP socket listens inside the fabric namespace and not in
+the root namespace, idempotent replay, and zero-leak teardown) is the
+separate harness `evidence/run-multinode.sh`; it is required before any
 production evidence claim.
 
 ## 5. Versioning

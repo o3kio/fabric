@@ -20,6 +20,8 @@
 #      packets appear in cleartext.
 #   5. Idempotent re-apply, zero-leak teardown in every host, and survival
 #      of the host keypair across fabric teardown (by design).
+#   6. WireGuard socket placement: the WG UDP socket listens inside the
+#      fabric namespace, never in the root namespace (contract §3.10).
 #
 # PREREQUISITES (orchestrator machine):
 #   - Linux with the wireguard and vxlan kernel modules available (the
@@ -111,7 +113,7 @@ capture_diagnostics() {
       echo "## wg show (fabric ns)"
       "${DOCKER[@]}" exec "fev-$h" ip netns exec "$PREFIX-fabric" wg show 2>&1
       echo "## conntrack entries for the fabric port (root ns view)"
-      "${DOCKER[@]}" exec "fev-$h" sh -c "grep 65001 /proc/net/nf_conntrack 2>/dev/null || true" 2>&1
+      "${DOCKER[@]}" exec "fev-$h" sh -c "grep $WG_PORT /proc/net/nf_conntrack 2>/dev/null || true" 2>&1
       echo "## ip -s link (root ns)"
       "${DOCKER[@]}" exec "fev-$h" ip -s link 2>&1
     } >"$out" 2>&1
@@ -339,6 +341,30 @@ for h in "${HOSTS[@]}"; do
   fi
 done
 
+# WireGuard socket placement (regression evidence for the create-in-ns
+# fix, contract §3.10): the WG UDP socket must live INSIDE the fabric
+# namespace. A WireGuard socket binds in the netns where the interface
+# is CREATED and never follows a later `ip link set netns`, so an
+# interface created in the root ns and moved would leave its socket in
+# the root ns — where the fabric's DNAT rules do not apply — and peer
+# traffic would be sent un-NAT'ed into a black hole. ss(8) lists
+# listening UDP sockets per network namespace, so both sides of the
+# invariant are directly observable here.
+for h in "${HOSTS[@]}"; do
+  ns_ss="$(hexec "$h" ip netns exec "$PREFIX-fabric" ss -uln)"
+  root_ss="$(hexec "$h" ss -uln)"
+  printf '%s\n' "$ns_ss" >"$RESULTS_DIR/ss-fabric-ns-$h.txt"
+  printf '%s\n' "$root_ss" >"$RESULTS_DIR/ss-root-ns-$h.txt"
+  ns_listening="$(printf '%s\n' "$ns_ss" | grep -E ":${WG_PORT}\b" || true)"
+  root_listening="$(printf '%s\n' "$root_ss" | grep -E ":${WG_PORT}\b" || true)"
+  if [[ -n "$ns_listening" && -z "$root_listening" ]]; then
+    pass "wg_socket_in_fabric_ns_$h" "WG UDP $WG_PORT listens in $PREFIX-fabric ns, not in root ns"
+  else
+    fail "wg_socket_in_fabric_ns_$h" \
+      "ns match: '${ns_listening:-<none>}', root match: '${root_listening:-<none>}'"
+  fi
+done
+
 declare -A TENANT_IP=( [h1]="$TENANT_H1" [h2]="$TENANT_H2" [h3]="$TENANT_H3" )
 for h in "${HOSTS[@]}"; do
   if fev "$h" tenant-up --root "/work/$h" --prefix "$PREFIX" \
@@ -442,18 +468,19 @@ fi
 hexec h1 ping -c 1 -w 2 "${CONN_IP[h2]}" >/dev/null 2>&1 || true
 
 # Combined capture in ONE traffic window: the same packets must show
-# WireGuard UDP (port 65001) AND no tenant-addressed (10.42.0.0/24)
+# WireGuard UDP (port $WG_PORT) AND no tenant-addressed (10.42.0.0/24)
 # cleartext. Two separate captures could pass vacuously — the cleartext
 # capture might simply have missed the traffic window and seen nothing at
 # all. The full capture is recorded in the results dir.
 "${DOCKER[@]}" exec fev-h2 timeout 15 tcpdump -i eth0 -c 40 -l -n \
-  'udp port 65001 or arp or icmp' \
+  "udp port $WG_PORT or arp or icmp" \
   >"$RESULTS_DIR/tcpdump-underlay-combined.txt" 2>/dev/null &
 COMBINED_PID=$!
 fev h1 probe --tenant-ns "$TNS" --target "$TENANT_H2" --count 10 --deadline 10 >/dev/null || true
 wait "$COMBINED_PID" || true
 CAPTURE="$RESULTS_DIR/tcpdump-underlay-combined.txt"
-wg_lines="$(grep -Ec '\.65001:|udp port 65001' "$CAPTURE" || true)"
+# tcpdump line format: "... 172.31.250.x.port > 172.31.250.y.port: UDP ..."
+wg_lines="$(grep -Ec "\.${WG_PORT}:" "$CAPTURE" || true)"
 tenant_leak="$(grep -c '10\.42\.' "$CAPTURE" || true)"
 if [[ "$wg_lines" -ge 1 ]]; then
   pass "wg_udp_visible_on_underlay" \

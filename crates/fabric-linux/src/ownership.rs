@@ -52,6 +52,18 @@ pub struct FabricOwnership {
     /// True once the shared fabric (netns, WireGuard, underlay veths) has
     /// been configured on this host.
     pub fabric_configured: bool,
+    /// True once the WireGuard interface in the fabric namespace is known
+    /// to have been CREATED inside that namespace. A WireGuard interface's
+    /// UDP socket binds in the namespace the interface was created in and
+    /// never follows the interface, so an interface that was created in
+    /// the root namespace and moved in leaves its socket outside the
+    /// fabric underlay — the provider repairs that by delete + re-create
+    /// from inside the namespace. Journals written before this field
+    /// existed parse as `false` (`serde(default)`), which triggers the
+    /// one-time legacy heal; the field is additive, so old and new
+    /// journal formats remain mutually readable.
+    #[serde(default)]
+    pub wireguard_born_in_fabric_ns: bool,
     /// WireGuard peers currently configured (union over live plans).
     pub peers: Vec<PeerRecord>,
     /// Per-network owned state, keyed by network id.
@@ -63,6 +75,7 @@ impl Default for FabricOwnership {
         Self {
             state_version: STATE_VERSION,
             fabric_configured: false,
+            wireguard_born_in_fabric_ns: false,
             peers: Vec::new(),
             networks: BTreeMap::new(),
         }
@@ -158,6 +171,48 @@ mod tests {
         let path = std::env::temp_dir().join("fabric-own-absent.json");
         let loaded = FabricOwnership::load_or_default(&path)?;
         assert_eq!(loaded, FabricOwnership::default());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_journal_without_socket_placement_flag_parses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A journal written before `wireguard_born_in_fabric_ns` existed
+        // must keep parsing (as false — the legacy-heal trigger), and the
+        // unknown-field tolerance is symmetric: this field is additive,
+        // never a format break.
+        let root = std::env::temp_dir().join(format!(
+            "fabric-own-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root)?;
+        let path = root.join("ownership.json");
+        fs::write(
+            &path,
+            "{\n  \"state_version\": 1,\n  \"fabric_configured\": true,\n  \
+             \"peers\": [],\n  \"networks\": {}\n}\n",
+        )?;
+        let loaded = FabricOwnership::load_or_default(&path)?;
+        assert!(loaded.fabric_configured);
+        assert!(
+            !loaded.wireguard_born_in_fabric_ns,
+            "an old journal must parse as legacy (socket placement unknown)"
+        );
+        // Round-trip rewrites the journal WITH the new field (serde's
+        // default only affects deserialization), keeping the value.
+        loaded.save(&path)?;
+        let raw = fs::read_to_string(&path)?;
+        assert!(
+            raw.contains("wireguard_born_in_fabric_ns"),
+            "a saved journal must carry the new field: {raw}"
+        );
+        let reloaded = FabricOwnership::load_or_default(&path)?;
+        assert!(!reloaded.wireguard_born_in_fabric_ns);
+        let _unused = fs::remove_dir_all(&root);
         Ok(())
     }
 }

@@ -103,6 +103,14 @@ fn cases() -> Vec<(String, Case)> {
             case_replay_idempotent,
         ),
         (
+            "wireguard_is_created_inside_the_fabric_namespace".to_string(),
+            case_wireguard_created_inside_ns,
+        ),
+        (
+            "flood_list_has_no_duplicates_after_replays".to_string(),
+            case_flood_no_duplicates_after_replays,
+        ),
+        (
             "flood_entries_scoped_to_plan_peers".to_string(),
             case_flood_scoping,
         ),
@@ -233,28 +241,135 @@ fn case_replay_idempotent() -> Result<(), FabricError> {
     let mut env = CaseEnv::new("replay")?;
     let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
         .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let vxlan = names.vxlan(&plan.network_id);
     let mut provider = env.provider()?;
     provider.apply_plan(&plan)?;
 
     // Re-open from the same state root (simulates daemon restart) and replay.
     env.take_runner_back(provider);
+    let first_apply_mutations = env.runner.mutating_calls().len();
     let mut provider = env.provider()?;
     provider.apply_plan(&plan)?;
+    env.take_runner_back(provider);
 
     // Peer reconfiguration is allowed (wg set is idempotent); object
-    // creation must not repeat.
-    let mutations = env.runner.mutating_calls();
-    let created_again = mutations.iter().any(|call| {
+    // creation must not repeat. Scoped to the REPLAY's mutations — the
+    // first apply legitimately creates everything.
+    let all_mutations = env.runner.mutating_calls();
+    let replay_mutations = &all_mutations[first_apply_mutations..];
+    let created_again = replay_mutations.iter().any(|call| {
         call.args.iter().any(|arg| arg == "add") && call.joined().contains("type vxlan")
-    }) || mutations.iter().any(|call| {
+    }) || replay_mutations.iter().any(|call| {
         call.joined().contains("netns add") || call.joined().contains("type wireguard")
     });
-    env.take_runner_back(provider);
+    // The fake kernel counts fdb instances: blind re-appending (the old
+    // behavior) would leave duplicates after the replay.
+    let flood_count = env
+        .runner
+        .fdb_entry_count(&vxlan, "00:00:00:00:00:00", "198.18.0.2");
     env.cleanup();
     if created_again {
         return Err(FabricError::Invalid(
             "replay recreated existing objects".to_string(),
         ));
+    }
+    if flood_count != 1 {
+        return Err(FabricError::Invalid(format!(
+            "replay must not duplicate HER flood entries (saw {flood_count} instances)"
+        )));
+    }
+    Ok(())
+}
+
+/// Regression case for the WireGuard socket-placement bug: the interface
+/// MUST be created from inside the fabric namespace. A WireGuard
+/// interface's UDP socket binds in the namespace the interface was
+/// CREATED in and never follows the interface; creating it in the root
+/// namespace and moving it in leaves the listening socket in the root
+/// namespace, where the underlay DNAT rule black-holes every NEW inbound
+/// flow into the fabric namespace (no listener there). Verified
+/// empirically on kernel 6.8: `ip link add w type wireguard` + `ip link
+/// set w netns <ns>` keeps the socket in the root namespace, and no
+/// down/up toggle inside the namespace re-binds it.
+fn case_wireguard_created_inside_ns() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("wg-in-ns")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let wg = names.wireguard_interface();
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+    let joined: Vec<String> = provider
+        .runner()
+        .calls()
+        .iter()
+        .map(|call| call.joined())
+        .collect();
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    let ns_add = format!("ip netns exec {ns} ip link add {wg} type wireguard");
+    if !joined.iter().any(|line| line == &ns_add) {
+        return Err(FabricError::Invalid(format!(
+            "the WireGuard interface must be created inside the fabric namespace \
+             (expected '{ns_add}')"
+        )));
+    }
+    let root_add = format!("ip link add {wg} type wireguard");
+    if joined.iter().any(|line| line == &root_add) {
+        return Err(FabricError::Invalid(
+            "the WireGuard interface must not be created in the root namespace".to_string(),
+        ));
+    }
+    let root_move = format!("ip link set {wg} netns {ns}");
+    if joined.iter().any(|line| line == &root_move) {
+        return Err(FabricError::Invalid(
+            "the WireGuard interface must not be moved into the fabric namespace \
+             (the socket never follows)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The kernel does not guarantee `bridge fdb append` deduplication
+/// (bridge(8); Launchpad #1531013 documented fleets accumulating
+/// duplicate all-zeros flood entries), so the provider reconciles the
+/// flood list against observed state instead of blindly re-appending.
+/// After several applies, every desired destination must exist exactly
+/// once — with a counting fake kernel, the old blind-append behavior
+/// fails this case.
+fn case_flood_no_duplicates_after_replays() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("fdb-dupes")?;
+    let plan = plan_for(
+        100,
+        &[("host-02", [198, 18, 0, 2]), ("host-03", [198, 18, 0, 3])],
+    )
+    .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let vxlan = names.vxlan(&plan.network_id);
+
+    let mut provider = env.provider()?;
+    for _ in 0..3 {
+        provider.apply_plan(&plan)?;
+    }
+    let count_2 = provider
+        .runner()
+        .fdb_entry_count(&vxlan, "00:00:00:00:00:00", "198.18.0.2");
+    let count_3 = provider
+        .runner()
+        .fdb_entry_count(&vxlan, "00:00:00:00:00:00", "198.18.0.3");
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if count_2 != 1 || count_3 != 1 {
+        return Err(FabricError::Invalid(format!(
+            "HER flood entries must exist exactly once after replays \
+             (198.18.0.2: {count_2}, 198.18.0.3: {count_3})"
+        )));
     }
     Ok(())
 }
@@ -513,7 +628,6 @@ fn case_teardown_after_restart() -> Result<(), FabricError> {
     let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
         .map_err(|e| FabricError::Invalid(e.to_string()))?;
     let names = fabric_linux::Names::new(env.config.name_prefix())?;
-    let ns = names.fabric_namespace();
     let network_id = plan.network_id.clone();
 
     let mut provider = env.provider()?;
@@ -526,31 +640,18 @@ fn case_teardown_after_restart() -> Result<(), FabricError> {
     let mut provider = env.provider()?;
     provider.remove_network(&network_id)?;
 
-    // Zero residue in the (fresh) kernel and the journals.
-    let ns_absent = !provider.runner().has_netns(&ns);
-    let links_absent = [
-        names.vxlan(&network_id),
-        names.fabric_bridge(&network_id),
-        names.fabric_port_veth(&network_id),
-        names.consumer_port_veth(&network_id),
-        names.wireguard_interface(),
-        names.host_underlay_veth(),
-    ]
-    .iter()
-    .all(|name| !provider.runner().has_link(name));
-    let fdb_absent = !provider.runner().has_fdb_entry(
-        &names.vxlan(&network_id),
-        "00:00:00:00:00:00",
-        "198.18.0.2",
-    );
+    // Kernel-residue assertions against the fresh fake would be vacuous
+    // (it never held the objects); the provider's own reports and the
+    // journals are the meaningful evidence here.
     let ownership_empty = provider.ownership().networks.is_empty();
     let plan_gone = !env.config.plan_path(&network_id).exists();
 
-    // A clean host must converge to Ok(true) with zero residue errors.
+    // A clean host must converge to Ok(true).
     let fabric_removed = provider.remove_fabric_if_unused()?;
 
     // Re-applying the same plan on the fresh kernel must fully recreate
-    // and re-populate the HER flood list (unconditional append).
+    // and re-populate the HER flood list (reconciliation against the
+    // observed — empty — forwarding state re-appends everything).
     let report = provider.apply_plan(&plan)?;
     let flood_healed = provider.runner().has_fdb_entry(
         &names.vxlan(&network_id),
@@ -560,11 +661,6 @@ fn case_teardown_after_restart() -> Result<(), FabricError> {
     env.take_runner_back(provider);
     env.cleanup();
 
-    if !ns_absent || !links_absent || !fdb_absent {
-        return Err(FabricError::Invalid(
-            "teardown after restart left kernel residue".to_string(),
-        ));
-    }
     if !ownership_empty || !plan_gone {
         return Err(FabricError::Invalid(
             "teardown after restart left journal residue".to_string(),
@@ -682,6 +778,16 @@ fn case_flood_list_shrinks() -> Result<(), FabricError> {
 
 /// A foreign VXLAN whose VNI merely extends the plan's VNI as a string
 /// prefix (1000 vs 100) must be rejected — token-exact identity checks.
+///
+/// NOTE on fake-kernel fidelity: this case exploits the fake's single
+/// GLOBAL link table — the foreign VXLAN is pre-created at host scope
+/// (before the fabric namespace exists) and the namespace-scoped
+/// `ip -d link show` inside the provider still observes it, unlike a
+/// real kernel where a root-namespace link is invisible from inside a
+/// netns. That quirk is deliberate here (it keeps the case setup simple)
+/// and is NOT mimicked by other cases: namespace placement is modeled
+/// everywhere the provider logic depends on it (WireGuard creation,
+/// root-ns stray detection).
 fn case_foreign_state_rejects_prefix_vni() -> Result<(), FabricError> {
     let mut env = CaseEnv::new("prefix-vni")?;
     let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
