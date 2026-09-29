@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.5] - 2026-09-29
+### Changed
+- **MSRV lowered to Rust 1.97.1** (from 1.98.0). The 1.98.0 floor was
+  incidental (the stable toolchain when the workspace was created), not a
+  feature requirement — the entire workspace (123 tests, all four crates)
+  compiles and passes under 1.97.1, verified with `cargo +1.97.1 test
+  --workspace --all-targets`. This is a compatible widening so both
+  consumers (O3K, toolchain-pinned to 1.97.1, and CHV, 1.98) can pin the
+  same tag under the single-tag fleet policy (`docs/change-control.md`).
+  No code changes; metadata only.
+
 ## [0.1.4] - 2026-09-29
 ### Fixed (review loop, round 1)
 - **`remove_network` now converges when the fabric namespace survives but
