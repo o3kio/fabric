@@ -80,8 +80,9 @@ no tenant packets for the wrong reason.
 
 ## Interpretation
 
-A green run means: on three independent host kernels' worth of container
-state, the compiled plans produced a single L2 broadcast domain — ARP and
+A green run means: on three independent host instances (privileged
+containers sharing one physical kernel), the compiled plans produced a
+single L2 broadcast domain — ARP and
 ICMP flow between tenant namespaces with real MACs, the only traffic on
 the underlay is WireGuard UDP, near-MTU packets survive the documented MTU
 layering, and teardown leaves zero fabric residue while preserving the
@@ -103,16 +104,31 @@ JSON, `wg show`, tcpdump text captures) plus a binary pcap in the workdir
   orchestrator host is shared with other workloads; on 2026-09-28 a parallel
   CHV qualification session's cleanup deleted every host bridge matching
   `chvbr0|br-*` — which includes docker's per-network bridges — mid-run,
-  twice. Both affected evidence runs (17:54:06 and 18:50:33) failed with an
+  twice. Both affected evidence runs are preserved: `results/
+  20260928T175355Z/` (**pre-NAT-free code** — its socket
+  assertions are the old `wg_socket_in_fabric_ns_*` and its container
+  diagnostics show the legacy DNAT/MASQ rules; its recorded failure
+  details latch 17:54:59–17:55:12, and the 17:54:06 bridge-down kernel
+  timestamp quoted during the incident came from the host journal, which
+  is not preserved in the repo) and `results/
+  20260928T185004Z/` (failed at `bum_arp_reflooded`; NAT-free
+  code with a healthy fabric up to the blackout; its ARP monitors run
+  18:50:11–18:51:21). Both failed with an
   identical signature: all bridge ports `entered disabled state` in the
   kernel journal at the same second, after which every host's root-ns ARP
   for its peers went unanswered (requests leave each container, nothing
-  arrives anywhere — captured per-host by `arp-monitor-h*.txt`). This is
+  arrives anywhere — captured per-host by `arp-monitor-h*.txt` in the
+  NAT-free run; the pre-NAT-free run's equivalent output is embedded in
+  its recorded assertion-failure details). This is
   external interference, not a fabric defect: the fabric's underlay depends
-  on host bridge forwarding, as does any container networking. Attribution
-  recipe for a failed run: check the kernel journal for `bridge ... entered
-  disabled state` events inside the run window (they must only appear at
-  container bring-up and teardown), and the ARP monitors for the
+  on host bridge forwarding, as does any container networking. (The full
+  run history is preserved under `results/`: the 16:36/16:47 failures are
+  the pre-redesign NAT-race signature — "only 1 peers have handshakes" —
+  that motivated the v0.1.2 underlay; a few interrupted runs record fewer
+  assertions and no summary.) Attribution
+  recipe for a failed run: check the kernel journal for `bridge ...
+  entered disabled state` events inside the run window (they must only
+  appear at container bring-up and teardown), and the ARP monitors for the
   requests-without-replies blackout signature. The evidence environment
   must be quiesced (no parallel bridge lifecycle churn) for a run to count
   toward acceptance; cross-machine runs remain the final production gate.

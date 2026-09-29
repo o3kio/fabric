@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 fabric-linux.workspace = true
 fabric-plan.workspace = true
+serde_json.workspace = true

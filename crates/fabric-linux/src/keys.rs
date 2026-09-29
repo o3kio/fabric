@@ -6,8 +6,10 @@
 //!
 //! - is generated with `wg genkey` if absent, stored 0600 via atomic
 //!   create (temp file + rename) under the provider state root;
-//! - is adopted as-is when a valid key already exists (so control-plane
-//!   records of the public key stay valid) and is **never** overwritten;
+//! - is adopted as-is when a non-empty key already exists (so
+//!   control-plane records of the public key stay valid) and is **never**
+//!   overwritten — enforced by mechanism (a no-replace publish), not by
+//!   the assumption that only one provider writes the state root;
 //! - is only ever referenced by file path in commands (`wg set <if>
 //!   private-key <path>`) or piped via stdin (`wg pubkey`), never placed in
 //!   argv;
@@ -82,7 +84,13 @@ pub fn derive_public_key(
 /// step, so it never exists with a permissive mode and cannot be
 /// pre-created (or pre-planted as a symlink) by anyone else. A stale temp
 /// left by an earlier crash is removed and the create is retried once.
-/// The file is fsynced before, and the parent directory after, the rename.
+/// The file is fsynced before, and the parent directory after, the
+/// publish. The publish itself never replaces an existing destination: a
+/// plain `rename` would silently clobber a key that appeared between the
+/// caller's `exists()` check and the rename (a TOCTOU); `hard_link` fails
+/// with `AlreadyExists` instead, and the surviving key is adopted — so
+/// "never overwrites" holds by mechanism, not by the single-writer
+/// assumption (review loop F-4).
 fn atomic_write_private(path: &Path, contents: &str) -> Result<(), FabricError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -107,7 +115,26 @@ fn atomic_write_private(path: &Path, contents: &str) -> Result<(), FabricError> 
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&tmp, path)?;
+    match fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            fs::remove_file(&tmp)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A destination appeared between the caller's `exists()` check
+            // and this publish. Never overwrite: adopt the surviving key
+            // (with the same non-empty check as the adoption path) and
+            // drop our temp.
+            fs::remove_file(&tmp)?;
+            let existing = fs::read_to_string(path)?;
+            if existing.trim().is_empty() {
+                return Err(FabricError::Invalid(format!(
+                    "existing private key {} is empty; refusing to overwrite foreign state",
+                    path.display()
+                )));
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent)?;
         dir.sync_all()?;
@@ -181,6 +208,33 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         assert!(!tmp.exists(), "the stale temp must be gone");
         assert!(stale_temp_files(&root)?.is_empty());
+        cleanup(&root);
+        Ok(())
+    }
+
+    /// Review loop F-4: the publish must never replace an existing
+    /// destination. A plain rename silently clobbers a key that appeared
+    /// between the caller's `exists()` check and the write; the
+    /// no-replace publish adopts the survivor instead. Pre-fix, the
+    /// destination was overwritten and this test failed.
+    #[test]
+    fn atomic_write_never_replaces_an_existing_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("no-clobber")?;
+        let key_path = root.join("wireguard-private.key");
+        fs::write(&key_path, "existing-key-material")?;
+
+        atomic_write_private(&key_path, "newly-generated-material")?;
+
+        assert_eq!(
+            fs::read_to_string(&key_path)?.trim(),
+            "existing-key-material",
+            "an existing destination must never be overwritten"
+        );
+        assert!(
+            stale_temp_files(&root)?.is_empty(),
+            "the losing temp must be cleaned up"
+        );
         cleanup(&root);
         Ok(())
     }

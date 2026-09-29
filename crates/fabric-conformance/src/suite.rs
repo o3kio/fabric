@@ -99,6 +99,14 @@ fn cases() -> Vec<(String, Case)> {
             case_endpoint_value_validation,
         ),
         (
+            "remove_network_converges_when_wireguard_link_absent".to_string(),
+            case_remove_network_converges_without_wireguard,
+        ),
+        (
+            "plan_validation_rejects_non_base64_public_keys".to_string(),
+            case_public_key_shape_validation,
+        ),
+        (
             "apply_creates_expected_kernel_objects".to_string(),
             case_apply_creates,
         ),
@@ -265,6 +273,98 @@ fn case_endpoint_value_validation() -> Result<(), FabricError> {
         ));
     }
     Ok(())
+}
+
+/// Contract §2.1: public-key shape is validated on the deserialized
+/// path too — serde bypasses `PublicKey::new`, so the re-check must live
+/// in `validate()`. A plan whose peer key is 44 non-base64 characters
+/// must be rejected by `apply_plan` before any state is created (review
+/// loop round 2).
+fn case_public_key_shape_validation() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("key-shape")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    // Round-trip through JSON with a corrupted peer public key — the
+    // deserialized path, which bypasses `PublicKey::new`.
+    let mut value = serde_json::to_value(&plan).map_err(|e| FabricError::Invalid(e.to_string()))?;
+    value["peers"][0]["public_key"] = serde_json::json!(format!("{}=", "!".repeat(43)));
+    let plan: StretchedL2Plan =
+        serde_json::from_value(value).map_err(|e| FabricError::Invalid(e.to_string()))?;
+
+    let mut provider = env.provider()?;
+    let err = provider.apply_plan(&plan);
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns_created = provider.runner().has_netns(&names.fabric_namespace());
+    env.take_runner_back(provider);
+    env.cleanup();
+    if err.is_ok() {
+        return Err(FabricError::Invalid(
+            "a plan with a non-base64 peer public key was accepted".to_string(),
+        ));
+    }
+    if ns_created {
+        return Err(FabricError::Invalid(
+            "an invalid plan must fail before any state is created".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Contract §6.4 (teardown convergence): `remove_network` must converge on a
+/// host whose fabric NAMESPACE survived but whose WireGuard LINK did not
+/// (module unload, operator deletion, partial teardown) — peer
+/// reconciliation has nothing to program, so it must skip, not fail, and
+/// the journals must converge so `remove_fabric_if_unused` stays reachable
+/// (review loop F-1).
+fn case_remove_network_converges_without_wireguard() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("remove-no-wg")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let mut provider = env.provider()?;
+    provider.apply_plan(&plan)?;
+
+    // The F-1 state: namespace present, WireGuard link absent.
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let wg = names.wireguard_interface();
+    {
+        let mut runner = provider.into_runner();
+        let out = runner.run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                ns.as_str(),
+                "ip",
+                "link",
+                "del",
+                wg.as_str(),
+            ],
+        )?;
+        if !out.success || !runner.has_netns(&ns) || runner.has_link_in(&wg, Some(&ns)) {
+            env.cleanup();
+            return Err(FabricError::Invalid(
+                "test seeding failed: expected namespace present and wg absent".to_string(),
+            ));
+        }
+        provider = LinuxFabricProvider::open(env.config.clone(), runner)?;
+    }
+
+    let removed = provider.remove_network(&plan.network_id);
+    let fabric_removed = provider.remove_fabric_if_unused();
+    env.take_runner_back(provider);
+    env.cleanup();
+    if let Err(e) = removed {
+        return Err(FabricError::Invalid(format!(
+            "remove_network must converge when the WireGuard link is absent: {e}"
+        )));
+    }
+    match fabric_removed {
+        Ok(true) => Ok(()),
+        other => Err(FabricError::Invalid(format!(
+            "fabric removal must stay reachable after the converged removal: {other:?}"
+        ))),
+    }
 }
 
 fn case_apply_creates() -> Result<(), FabricError> {

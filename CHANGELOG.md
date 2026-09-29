@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.1.4] - 2026-09-29
+### Fixed (review loop, round 1)
+- **`remove_network` now converges when the fabric namespace survives but
+  the WireGuard link does not (F-1).** Previously the peer-reconciliation
+  `wg set` hard-failed in that state — module unload, operator deletion,
+  partial teardown — AFTER the plan journal had already been dropped,
+  wedging the host with an orphaned ownership entry that also blocked
+  `remove_fabric_if_unused` until an apply re-created the transport.
+  `configure_peers` now observes the WireGuard link and skips its
+  wg/route commands when absent (unreachable on the apply path, where
+  `ensure_fabric` guarantees the link). Regression test
+  `remove_network_converges_when_netns_present_but_wireguard_absent` and
+  conformance case `remove_network_converges_when_wireguard_link_absent`
+  (25 cases now, with the round-2 key-shape case); the unit test verified to fail against v0.1.3 (47dca16)
+  in a throwaway worktree (pre-fix: `Err(Command … wg set …)`). Contract
+  §3.8 and design.md §6.1/§6.4 amended in the same change.
+- **Public-key shape is validated, not just length (F-3).** A
+  44-character non-base64 string passed `PublicKey::new` and only failed
+  later at the `wg set` command layer, after the plan had been journaled
+  (the same class as the v0.1.3 endpoint gap). `PublicKey::new` now
+  enforces the exact WireGuard encoding: 43 base64-alphabet characters
+  plus one trailing `'='` pad. The fake kernel's `wg pubkey` output is
+  now a faithful base64 key (it previously emitted a non-base64
+  44-character string that the new validation would reject). Regression
+  test `public_key_rejects_non_base64_shapes`, verified to fail against
+  v0.1.3. Contract §2.1's "values are validated" enumeration extended.
+  **Round 2 closed the deserialized half of the gap** (the S1 pattern,
+  byte-for-byte): `PublicKey` is `serde(transparent)`, so deserialization
+  bypasses `new` — a plan JSON carrying a 44-char non-base64 key passed
+  `validate()` and reached `wg set` after journaling. `PublicKey::
+  validate()` is now the single shape authority (delegated to by `new`)
+  and is re-run by `FabricPeer::validate()` and
+  `FabricHostIdentity::validate()`. Regression test
+  `deserialized_public_key_shape_fails_peer_validation` (verified to
+  fail against the round-1 commit bd4cf53) and conformance case
+  `plan_validation_rejects_non_base64_public_keys` (25 cases now) pin
+  the deserialized path.
+- **The private-key publish never replaces an existing destination
+  (F-4).** `atomic_write_private` used `fs::rename`, which silently
+  clobbers a key file that appears between the caller's `exists()` check
+  and the rename (a TOCTOU). It now publishes via `hard_link` (fails
+  `AlreadyExists` instead), adopting the surviving key with the same
+  non-empty check — "never overwrites" holds by mechanism, not by the
+  single-writer assumption. Unreachable in the single-provider-per-host
+  model, but now tested: `atomic_write_never_replaces_an_existing_
+  destination`, verified to fail against v0.1.3 (pre-fix: the destination
+  was overwritten). The module docs now say "non-empty" (what is actually
+  checked), not "valid".
+- **PublicKey Debug/Display docs aligned (F-2):** public keys are
+  non-secret and both formatters render them fully for operator
+  debugging; the stale "intentionally terse" claim is gone.
+
+### Evidence harness (F-5, F-6)
+- **Positive teardown records (F-5):** `tenant_down_*` and `teardown_*`
+  were only recorded on FAILURE — a green run did not positively assert
+  tenant-down/teardown success (only transitively, via fabric-down and
+  leak-check). They are now `pass`-recorded on success, bringing a green
+  run to **41 assertions** (from 35). README and design.md updated.
+- **Interference-attribution precision (F-6):** the evidence README's
+  Limitations now names the exact affected run directories
+  (`20260928T175355Z`, `20260928T185004Z`), notes that the first used
+  pre-NAT-free code (old `wg_socket_in_fabric_ns_*` assertions, legacy
+  DNAT/MASQ in its diagnostics) while the second ran the NAT-free design,
+  and acknowledges the preserved dev-phase failures and interrupted runs.
+  The Interpretation section no longer implies multiple host kernels.
+
 ## [0.1.3] - 2026-09-29
 ### Documentation program — design doc, cross-implementation change control, fabric ADRs
 - **`docs/design.md`** — the consolidated engineering design (explanatory;

@@ -10,14 +10,21 @@ use crate::PlanError;
 /// A WireGuard public key.
 ///
 /// Public keys are safe to distribute through authenticated control-plane
-/// state. The [`fmt::Debug`] implementation is intentionally terse so key
-/// material never renders verbosely in logs.
+/// state; they are not secret, so both [`fmt::Display`] and [`fmt::Debug`]
+/// render the full key to aid operator debugging.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PublicKey(String);
 
 impl PublicKey {
     /// Wrap a base64-encoded WireGuard public key.
+    ///
+    /// A WireGuard public key is the standard base64 encoding of exactly
+    /// 32 bytes: 44 characters — 43 from the base64 alphabet plus one
+    /// trailing `'='` pad. Length alone is not enough (review loop F-3):
+    /// a 44-character non-base64 string would otherwise pass validation
+    /// and only fail later at the `wg set` command layer, after the plan
+    /// had been journaled.
     pub fn new(key: impl Into<String>) -> Result<Self, PlanError> {
         let key = key.into();
         if key.trim().is_empty() {
@@ -31,7 +38,33 @@ impl PublicKey {
                 key.len()
             )));
         }
-        Ok(Self(key))
+        let key = Self(key);
+        key.validate()?;
+        Ok(key)
+    }
+
+    /// Re-check the WireGuard encoding on a value that did not pass
+    /// through [`PublicKey::new`] — most importantly a `PublicKey`
+    /// produced by serde deserialization of a plan or journal, which
+    /// bypasses `new` entirely (`serde(transparent)`). Same rule as
+    /// `new` (review loop round 2, mirroring the S1 endpoint pattern).
+    pub fn validate(&self) -> Result<(), PlanError> {
+        let bytes = self.0.as_bytes();
+        // Short-circuit order matters: the slice and index below are
+        // only evaluated when the length is exactly 44.
+        let malformed = bytes.len() != 44
+            || bytes[..43]
+                .iter()
+                .any(|&b| !b.is_ascii_alphanumeric() && b != b'+' && b != b'/')
+            || bytes[43] != b'=';
+        if malformed {
+            return Err(PlanError::Invalid(
+                "public key must be 44 base64 characters: 43 alphabet \
+                 characters plus one trailing '='"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// The base64-encoded key material.
@@ -159,9 +192,11 @@ impl FabricPeer {
     /// Validate this peer record.
     pub fn validate(&self) -> Result<(), PlanError> {
         validate_identifier("peer host_id", &self.host_id)?;
-        // Endpoints can arrive deserialized (serde bypasses
-        // `UnderlayEndpoint::parse`), so their value rules are re-checked
-        // here — review finding S1.
+        // Endpoints and public keys can arrive deserialized (serde
+        // bypasses `UnderlayEndpoint::parse` and `PublicKey::new`), so
+        // their value rules are re-checked here — review findings S1
+        // (endpoints) and round 2 (public-key shape).
+        self.public_key.validate()?;
         self.underlay_endpoint.validate()?;
         if self.fabric_transport_ip.is_unspecified() {
             return Err(PlanError::Invalid(
@@ -176,8 +211,9 @@ impl FabricHostIdentity {
     /// Validate this host identity.
     pub fn validate(&self) -> Result<(), PlanError> {
         validate_identifier("host_id", &self.host_id)?;
-        // Same S1 rule as FabricPeer: deserialized endpoints are value-
-        // validated here, not only at parse time.
+        // Same S1/round-2 rule as FabricPeer: deserialized endpoints and
+        // public keys are value-validated here, not only at parse time.
+        self.public_key.validate()?;
         self.underlay_endpoint.validate()?;
         if self.fabric_transport_ip.is_unspecified() {
             return Err(PlanError::Invalid(
@@ -227,6 +263,31 @@ mod tests {
     fn public_key_rejects_wrong_length() {
         assert!(PublicKey::new("short").is_err());
         assert!(PublicKey::new("").is_err());
+    }
+
+    /// Review loop F-3: length alone is not a base64 check. All of these
+    /// are exactly 44 characters; none is a valid WireGuard public-key
+    /// encoding. Every assertion fails against pre-fix code, which
+    /// accepted any 44-character string and only failed later at the
+    /// `wg set` command layer.
+    #[test]
+    fn public_key_rejects_non_base64_shapes() {
+        let non_alphabet = format!("{}=", "!".repeat(43));
+        assert!(
+            PublicKey::new(non_alphabet).is_err(),
+            "non-alphabet characters must fail validation"
+        );
+        assert!(
+            PublicKey::new("=7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kMK").is_err(),
+            "'=' inside the data region must fail validation"
+        );
+        assert!(
+            PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kMK").is_err(),
+            "a missing trailing '=' pad must fail validation"
+        );
+        // Sanity: a well-formed key still validates.
+        assert!(PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=").is_ok());
+        assert!(PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kN=").is_ok());
     }
 
     #[test]
@@ -289,6 +350,49 @@ mod tests {
         // Sanity: a well-formed deserialized endpoint still validates.
         let mut value = base;
         value["underlay_endpoint"] = serde_json::json!({"host": "203.0.113.7", "port": 65001});
+        let peer: FabricPeer =
+            serde_json::from_value(value).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        peer.validate()?;
+        Ok(())
+    }
+
+    /// Review loop round 2: `PublicKey` is `serde(transparent)`, so
+    /// deserialization bypasses `PublicKey::new` and its shape check. A
+    /// 44-character non-base64 key arriving through plan JSON must fail
+    /// `validate()` — not pass and surface later at the `wg set` command
+    /// layer, after the plan was journaled. Verified to fail against
+    /// bd4cf53 (round 1), which only checked shape in `new`.
+    #[test]
+    fn deserialized_public_key_shape_fails_peer_validation() -> Result<(), PlanError> {
+        let base = serde_json::json!({
+            "host_id": "host-02",
+            "fabric_transport_ip": "198.18.0.2",
+            "underlay_endpoint": {"host": "203.0.113.7", "port": 65001}
+        });
+        for (label, key) in [
+            ("non-alphabet characters", format!("{}=", "!".repeat(43))),
+            (
+                "'=' inside the data region",
+                "=7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kMK".to_string(),
+            ),
+            (
+                "missing trailing pad",
+                "K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kMK".to_string(),
+            ),
+        ] {
+            let mut value = base.clone();
+            value["public_key"] = serde_json::json!(key);
+            let peer: FabricPeer =
+                serde_json::from_value(value).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+            assert!(
+                peer.validate().is_err(),
+                "{label}: a deserialized public key must fail validation, \
+                 not the command layer"
+            );
+        }
+        // Sanity: a well-formed deserialized key still validates.
+        let mut value = base;
+        value["public_key"] = serde_json::json!("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=");
         let peer: FabricPeer =
             serde_json::from_value(value).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
         peer.validate()?;
