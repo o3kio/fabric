@@ -7,7 +7,7 @@ locations to the same VLAN: VMs in one network ARP and ping each other with
 real MACs, identically on the same hypervisor and across hypervisors.
 
 Status: **hardened provider, NAT-free underlay, green multi-host evidence
-gate.** The fake-kernel conformance suite and the 41-assertion multi-host
+gate.** The fake-kernel conformance suite and the 35-assertion multi-host
 evidence run (three real host instances — privileged containers on one
 physical kernel: real ARP/ICMP with real MACs, encrypted underlay,
 zero-leak teardown, WG socket in the root netns — the interface is

@@ -14,7 +14,7 @@ root-causes verified against the mainline kernel:
 1. **DNAT black-holes NEW inbound flows.** A WireGuard interface's UDP socket
    binds in its **creating** namespace and never follows
    `ip link set netns` — `creating_net` is immutable
-   (`drivers/net/wireground/socket.c`; verified empirically on kernel 6.8).
+   (`drivers/net/wireguard/socket.c`; verified empirically on kernel 6.8).
    A wg created in the root ns and moved into the fabric ns keeps its socket
    in the root ns, while the DNAT rule rewrites every NEW inbound flow into
    the fabric ns, where nothing listens. Peer pairs survived only when an

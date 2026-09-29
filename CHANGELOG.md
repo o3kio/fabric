@@ -36,11 +36,13 @@
   anti-drift suite proving provider behavior modulo configuration,
   runnable by consumers at their pinned tag; the evidence gate is
   described identically everywhere (three privileged host instances —
-  containers — on one physical kernel); the README's assertion count is
-  corrected to 41; the crate table distinguishes provider-employed types
-  from control-plane contract vocabulary; `AGENTS.md` gains the evidence
-  gate's contract of record (who runs it, results never committed, what a
-  release consumes) and the documentation-discipline section.
+  containers — on one physical kernel); the evidence-gate assertion
+  count is stated as **35** and verified against the recorded runs
+  (`evidence/results/*/summary.json`); the crate table distinguishes
+  provider-employed types from control-plane contract vocabulary;
+  `AGENTS.md` gains the evidence gate's contract of record (who runs
+  it, results never committed, what a release consumes) and the
+  documentation-discipline section.
 - **Keypair wording fixed (review S4):** one keypair **per host** (the key
   file is not domain-keyed; a host runs at most one fabric) — code and
   docs now agree.
@@ -58,6 +60,23 @@
   `deserialized_endpoint_values_fail_peer_validation` and
   `deserialized_plan_with_invalid_endpoint_values_fails_validation`,
   verified to fail against v0.1.2 (9082ff9) in a throwaway worktree.
+  Note: the `parse()` error *message wording* changed (e.g.
+  `endpoint ":65001" has an empty host` → `endpoint host must not be
+  empty`); the set of rejected inputs is unchanged.
+- **Journaled plans are re-validated on read (review m4).** `live_plans()`
+  deserialized every plan file under the state root and fed
+  endpoint/MTU values into kernel commands without re-running
+  `validate()` — a plan journal that still parses but fails validation
+  (operator hand-edit, bit-rot that remains valid JSON) silently drove
+  peer/MTU realization. It now fails the apply of ANY network closed
+  with an `Ownership` error naming the file; re-applying the affected
+  network with a corrected plan overwrites the file and converges.
+  Regression test `apply_fails_closed_on_parseable_but_invalid_plan_journal`,
+  verified to fail against the pre-fix commit in a throwaway worktree.
+- **Conformance extension (review m5):** new suite case
+  `plan_validation_rejects_invalid_endpoint_values` (23 cases now) —
+  a plan with a port-0 peer endpoint must fail before any state is
+  created.
 
 ## [0.1.2] - 2026-09-28
 ### Production-impacting fix — upgrade required

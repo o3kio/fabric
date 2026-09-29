@@ -1188,7 +1188,24 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
                 Err(_) => continue,
             };
             match serde_json::from_str::<StretchedL2Plan>(&raw) {
-                Ok(plan) => plans.push(plan),
+                Ok(plan) => {
+                    // Re-validate on read (review m4): every journaled plan
+                    // was validated at persist time, but a file that still
+                    // parses yet fails validation (operator hand-edit,
+                    // bit-rot that remains valid JSON) must NOT feed
+                    // endpoint/MTU values into kernel commands unvalidated —
+                    // contract §2.1's blanket "values validated before
+                    // realization" holds on this path too. Fail closed,
+                    // naming the file; re-applying that network with a
+                    // corrected plan overwrites the file and converges.
+                    if let Err(e) = plan.validate() {
+                        return Err(FabricError::Ownership(format!(
+                            "plan journal {} holds an invalid plan: {e}",
+                            path.display()
+                        )));
+                    }
+                    plans.push(plan)
+                }
                 Err(e) => {
                     return Err(FabricError::Ownership(format!(
                         "plan journal {} is corrupt: {e}",
@@ -1694,6 +1711,68 @@ mod tests {
 
     fn plan_error(e: PlanError) -> FabricError {
         FabricError::Invalid(e.to_string())
+    }
+
+    /// Review m4: a plan journal that still DESERIALIZES but fails
+    /// `validate()` (operator hand-edit, or bit-rot that remains valid
+    /// JSON) must fail the next apply of ANY network closed — its
+    /// endpoint/MTU values must never feed kernel commands unvalidated
+    /// (contract §2.1's blanket "values validated before realization"
+    /// holds on the journal-read path too). Pre-fix: the apply of the
+    /// OTHER network succeeded and the invalid values silently drove
+    /// peer/MTU realization. Verified to fail against dd66b1e's parent
+    /// line (live_plans pushed deserialized plans without validation).
+    #[test]
+    fn apply_fails_closed_on_parseable_but_invalid_plan_journal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("live-plans-validation")?;
+        let config = FabricLinuxConfig::new(&root);
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let plan_a = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan_a)?;
+        drop(provider);
+
+        // Hand-write net-b's plan journal: it deserializes cleanly but
+        // violates MTU layering (tenant 1380 + 50 > fabric 1400).
+        let plan_b = test_plan("net-b", 200, 1380, 1400).map_err(plan_error)?;
+        let encoded =
+            serde_json::to_string(&plan_b).map_err(|e| FabricError::Ownership(e.to_string()))?;
+        std::fs::create_dir_all(config.plans_dir())?;
+        std::fs::write(config.plan_path("net-b"), encoded)?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        let result = provider.apply_plan(&plan_a);
+        let wg_kept = provider.runner().has_link_in(&wg, Some(&ns));
+        let ns_kept = provider.runner().has_netns(&ns);
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        match result {
+            Err(FabricError::Ownership(message)) => {
+                assert!(
+                    message.contains("net-b")
+                        && message.contains("invalid plan")
+                        && message.contains("MTU"),
+                    "the error must name the offending journal and its validation failure: \
+                     {message}"
+                );
+            }
+            other => {
+                return Err(Box::new(FabricError::Invalid(format!(
+                    "an apply must fail closed when a journaled plan fails validation, \
+                     got {other:?}"
+                ))));
+            }
+        }
+        assert!(
+            wg_kept && ns_kept,
+            "the failure must leave the existing fabric fully intact"
+        );
+        Ok(())
     }
 
     /// Rewrite the ownership journal in the legacy format (the

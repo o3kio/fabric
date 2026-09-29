@@ -95,6 +95,10 @@ fn cases() -> Vec<(String, Case)> {
             case_mtu_validation,
         ),
         (
+            "plan_validation_rejects_invalid_endpoint_values".to_string(),
+            case_endpoint_value_validation,
+        ),
+        (
             "apply_creates_expected_kernel_objects".to_string(),
             case_apply_creates,
         ),
@@ -232,6 +236,34 @@ fn case_mtu_validation() -> Result<(), FabricError> {
     }
     env.take_runner_back(provider);
     env.cleanup();
+    Ok(())
+}
+
+/// Contract §2.1: plan values are validated before realization — including
+/// endpoint values that only a deserialized (serde) path could carry
+/// (empty host, port 0), which `UnderlayEndpoint::parse` would have
+/// rejected. The apply must fail closed with NO state created.
+fn case_endpoint_value_validation() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("endpoint-values")?;
+    let mut plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    plan.peers[0].underlay_endpoint.port = 0;
+    let mut provider = env.provider()?;
+    let err = provider.apply_plan(&plan);
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns_created = provider.runner().has_netns(&names.fabric_namespace());
+    env.take_runner_back(provider);
+    env.cleanup();
+    if err.is_ok() {
+        return Err(FabricError::Invalid(
+            "a plan with a port-0 peer endpoint was accepted".to_string(),
+        ));
+    }
+    if ns_created {
+        return Err(FabricError::Invalid(
+            "an invalid plan must fail before any state is created".to_string(),
+        ));
+    }
     Ok(())
 }
 

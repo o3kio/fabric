@@ -141,10 +141,13 @@ Frame path for a tenant frame from host A to host B:
 
 **MTU layering.** The plan validates `tenant_mtu + 50 (VXLAN_OVERHEAD_BYTES)
 ≤ fabric_mtu` and `tenant_mtu ≥ 576 (MIN_TENANT_MTU)`; `MAX_MTU` is 65535.
-The VXLAN device, bridge, and both veth ends carry `tenant_mtu`; the WG
-interface carries `fabric_mtu` — specifically the **maximum live
+The VXLAN device and both veth ends carry `tenant_mtu` (the learning bridge's
+own MTU is not set — it never gates delivery between tenant-MTU ports); the
+WG interface carries `fabric_mtu` — specifically the **maximum live
 `fabric_mtu` across applied networks, re-asserted every apply and never
-shrunk below it** (shrinking would black-hole existing networks). The
+shrunk below it** (shrinking would black-hole existing networks; after the
+last high-MTU network is removed, the next apply re-converges downward
+safely). The
 outermost inequality is control-plane responsibility:
 `fabric_mtu + 60 (WIREGUARD_OVERHEAD_BYTES_IPV4; 80 for IPv6 outer) ≤
 underlay path MTU`. Golden worked example from the evidence gate: tenant
@@ -279,8 +282,9 @@ object is **foreign state** — rejected, never adopted, never deleted.
 ### 6.2 `ensure_fabric` — creation, healthy path, healing
 
 - **Create:** netns → wg created **in the root ns** (`ip link add … type
-  wireguard`) → `wg set` (private key **by file path**, listen port) → `ip
-  link set <wg> netns <fabric-ns>` → transport `/32` address → peer set →
+  wireguard`) → moved into the fabric ns (`ip link set <wg> netns
+  <fabric-ns>`) → `wg set` from inside the fabric ns (private key **by file
+  path**, listen port) → transport `/32` address → peer set →
   `fabric_mtu`. The pre-add journal claim (`fabric_creation_claimed`) closes
   the crash window between `ip link add` and the move.
 - **Healthy:** observe and verify identity (ns exists, wg present with the
@@ -313,9 +317,10 @@ Full rationale: [ADR-0002](adr/0002-runtime-socket-placement-verification.md).
   journal entry unconditionally. Never touches shared fabric objects or NAT
   state.
 - `remove_fabric_if_unused`: eligibility guards (no networks left, no plan
-  files) → **residue verification** (§8) → wg deletion → namespace deletion →
-  tolerant legacy cleanup → journal cleared. The private key intentionally
-  survives so control-plane records of the public key stay valid.
+  files) → **residue verification** (§8) → wg deletion → tolerant legacy
+  cleanup → namespace deletion → journal cleared. The private key
+  intentionally survives so control-plane records of the public key stay
+  valid.
 - Crash between any steps: the next operation re-observes, re-verifies, and
   converges — every deletion is idempotent (absent objects count as removed),
   and the journal is only rewritten after the deletions it describes have
@@ -420,7 +425,7 @@ teardown by design.
 | `ForeignState` (ambiguity) | WG-port listeners in *both* the fabric ns and root ns | Identify the fabric-ns listener's owner; remove it; re-apply (nothing was modified) |
 | `ForeignState` (fresh-host stray) | Owned-name collision on a host with an empty journal | The object predates this installation; adopt-by-name is forbidden — investigate and remove |
 | `Invalid` (plan) | Plan validation failed (including endpoint values) | Fix the control plane's plan compilation; nothing was touched |
-| Corrupt plan file | A truncated/corrupt `<state-root>/plans/<id>.json` makes **every** apply and `remove_network` fail closed (the whole state root must be readable to reconcile peer sets) | Inspect the named file; if it is unrecoverable, hand-delete that one plan file — the provider will re-converge from the next apply of that network. Do not delete healthy plans. |
+| Corrupt/invalid plan file | A truncated `<state-root>/plans/<id>.json`, or one that still parses but fails validation (hand-edit, bit-rot), makes **every** apply and `remove_network` fail closed (the whole state root must be readable *and valid* to reconcile peer sets) | Inspect the named file; if it is unrecoverable, hand-delete that one plan file — or re-apply that network with a corrected plan, which overwrites it — the provider re-converges. Do not delete healthy plans. |
 | `Command` (ss leg) | A socket-placement observation itself failed | Treat as unverified, not quiet; fix the tooling/environment and re-apply |
 | `Command` (general) | A kernel command failed | The error carries the command and stderr; journal-before-mutate bounds the half-applied window to idempotent re-apply |
 
@@ -452,10 +457,10 @@ posture the fabric forbids.
 
 | Layer | What it is | What it proves |
 |---|---|---|
-| Unit (`fabric-linux`, recorded fake kernel) | 78 tests against `RecordingRunner`, which models real kernel semantics (per-ns name tables, socket-creation placement, per-ns `ss`, one-instance `fdb del`, real error wording) | Every lifecycle path, heal slice, residue vector, and crash window at the behavior level |
+| Unit (`fabric-linux`, recorded fake kernel) | 79 tests against `RecordingRunner`, which models real kernel semantics (per-ns name tables, socket-creation placement, per-ns `ss`, one-instance `fdb del`, real error wording) | Every lifecycle path, heal slice, residue vector, and crash window at the behavior level |
 | `fabric-plan` | 20 tests | Input validation (including deserialized endpoint values) and fingerprinting |
-| `fabric-conformance` | 22-case suite (runs as one cargo test), executable via `run_suite()` | Provider behavior **modulo configuration** — consumers run it in CI at their pinned tag to re-verify that tag's behavior; it cannot exercise consumer integration or config choices |
-| Multi-host evidence (`evidence/run-multinode.sh`) | Three privileged containers, **41 assertions** per run, real ARP/ICMP/MACs/handshakes/captures | The fabric itself: the stretched L2 actually works, encrypted, and tears down without leaks |
+| `fabric-conformance` | 23-case suite (runs as one cargo test), executable via `run_suite()` | Provider behavior **modulo configuration** — consumers run it in CI at their pinned tag to re-verify that tag's behavior; it cannot exercise consumer integration or config choices |
+| Multi-host evidence (`evidence/run-multinode.sh`) | Three privileged containers, **35 assertions** per green run, real ARP/ICMP/MACs/handshakes/captures | The fabric itself: the stretched L2 actually works, encrypted, and tears down without leaks |
 
 New behavioral tests must genuinely fail against pre-fix code (hybrid
 worktree verification, documented in the commits); coverage pins are declared
