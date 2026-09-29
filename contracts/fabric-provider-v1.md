@@ -36,10 +36,16 @@ attachment, VNI binding allocation, placement, FIPs, lifecycle.
 
 1. The sole input is a validated `StretchedL2Plan` (see `fabric-plan`).
    Plans are serde-serializable, versioned by generation numbers, and carry
-   a SHA-256 content fingerprint. Plan deserialization is strict:
-   unknown fields are rejected (`deny_unknown_fields` on the plan, peer,
-   and endpoint types), so a control plane compiling against a newer plan
-   schema fails loudly instead of silently dropping fields. The peer list
+   a SHA-256 content fingerprint (recorded in the ownership journal as
+   ground truth; never compared for change detection — idempotency is
+   re-assertive, §3.2). Plan deserialization is strict, where "strict"
+   means exactly: unknown fields are rejected (`deny_unknown_fields` on
+   the plan, peer, and endpoint types), so a control plane compiling
+   against a newer plan schema fails loudly instead of silently dropping
+   fields; and **values are validated by `validate()`**, which must run
+   before realization — including endpoint values (non-empty host, no
+   whitespace/control characters, nonzero port) on both the parsed and
+   the deserialized path. The peer list
    must not contain duplicate public keys — peers are keyed by public key
    during realization, and a duplicate would silently drop a peer from the
    WireGuard set.
@@ -474,7 +480,8 @@ WireGuard socket placement — the per-namespace listening-socket dumps of
 `iptables -D`, and counting fdb entries), so a permissive provider flow
 fails the suite rather than silently passing.
 
-The privileged multi-host gate (three real hosts on one kernel, real
+The privileged multi-host gate (three privileged host instances —
+containers — on one physical kernel: real
 WireGuard handshakes, cross-host L2 and near-MTU tenant traffic,
 cleartext underlay capture proving encryption, per-host assertion that
 the WireGuard UDP socket listens in the ROOT namespace (`ss -uln` in

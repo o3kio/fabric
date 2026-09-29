@@ -7,7 +7,7 @@ locations to the same VLAN: VMs in one network ARP and ping each other with
 real MACs, identically on the same hypervisor and across hypervisors.
 
 Status: **hardened provider, NAT-free underlay, green multi-host evidence
-gate.** The fake-kernel conformance suite and the 35-assertion multi-host
+gate.** The fake-kernel conformance suite and the 41-assertion multi-host
 evidence run (three real host instances — privileged containers on one
 physical kernel: real ARP/ICMP with real MACs, encrypted underlay,
 zero-leak teardown, WG socket in the root netns — the interface is
@@ -28,6 +28,8 @@ ownership fencing, fail-closed foreign-state rejection, and strict key
 hygiene. Normative sources:
 
 - [contracts/fabric-provider-v1.md](contracts/fabric-provider-v1.md) — the provider contract (this repo)
+- [docs/change-control.md](docs/change-control.md) — cross-implementation alignment: how this repo and its two consumers (O3K, CHV) change without drifting
+- [docs/design.md](docs/design.md) — the consolidated engineering design (explanatory; the contract wins on disagreement)
 - O3K [ADR-0186](https://github.com/o3kio/o3k/blob/main/docs/adr/ADR-0186-stretched-l2-edge-fabric-vxlan-her.md) / [SPEC-0049](https://github.com/o3kio/o3k/blob/main/docs/specs/SPEC-0049-stretched-l2-edge-fabric-v3.md)
 - CHV [ADR-021](https://github.com/kubedoio/chv/blob/main/docs/specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md)
 
@@ -35,10 +37,21 @@ hygiene. Normative sources:
 
 | Crate | Contents |
 |---|---|
-| `fabric-plan` | Portable, serde-serializable plan types: `Vni`, `PublicKey`, `FabricHostIdentity`, `FabricPeer`, `FabricVniBinding`, `StretchedL2Plan`, plan validation, SHA-256 fingerprint. No I/O. |
+| `fabric-plan` | Portable, serde-serializable plan types — **provider-employed**: `Vni`, `PublicKey`, `FabricPeer`, `StretchedL2Plan`, plan validation, SHA-256 fingerprint; **control-plane contract vocabulary** (agreed shapes both products build from, not exercised by the provider): `FabricHostIdentity`, `FabricVniBinding`/`BindingState`, the MTU constants/helpers, `validate_endpoint`/`validate_public_key`. No I/O. |
 | `fabric-linux` | The Linux provider: `FabricCommand` runner seam (+ real subprocess runner and a recorded fake-kernel runner), deterministic IFNAMSIZ-safe naming, WireGuard key hygiene, ownership/plan journals, `LinuxFabricProvider` (`apply_plan` / `remove_network` / `remove_fabric_if_unused`). |
-| `fabric-conformance` | The shared anti-drift conformance suite both products run in CI. |
+| `fabric-conformance` | The shared anti-drift conformance suite — consumers run `run_suite()` in their CI at their pinned tag; it proves provider behavior modulo configuration. |
 | `fabric-evidence` | Privileged per-host evidence binary for the multi-host gate (`evidence/run-multinode.sh`): identity/apply/tenant-up/probe/neighbors/teardown/leak-check against the real provider. |
+
+## Documentation map
+
+| Document | What it is |
+|---|---|
+| [`contracts/fabric-provider-v1.md`](contracts/fabric-provider-v1.md) | **Normative** provider contract (behavioral invariants) |
+| [`docs/design.md`](docs/design.md) | The consolidated engineering design: kernel shape, datapath, underlay (ADR-0001), lifecycle state machines, journals, migration, security model, failure-mode runbook, limits, evidence scope |
+| [`docs/change-control.md`](docs/change-control.md) | **Normative** cross-implementation alignment: the doc hierarchy, change classes A–D, hard rules for O3K and CHV, versioning/skew, escalation |
+| [`docs/adr/`](docs/adr/README.md) | Fabric decision records (ADR-0001 underlay redesign, ADR-0002 socket-placement verification) |
+| [`evidence/README.md`](evidence/README.md) | The multi-host evidence gate: what it proves, how to run it, honest limitations |
+| [`AGENTS.md`](AGENTS.md) | Working rules for code agents in this repo |
 
 ## What is shared — and what is not
 
@@ -91,11 +104,12 @@ Workspace lints: `unsafe_code` forbidden; `clippy::unwrap_used`,
 
 ## Multi-host evidence
 
-The privileged evidence gate (three hosts, real WireGuard handshakes,
-cross-host ARP/ping with real MACs, encrypted-underlay capture, zero-leak
-teardown) lives in [`evidence/`](evidence/README.md) — see
-`evidence/run-multinode.sh`. It is required before any production evidence
-claim.
+The privileged evidence gate (three privileged host instances — containers —
+on one physical kernel: real WireGuard handshakes, cross-host ARP/ping with
+real MACs, encrypted-underlay capture, zero-leak teardown) lives in
+[`evidence/`](evidence/README.md) — see `evidence/run-multinode.sh`. It is
+required before any production evidence claim. Cross-machine runs over real
+networks remain the final production gate.
 
 ## Releasing
 

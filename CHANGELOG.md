@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.1.3] - 2026-09-29
+### Documentation program — design doc, cross-implementation change control, fabric ADRs
+- **`docs/design.md`** — the consolidated engineering design (explanatory;
+  the contract remains normative): kernel-object inventory with exact names
+  and paths, tenant datapath and MTU layering (with the evidence gate's
+  golden arithmetic), the NAT-free underlay, plan model, the authoritative
+  apply/teardown orderings, the three-way socket discriminator, journals,
+  migration semantics, security model, a failure-mode → operator-remediation
+  table (including the corrupt-plan-journal blast radius and its manual
+  remediation, previously undocumented), stated limitations (incl. host-image
+  binary/module requirements), evidence claims and scope, and the pinned
+  per-product configuration values (prefixes `o3k`/`chv`/`ev`, WG port
+  policy, single-tag fleet policy).
+- **`docs/change-control.md`** — normative cross-implementation alignment:
+  the six-layer normative hierarchy, change classes A–D with their required
+  processes, eight hard rules for both consumers (no forking, no touching
+  fabric kernel state, no contract reinterpretation, no consumer-private
+  knobs, shared vocabulary, upstream-first, conformance as the shared gate),
+  versioning/skew/fleet policy, stability commitments for contract v1, and
+  escalation rules — the design does not bend to either product's local
+  goals.
+- **`docs/adr/`** — fabric decision records: ADR-0001 (NAT-free
+  root-terminated transport, with the two-race postmortem), ADR-0002
+  (runtime socket-placement verification and the three-way discriminator),
+  plus the index/format README.
+- **Contract §2.1** now defines exactly what "strict deserialization"
+  means (unknown fields reject at deserialization; values — including
+  endpoint values on the deserialized path — validated by `validate()`),
+  and states that the plan fingerprint is recorded ground truth, never
+  compared for change detection.
+- **Documentation cohesion fixes (comprehensive-review findings D1–D6):**
+  `fabric-conformance`'s crate docs no longer claim a nonexistent
+  KVM/libvirt harness or an "executable suite" — it is the shared
+  anti-drift suite proving provider behavior modulo configuration,
+  runnable by consumers at their pinned tag; the evidence gate is
+  described identically everywhere (three privileged host instances —
+  containers — on one physical kernel); the README's assertion count is
+  corrected to 41; the crate table distinguishes provider-employed types
+  from control-plane contract vocabulary; `AGENTS.md` gains the evidence
+  gate's contract of record (who runs it, results never committed, what a
+  release consumes) and the documentation-discipline section.
+- **Keypair wording fixed (review S4):** one keypair **per host** (the key
+  file is not domain-keyed; a host runs at most one fabric) — code and
+  docs now agree.
+
+### Fixed
+- **Endpoint value validation on the deserialized path (review S1).**
+  `UnderlayEndpoint::parse` validated host non-empty / no whitespace or
+  control characters / nonzero port, but serde deserialization bypassed
+  `parse`, so a plan JSON with `"underlay_endpoint": {"host": "", "port":
+  0}` passed `StretchedL2Plan::validate()` and only failed later at the
+  checked `wg set peer … endpoint`, after the plan had been journaled.
+  Value rules now live in `UnderlayEndpoint::validate()` (single source of
+  truth; `parse` delegates) and are enforced by `FabricPeer::validate()`
+  and `FabricHostIdentity::validate()`. New regression tests
+  `deserialized_endpoint_values_fail_peer_validation` and
+  `deserialized_plan_with_invalid_endpoint_values_fails_validation`,
+  verified to fail against v0.1.2 (9082ff9) in a throwaway worktree.
+
 ## [0.1.2] - 2026-09-28
 ### Production-impacting fix — upgrade required
 - **Deterministic NAT-free underlay.** The WireGuard interface is now created
