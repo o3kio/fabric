@@ -36,9 +36,10 @@ path races with WireGuard's own endpoint roaming.**
 ## Decision
 
 Remove the NAT machinery entirely. The WireGuard interface is created in the
-**root** namespace (`ip link add … type wireguard`, `wg set … private-key
-<path> listen-port …`) and then moved into the fabric namespace — so its UDP
-socket, bound in the creating namespace, lives in the root ns. Outbound
+**root** namespace (`ip link add … type wireguard`), moved into the fabric
+namespace (`ip link set … netns`), and only then configured from inside the
+fabric ns (`wg set … private-key <path> listen-port …`) — so its UDP socket,
+bound in the creating namespace, lives in the root ns. Outbound
 transport rides normal host routing; inbound transport is delivered directly
 to the root-ns listener. The veth pair, DNAT, MASQ, and the 169.254.253.0/30
 attachment are gone. Everything tenant-facing (VXLAN, learning bridge, veth

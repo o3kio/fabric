@@ -388,6 +388,13 @@ Legacy hosts carry the v0.1.x NAT underlay: a host↔fabric veth pair
   strings; a real kernel that renders `-S` differently would fail closed
   (loud, hand-remediable) rather than mis-delete. The multi-node evidence
   environment never exercises this path (fresh hosts carry no legacy rules).
+- One migration residual, for completeness: journals are re-validated on
+  read (§11), and the only theoretical way a converged old journal could
+  fail current validation is an endpoint value old code realized without
+  the real `wg` tool rejecting it (e.g. port 0 — the S1 analysis holds this
+  impossible, but nothing in this repo pins real-wireguard-tools behavior).
+  Such a journal fails closed on read with the §11 remediation (re-apply
+  the corrected plan, or delete the file) — contained, never a wedge.
 
 ## 9. Identity and key hygiene
 
@@ -425,7 +432,7 @@ teardown by design.
 | `ForeignState` (ambiguity) | WG-port listeners in *both* the fabric ns and root ns | Identify the fabric-ns listener's owner; remove it; re-apply (nothing was modified) |
 | `ForeignState` (fresh-host stray) | Owned-name collision on a host with an empty journal | The object predates this installation; adopt-by-name is forbidden — investigate and remove |
 | `Invalid` (plan) | Plan validation failed (including endpoint values) | Fix the control plane's plan compilation; nothing was touched |
-| Corrupt/invalid plan file | A truncated `<state-root>/plans/<id>.json`, or one that still parses but fails validation (hand-edit, bit-rot), makes **every** apply and `remove_network` fail closed (the whole state root must be readable *and valid* to reconcile peer sets) | Inspect the named file; if it is unrecoverable, hand-delete that one plan file — or re-apply that network with a corrected plan, which overwrites it — the provider re-converges. Do not delete healthy plans. |
+| Corrupt/invalid plan file | A truncated `<state-root>/plans/<id>.json`, or one that still parses but fails validation (hand-edit, bit-rot), fails **every apply and `remove_network` of any other network** closed (the whole state root must be readable *and valid* to reconcile peer sets). Removing the **offending** network itself still succeeds — it deletes its plan file before the reconciliation read, which is a natural recovery path. | Inspect the named file; if it is unrecoverable, hand-delete that one plan file — or re-apply that network with a corrected plan, which overwrites it — the provider re-converges. Do not delete healthy plans. |
 | `Command` (ss leg) | A socket-placement observation itself failed | Treat as unverified, not quiet; fix the tooling/environment and re-apply |
 | `Command` (general) | A kernel command failed | The error carries the command and stderr; journal-before-mutate bounds the half-applied window to idempotent re-apply |
 

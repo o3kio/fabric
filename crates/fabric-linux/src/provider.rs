@@ -1720,8 +1720,9 @@ mod tests {
     /// (contract §2.1's blanket "values validated before realization"
     /// holds on the journal-read path too). Pre-fix: the apply of the
     /// OTHER network succeeded and the invalid values silently drove
-    /// peer/MTU realization. Verified to fail against dd66b1e's parent
-    /// line (live_plans pushed deserialized plans without validation).
+    /// peer/MTU realization. Verified to fail against dd66b1e (the
+    /// pre-fix commit — live_plans pushed deserialized plans without
+    /// validation).
     #[test]
     fn apply_fails_closed_on_parseable_but_invalid_plan_journal()
     -> Result<(), Box<dyn std::error::Error>> {
