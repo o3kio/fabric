@@ -52,6 +52,7 @@ version = "0.1.4"
 dependencies = [
  "fabric-linux",
  "fabric-plan",
+ "serde_json",
 ]
 
 [[package]]

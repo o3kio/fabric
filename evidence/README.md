@@ -105,15 +105,21 @@ JSON, `wg show`, tcpdump text captures) plus a binary pcap in the workdir
   CHV qualification session's cleanup deleted every host bridge matching
   `chvbr0|br-*` — which includes docker's per-network bridges — mid-run,
   twice. Both affected evidence runs are preserved: `results/
-  20260928T175355Z/` (failed 17:54:06; **pre-NAT-free code** — its socket
+  20260928T175355Z/` (**pre-NAT-free code** — its socket
   assertions are the old `wg_socket_in_fabric_ns_*` and its container
-  diagnostics show the legacy DNAT/MASQ rules) and `results/
-  20260928T185004Z/` (failed 18:50:33 at `bum_arp_reflooded`; NAT-free
-  code with a healthy fabric up to the blackout). Both failed with an
+  diagnostics show the legacy DNAT/MASQ rules; its recorded failure
+  details latch 17:54:59–17:55:12, and the 17:54:06 bridge-down kernel
+  timestamp quoted during the incident came from the host journal, which
+  is not preserved in the repo) and `results/
+  20260928T185004Z/` (failed at `bum_arp_reflooded`; NAT-free
+  code with a healthy fabric up to the blackout; its ARP monitors run
+  18:50:11–18:51:21). Both failed with an
   identical signature: all bridge ports `entered disabled state` in the
   kernel journal at the same second, after which every host's root-ns ARP
   for its peers went unanswered (requests leave each container, nothing
-  arrives anywhere — captured per-host by `arp-monitor-h*.txt`). This is
+  arrives anywhere — captured per-host by `arp-monitor-h*.txt` in the
+  NAT-free run; the pre-NAT-free run's equivalent output is embedded in
+  its recorded assertion-failure details). This is
   external interference, not a fabric defect: the fabric's underlay depends
   on host bridge forwarding, as does any container networking. (The full
   run history is preserved under `results/`: the 16:36/16:47 failures are

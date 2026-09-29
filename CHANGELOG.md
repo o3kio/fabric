@@ -13,7 +13,7 @@
   `ensure_fabric` guarantees the link). Regression test
   `remove_network_converges_when_netns_present_but_wireguard_absent` and
   conformance case `remove_network_converges_when_wireguard_link_absent`
-  (24 cases now); the unit test verified to fail against v0.1.3 (47dca16)
+  (25 cases now, with the round-2 key-shape case); the unit test verified to fail against v0.1.3 (47dca16)
   in a throwaway worktree (pre-fix: `Err(Command … wg set …)`). Contract
   §3.8 and design.md §6.1/§6.4 amended in the same change.
 - **Public-key shape is validated, not just length (F-3).** A
@@ -26,6 +26,17 @@
   44-character string that the new validation would reject). Regression
   test `public_key_rejects_non_base64_shapes`, verified to fail against
   v0.1.3. Contract §2.1's "values are validated" enumeration extended.
+  **Round 2 closed the deserialized half of the gap** (the S1 pattern,
+  byte-for-byte): `PublicKey` is `serde(transparent)`, so deserialization
+  bypasses `new` — a plan JSON carrying a 44-char non-base64 key passed
+  `validate()` and reached `wg set` after journaling. `PublicKey::
+  validate()` is now the single shape authority (delegated to by `new`)
+  and is re-run by `FabricPeer::validate()` and
+  `FabricHostIdentity::validate()`. Regression test
+  `deserialized_public_key_shape_fails_peer_validation` (verified to
+  fail against the round-1 commit bd4cf53) and conformance case
+  `plan_validation_rejects_non_base64_public_keys` (25 cases now) pin
+  the deserialized path.
 - **The private-key publish never replaces an existing destination
   (F-4).** `atomic_write_private` used `fs::rename`, which silently
   clobbers a key file that appears between the caller's `exists()` check

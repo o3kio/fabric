@@ -1,6 +1,6 @@
 # The Kubedo Stretched-L2 Fabric — Design Document
 
-Status: Accepted · Applies to: fabric v0.1.3 (`fabric-plan`/`fabric-linux`/`fabric-conformance`) · Maintained in this repository
+Status: Accepted · Applies to: fabric v0.1.4 (`fabric-plan`/`fabric-linux`/`fabric-conformance`) · Maintained in this repository
 
 This document is the consolidated **engineering design** of the shared
 stretched-L2 fabric: what it builds in the host kernel, why it is built that
@@ -224,8 +224,10 @@ local host, network) triple:
 | `plan_generation` | monotonic, fences stale plans |
 
 "Strict" means exactly (contract §2.1): unknown fields reject at
-deserialization, and **values** — including endpoint values on the
-deserialized path — are validated by `validate()`, which must run before
+deserialization, and **values** — including endpoint values and public-key
+shape, on the deserialized path as well as the parsed path (serde bypasses
+the `parse`/`new` constructors) — are validated by `validate()`, which must
+run before
 realization. The provider additionally computes a SHA-256 fingerprint over
 the canonical serialization and records it in the journal; the fingerprint is
 **ground truth, never compared** — idempotency is re-assertive, not
@@ -473,8 +475,8 @@ posture the fabric forbids.
 | Layer | What it is | What it proves |
 |---|---|---|
 | Unit (`fabric-linux`, recorded fake kernel) | 81 tests against `RecordingRunner`, which models real kernel semantics (per-ns name tables, socket-creation placement, per-ns `ss`, one-instance `fdb del`, real error wording, base64-shaped pubkey derivation) | Every lifecycle path, heal slice, residue vector, and crash window at the behavior level |
-| `fabric-plan` | 21 tests | Input validation (including deserialized endpoint values and public-key shape) and fingerprinting |
-| `fabric-conformance` | 24-case suite (runs as one cargo test), executable via `run_suite()` | Provider behavior **modulo configuration** — consumers run it in CI at their pinned tag to re-verify that tag's behavior; it cannot exercise consumer integration or config choices |
+| `fabric-plan` | 22 tests | Input validation (including deserialized endpoint values and public-key shape) and fingerprinting |
+| `fabric-conformance` | 25-case suite (runs as one cargo test), executable via `run_suite()` | Provider behavior **modulo configuration** — consumers run it in CI at their pinned tag to re-verify that tag's behavior; it cannot exercise consumer integration or config choices |
 | Multi-host evidence (`evidence/run-multinode.sh`) | Three privileged containers, **41 assertions** per green run (every teardown step — tenant-down, teardown, fabric-down, leak-check — is positively recorded, not just failure-asserted), real ARP/ICMP/MACs/handshakes/captures | The fabric itself: the stretched L2 actually works, encrypted, and tears down without leaks |
 
 New behavioral tests must genuinely fail against pre-fix code (hybrid

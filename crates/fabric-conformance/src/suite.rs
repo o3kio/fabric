@@ -103,6 +103,10 @@ fn cases() -> Vec<(String, Case)> {
             case_remove_network_converges_without_wireguard,
         ),
         (
+            "plan_validation_rejects_non_base64_public_keys".to_string(),
+            case_public_key_shape_validation,
+        ),
+        (
             "apply_creates_expected_kernel_objects".to_string(),
             case_apply_creates,
         ),
@@ -261,6 +265,41 @@ fn case_endpoint_value_validation() -> Result<(), FabricError> {
     if err.is_ok() {
         return Err(FabricError::Invalid(
             "a plan with a port-0 peer endpoint was accepted".to_string(),
+        ));
+    }
+    if ns_created {
+        return Err(FabricError::Invalid(
+            "an invalid plan must fail before any state is created".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Contract §2.1: public-key shape is validated on the deserialized
+/// path too — serde bypasses `PublicKey::new`, so the re-check must live
+/// in `validate()`. A plan whose peer key is 44 non-base64 characters
+/// must be rejected by `apply_plan` before any state is created (review
+/// loop round 2).
+fn case_public_key_shape_validation() -> Result<(), FabricError> {
+    let mut env = CaseEnv::new("key-shape")?;
+    let plan = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    // Round-trip through JSON with a corrupted peer public key — the
+    // deserialized path, which bypasses `PublicKey::new`.
+    let mut value = serde_json::to_value(&plan).map_err(|e| FabricError::Invalid(e.to_string()))?;
+    value["peers"][0]["public_key"] = serde_json::json!(format!("{}=", "!".repeat(43)));
+    let plan: StretchedL2Plan =
+        serde_json::from_value(value).map_err(|e| FabricError::Invalid(e.to_string()))?;
+
+    let mut provider = env.provider()?;
+    let err = provider.apply_plan(&plan);
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns_created = provider.runner().has_netns(&names.fabric_namespace());
+    env.take_runner_back(provider);
+    env.cleanup();
+    if err.is_ok() {
+        return Err(FabricError::Invalid(
+            "a plan with a non-base64 peer public key was accepted".to_string(),
         ));
     }
     if ns_created {
