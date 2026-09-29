@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-conformance"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "fabric-linux",
  "fabric-plan",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-evidence"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "fabric-linux",
  "fabric-plan",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-linux"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "fabric-plan",
  "serde",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "fabric-plan"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
