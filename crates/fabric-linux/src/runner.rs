@@ -957,11 +957,11 @@ fn cannot_find_device(name: &str) -> CommandOutput {
     command_error(&format!("Cannot find device \"{name}\""))
 }
 
-/// Deterministic base64 public key for the fake kernel: derived from the
-/// private-key material's LENGTH (so keys of different lengths derive
-/// different public keys; equal-length materials deliberately collide —
-/// the fake models `wg pubkey` succeeding, not its one-way function),
-/// and always valid under `fabric_plan::PublicKey::new` (43 alphabet
+/// Deterministic base64 public key for the fake kernel: a function of
+/// the private-key material's LENGTH modulo 64 — so all realistic
+/// 44-character materials deliberately collide on one fake key (the
+/// fake models `wg pubkey` succeeding, not its one-way function) — and
+/// always valid under `fabric_plan::PublicKey::new` (43 alphabet
 /// characters plus one trailing '=' pad).
 fn fake_public_key(private_material: &str) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
