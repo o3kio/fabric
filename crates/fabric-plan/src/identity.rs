@@ -67,26 +67,49 @@ impl UnderlayEndpoint {
         let (host, port) = raw
             .rsplit_once(':')
             .ok_or_else(|| PlanError::Invalid(format!("endpoint {raw:?} is not host:port")))?;
-        if host.is_empty() {
-            return Err(PlanError::Invalid(format!(
-                "endpoint {raw:?} has an empty host"
-            )));
-        }
-        if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err(PlanError::Invalid(format!(
-                "endpoint {raw:?} host contains whitespace or control characters"
-            )));
-        }
         let port: u16 = port
             .parse()
             .map_err(|_| PlanError::Invalid(format!("endpoint {raw:?} has an invalid port")))?;
-        if port == 0 {
-            return Err(PlanError::Invalid(format!("endpoint {raw:?} has port 0")));
-        }
-        Ok(Self {
+        let endpoint = Self {
             host: host.to_string(),
             port,
-        })
+        };
+        // Value rules live in `validate` (single source of truth) so the
+        // serde deserialization path enforces exactly the same rules.
+        endpoint.validate()?;
+        Ok(endpoint)
+    }
+
+    /// Validate the endpoint's values.
+    ///
+    /// `serde` deserialization does not run [`Self::parse`], so these value
+    /// rules are re-checked wherever a deserialized endpoint enters a
+    /// validated structure ([`FabricPeer::validate`],
+    /// [`FabricHostIdentity::validate`]). Without this, a plan JSON with an
+    /// empty host or port 0 passed `StretchedL2Plan::validate()` and only
+    /// failed later at the WireGuard command layer, after the plan had
+    /// been journaled (review finding S1).
+    pub fn validate(&self) -> Result<(), PlanError> {
+        if self.host.is_empty() {
+            return Err(PlanError::Invalid(
+                "endpoint host must not be empty".to_string(),
+            ));
+        }
+        if self
+            .host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(PlanError::Invalid(
+                "endpoint host must not contain whitespace or control characters".to_string(),
+            ));
+        }
+        if self.port == 0 {
+            return Err(PlanError::Invalid(
+                "endpoint port must not be 0".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -136,6 +159,10 @@ impl FabricPeer {
     /// Validate this peer record.
     pub fn validate(&self) -> Result<(), PlanError> {
         validate_identifier("peer host_id", &self.host_id)?;
+        // Endpoints can arrive deserialized (serde bypasses
+        // `UnderlayEndpoint::parse`), so their value rules are re-checked
+        // here — review finding S1.
+        self.underlay_endpoint.validate()?;
         if self.fabric_transport_ip.is_unspecified() {
             return Err(PlanError::Invalid(
                 "peer fabric transport IP must not be unspecified".to_string(),
@@ -149,6 +176,9 @@ impl FabricHostIdentity {
     /// Validate this host identity.
     pub fn validate(&self) -> Result<(), PlanError> {
         validate_identifier("host_id", &self.host_id)?;
+        // Same S1 rule as FabricPeer: deserialized endpoints are value-
+        // validated here, not only at parse time.
+        self.underlay_endpoint.validate()?;
         if self.fabric_transport_ip.is_unspecified() {
             return Err(PlanError::Invalid(
                 "fabric transport IP must not be unspecified".to_string(),
@@ -221,6 +251,48 @@ mod tests {
         );
         assert!(UnderlayEndpoint::parse("host:0").is_err(), "port 0");
         assert!(UnderlayEndpoint::parse("203.0.113.7:1").is_ok());
+    }
+
+    /// Review finding S1: serde deserialization bypasses
+    /// `UnderlayEndpoint::parse`, so a peer (or plan) built from JSON with
+    /// an empty host, whitespace host, or port 0 must be caught by
+    /// `FabricPeer::validate()` — previously it passed validation and only
+    /// failed later at the WireGuard command layer, after the plan had
+    /// been journaled. Every assertion below fails against pre-fix code.
+    #[test]
+    fn deserialized_endpoint_values_fail_peer_validation() -> Result<(), PlanError> {
+        let base = serde_json::json!({
+            "host_id": "host-02",
+            "public_key": "K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=",
+            "fabric_transport_ip": "198.18.0.2"
+        });
+        for (label, endpoint) in [
+            ("empty host", serde_json::json!({"host": "", "port": 65001})),
+            (
+                "whitespace host",
+                serde_json::json!({"host": "bad host", "port": 65001}),
+            ),
+            (
+                "port 0",
+                serde_json::json!({"host": "203.0.113.7", "port": 0}),
+            ),
+        ] {
+            let mut value = base.clone();
+            value["underlay_endpoint"] = endpoint;
+            let peer: FabricPeer =
+                serde_json::from_value(value).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+            assert!(
+                peer.validate().is_err(),
+                "{label}: a deserialized endpoint must fail validation, not the command layer"
+            );
+        }
+        // Sanity: a well-formed deserialized endpoint still validates.
+        let mut value = base;
+        value["underlay_endpoint"] = serde_json::json!({"host": "203.0.113.7", "port": 65001});
+        let peer: FabricPeer =
+            serde_json::from_value(value).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        peer.validate()?;
+        Ok(())
     }
 
     #[test]

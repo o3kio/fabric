@@ -39,7 +39,38 @@ the product repos; the executable contract lives here:
 
 - Unit + conformance tests here run unprivileged against the recorded fake
   kernel (`RecordingRunner`).
-- Privileged multi-host evidence (three real hosts, real WireGuard
-  handshakes, cleartext-underlay capture, zero-leak teardown) lives in
+- Privileged multi-host evidence (three privileged host instances —
+  containers — on one physical kernel: real WireGuard handshakes,
+  cleartext-underlay capture, zero-leak teardown) lives in
   `evidence/run-multinode.sh`. It is required before any production
   evidence claim; do not fake it.
+
+## Evidence gate — contract of record
+
+- **Who runs it:** the fabric maintainer, on a quiesced orchestrator host
+  (no parallel bridge lifecycle churn — see `evidence/README.md` →
+  Limitations for the interference attribution recipe), before tagging a
+  release whose diff touches the datapath, underlay, or teardown.
+- **Where results live:** `evidence/results/<timestamp>/` — git-ignored by
+  design (they can contain environment detail); the release record is the
+  PR description + CHANGELOG entry stating the run's outcome and the
+  commit it ran on. Do not commit results.
+- **What a release consumes:** a green 10-run acceptance loop (or a
+  failure root-caused as external interference, per the recipe) on the
+  exact release commit, stated in the release PR. CI does not and cannot
+  run the gate (privileged docker); absence of a gate run in CI is not
+  evidence of absence of a run.
+- **Honesty rule:** state the evidence scope exactly as
+  `evidence/README.md` → Limitations does (one physical kernel; not
+  geographic distance, NIC heterogeneity, or real-internet path MTU;
+  cross-machine runs remain the final production gate).
+
+## Documentation discipline
+
+- `docs/design.md` (design details), `docs/change-control.md`
+  (cross-implementation alignment and change classes), and `docs/adr/`
+  (provider decision records) are normative-adjacent: update them in the
+  same change as any behavior they describe, and classify changes per
+  `docs/change-control.md` in the PR description.
+- Never weaken the contract to make code or docs agree — fix whichever is
+  wrong, contract first if behavior must change.

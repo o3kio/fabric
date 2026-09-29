@@ -284,4 +284,26 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Review finding S1, plan level: a plan deserialized from JSON with a
+    /// peer endpoint carrying an empty host or port 0 must fail
+    /// `validate()` — previously only unknown *fields* were rejected at
+    /// deserialization, endpoint *values* slipped through to the
+    /// WireGuard command layer after the plan was journaled. Fails
+    /// against pre-fix code.
+    #[test]
+    fn deserialized_plan_with_invalid_endpoint_values_fails_validation() -> Result<(), PlanError> {
+        let raw = plan()?;
+        let mut value =
+            serde_json::to_value(&raw).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        value["peers"][0]["underlay_endpoint"] =
+            serde_json::json!({"host": "198.51.100.1", "port": 0});
+        let deserialized: StretchedL2Plan =
+            serde_json::from_value(value).map_err(|e| PlanError::Fingerprint(e.to_string()))?;
+        assert!(
+            deserialized.validate().is_err(),
+            "a deserialized plan with a port-0 endpoint must fail validation"
+        );
+        Ok(())
+    }
 }

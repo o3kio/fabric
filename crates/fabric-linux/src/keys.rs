@@ -1,6 +1,8 @@
 //! WireGuard key hygiene.
 //!
-//! One keypair per host per fabric domain. The private key:
+//! One keypair per host (a host runs at most one fabric; the key file is
+//! not domain-keyed — see ADR-0001's one-fabric-per-port limitation). The
+//! private key:
 //!
 //! - is generated with `wg genkey` if absent, stored 0600 via atomic
 //!   create (temp file + rename) under the provider state root;
