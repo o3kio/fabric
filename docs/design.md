@@ -220,7 +220,7 @@ local host, network) triple:
 | `local_transport_ip` | this host's address inside the WG mesh; must be specified |
 | `vni` + `binding_generation` | the network's current VNI binding and its generation (VNI ∈ 1..=0x00ff_ffff; generation nonzero) |
 | `tenant_mtu`, `fabric_mtu` | MTU layering (§4.1) |
-| `peers` | bounded HER set; per peer: `host_id`, `public_key` (44-char base64), `underlay_endpoint` (non-empty host, no whitespace/control, nonzero port), `fabric_transport_ip`. No self entries; host IDs, transport IPs, and public keys each unique |
+| `peers` | bounded HER set; per peer: `host_id`, `public_key` (44 base64 chars: 43 alphabet characters + one trailing `'='`), `underlay_endpoint` (non-empty host, no whitespace/control, nonzero port), `fabric_transport_ip`. No self entries; host IDs, transport IPs, and public keys each unique |
 | `plan_generation` | monotonic, fences stale plans |
 
 "Strict" means exactly (contract §2.1): unknown fields reject at
@@ -266,7 +266,12 @@ validate plan → compute fingerprint
   3. ensure_fabric()                        (ns, wg create-in-root + move,
                                              identity verification, §6.2–6.3)
   4. configure_peers()                      (stale peer withdrawal, endpoints,
-                                             allowed-ips + /32 routes)
+                                             allowed-ips + /32 routes; skips
+                                             its wg/route commands when the
+                                             wg link is observed absent —
+                                             only reachable on the removal
+                                             path, since ensure_fabric
+                                             guarantees the link on apply)
   5. enforce_wireguard_mtu()                (max live fabric_mtu, never shrinks)
   6. ensure_network()                       (vxlan, bridge, veths, MTU,
                                              link up, flood reconcile §6.5)
@@ -315,7 +320,10 @@ Full rationale: [ADR-0002](adr/0002-runtime-socket-placement-verification.md).
 - `remove_network`: deletes only the journal-recorded per-network objects
   (vxlan, bridge, both veth ends, flood entries), then drops the plan and
   journal entry unconditionally. Never touches shared fabric objects or NAT
-  state.
+  state. Peer reconciliation observes the WireGuard link and **skips** its
+  wg/route commands when the link is absent (module unload, operator
+  deletion, partial teardown) — failing there would wedge the removal
+  after the journals were already dropped.
 - `remove_fabric_if_unused`: eligibility guards (no networks left, no plan
   files) → **residue verification** (§8) → wg deletion → tolerant legacy
   cleanup → namespace deletion → journal cleared. The private key
@@ -464,10 +472,10 @@ posture the fabric forbids.
 
 | Layer | What it is | What it proves |
 |---|---|---|
-| Unit (`fabric-linux`, recorded fake kernel) | 79 tests against `RecordingRunner`, which models real kernel semantics (per-ns name tables, socket-creation placement, per-ns `ss`, one-instance `fdb del`, real error wording) | Every lifecycle path, heal slice, residue vector, and crash window at the behavior level |
-| `fabric-plan` | 20 tests | Input validation (including deserialized endpoint values) and fingerprinting |
-| `fabric-conformance` | 23-case suite (runs as one cargo test), executable via `run_suite()` | Provider behavior **modulo configuration** — consumers run it in CI at their pinned tag to re-verify that tag's behavior; it cannot exercise consumer integration or config choices |
-| Multi-host evidence (`evidence/run-multinode.sh`) | Three privileged containers, **35 assertions** per green run, real ARP/ICMP/MACs/handshakes/captures | The fabric itself: the stretched L2 actually works, encrypted, and tears down without leaks |
+| Unit (`fabric-linux`, recorded fake kernel) | 81 tests against `RecordingRunner`, which models real kernel semantics (per-ns name tables, socket-creation placement, per-ns `ss`, one-instance `fdb del`, real error wording, base64-shaped pubkey derivation) | Every lifecycle path, heal slice, residue vector, and crash window at the behavior level |
+| `fabric-plan` | 21 tests | Input validation (including deserialized endpoint values and public-key shape) and fingerprinting |
+| `fabric-conformance` | 24-case suite (runs as one cargo test), executable via `run_suite()` | Provider behavior **modulo configuration** — consumers run it in CI at their pinned tag to re-verify that tag's behavior; it cannot exercise consumer integration or config choices |
+| Multi-host evidence (`evidence/run-multinode.sh`) | Three privileged containers, **41 assertions** per green run (every teardown step — tenant-down, teardown, fabric-down, leak-check — is positively recorded, not just failure-asserted), real ARP/ICMP/MACs/handshakes/captures | The fabric itself: the stretched L2 actually works, encrypted, and tears down without leaks |
 
 New behavioral tests must genuinely fail against pre-fix code (hybrid
 worktree verification, documented in the commits); coverage pins are declared

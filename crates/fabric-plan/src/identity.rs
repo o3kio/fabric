@@ -10,14 +10,21 @@ use crate::PlanError;
 /// A WireGuard public key.
 ///
 /// Public keys are safe to distribute through authenticated control-plane
-/// state. The [`fmt::Debug`] implementation is intentionally terse so key
-/// material never renders verbosely in logs.
+/// state; they are not secret, so both [`fmt::Display`] and [`fmt::Debug`]
+/// render the full key to aid operator debugging.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PublicKey(String);
 
 impl PublicKey {
     /// Wrap a base64-encoded WireGuard public key.
+    ///
+    /// A WireGuard public key is the standard base64 encoding of exactly
+    /// 32 bytes: 44 characters — 43 from the base64 alphabet plus one
+    /// trailing `'='` pad. Length alone is not enough (review loop F-3):
+    /// a 44-character non-base64 string would otherwise pass validation
+    /// and only fail later at the `wg set` command layer, after the plan
+    /// had been journaled.
     pub fn new(key: impl Into<String>) -> Result<Self, PlanError> {
         let key = key.into();
         if key.trim().is_empty() {
@@ -30,6 +37,17 @@ impl PublicKey {
                 "public key must be 44 base64 characters, got {}",
                 key.len()
             )));
+        }
+        let bytes = key.as_bytes();
+        let data_malformed = bytes[..43]
+            .iter()
+            .any(|&b| !b.is_ascii_alphanumeric() && b != b'+' && b != b'/');
+        if data_malformed || bytes[43] != b'=' {
+            return Err(PlanError::Invalid(
+                "public key must be 44 base64 characters: 43 alphabet \
+                 characters plus one trailing '='"
+                    .to_string(),
+            ));
         }
         Ok(Self(key))
     }
@@ -227,6 +245,31 @@ mod tests {
     fn public_key_rejects_wrong_length() {
         assert!(PublicKey::new("short").is_err());
         assert!(PublicKey::new("").is_err());
+    }
+
+    /// Review loop F-3: length alone is not a base64 check. All of these
+    /// are exactly 44 characters; none is a valid WireGuard public-key
+    /// encoding. Every assertion fails against pre-fix code, which
+    /// accepted any 44-character string and only failed later at the
+    /// `wg set` command layer.
+    #[test]
+    fn public_key_rejects_non_base64_shapes() {
+        let non_alphabet = format!("{}=", "!".repeat(43));
+        assert!(
+            PublicKey::new(non_alphabet).is_err(),
+            "non-alphabet characters must fail validation"
+        );
+        assert!(
+            PublicKey::new("=7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kMK").is_err(),
+            "'=' inside the data region must fail validation"
+        );
+        assert!(
+            PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kMK").is_err(),
+            "a missing trailing '=' pad must fail validation"
+        );
+        // Sanity: a well-formed key still validates.
+        assert!(PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kM=").is_ok());
+        assert!(PublicKey::new("K7XbF9cV2mQpT3nZ8sL4dW6yH1jR5uA0eG9iO2pS7kN=").is_ok());
     }
 
     #[test]

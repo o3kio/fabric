@@ -957,6 +957,22 @@ fn cannot_find_device(name: &str) -> CommandOutput {
     command_error(&format!("Cannot find device \"{name}\""))
 }
 
+/// Deterministic base64 public key for the fake kernel: varies with the
+/// private-key material's length so different keys derive different
+/// public keys, and is always valid under `fabric_plan::PublicKey::new`
+/// (43 alphabet characters plus one trailing '=' pad).
+fn fake_public_key(private_material: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let seed = private_material.len();
+    let mut key = String::with_capacity(44);
+    for i in 0..43 {
+        let index = (seed + i * 7 + 11) % ALPHABET.len();
+        key.push(ALPHABET[index] as char);
+    }
+    key.push('=');
+    key
+}
+
 fn is_observation(program: &str, args: &[String]) -> bool {
     // A bare `ss ...` invocation (the root-namespace leg of the
     // socket-placement discriminator) is always an observation — the
@@ -1117,9 +1133,13 @@ impl FabricCommand for RecordingRunner {
         self.record(program, args, Some(stdin));
         if program == "wg" && args.first() == Some(&"pubkey") {
             return Ok(CommandOutput {
-                // Deterministic 44-character base64-shaped public key.
+                // Deterministic 44-character base64 public key — 43
+                // alphabet characters plus one trailing '=' pad, the
+                // exact shape a real `wg pubkey` emits for 32 key bytes —
+                // so key-shape validation in the plan layer is exercised
+                // faithfully (review loop F-3).
                 success: true,
-                stdout: format!("pubkey-{:035}-x\n", stdin.trim().len()),
+                stdout: format!("{}\n", fake_public_key(stdin.trim())),
                 stderr: String::new(),
             });
         }

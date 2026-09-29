@@ -615,9 +615,11 @@ for h in "${HOSTS[@]}"; do
   fev "$h" tenant-down --root "/work/$h" --prefix "$PREFIX" \
     --network-id "$NETWORK_ID" --bridge "$BRIDGE" --tenant-ns "$TNS" \
     >"$RESULTS_DIR/tenant-down-$h.json" \
+    && pass "tenant_down_$h" "tenant attachment removed" \
     || fail "tenant_down_$h" "tenant-down exited nonzero"
   fev "$h" teardown --root "/work/$h" --prefix "$PREFIX" --network-id "$NETWORK_ID" \
     >"$RESULTS_DIR/teardown-$h.json" \
+    && pass "teardown_$h" "network fabric objects removed" \
     || fail "teardown_$h" "teardown exited nonzero"
   fev "$h" fabric-down --root "/work/$h" --prefix "$PREFIX" \
     >"$RESULTS_DIR/fabric-down-$h.json" \

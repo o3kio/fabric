@@ -858,6 +858,23 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         let ns = names.fabric_namespace();
         let wg = names.wireguard_interface();
         let ns_present = self.has_fabric_netns(&ns)?;
+        // The WireGuard link must also be OBSERVED present before any wg
+        // or route command runs. On every apply path `ensure_fabric`
+        // guarantees it (creates or verifies it immediately before). On
+        // the removal path a host can present a surviving namespace with
+        // a MISSING WireGuard link (module unload, operator deletion, a
+        // partial teardown): peer reconciliation then has nothing to
+        // program, and failing here would wedge `remove_network` AFTER
+        // it has already dropped the plan journal — an orphaned
+        // ownership entry that also blocks `remove_fabric_if_unused`.
+        // Skipping is safe and convergent: the journal still moves to
+        // the desired peer set, and the next apply's `ensure_fabric`
+        // re-creates and fully re-programs the transport before this
+        // runs again (review loop F-1).
+        let wg_present = ns_present
+            && self
+                .ns_run(&ns, "ip", &["link", "show", wg.as_str()])?
+                .success;
 
         let mut desired: BTreeMap<String, PeerRecord> = BTreeMap::new();
         for plan in self.live_plans()? {
@@ -881,7 +898,7 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             .map(|p| (p.public_key.clone(), p.clone()))
             .collect();
 
-        if ns_present {
+        if wg_present {
             // Remove stale peers first (by public key).
             for (public_key, record) in current.iter() {
                 if !desired.contains_key(public_key) {
@@ -1773,6 +1790,76 @@ mod tests {
             wg_kept && ns_kept,
             "the failure must leave the existing fabric fully intact"
         );
+        Ok(())
+    }
+
+    /// Review loop F-1: a host whose fabric NAMESPACE survived but whose
+    /// WireGuard LINK did not (module unload, operator deletion, partial
+    /// teardown) must still converge `remove_network` — previously the
+    /// peer-reconciliation `wg set` hard-failed AFTER the plan journal
+    /// had been dropped, wedging the host with an orphaned ownership
+    /// entry that also blocked `remove_fabric_if_unused`. Verified to
+    /// fail against 47dca16 (v0.1.3): pre-fix, remove_network returned
+    /// `Err(Command … wg set … failed)`.
+    #[test]
+    fn remove_network_converges_when_netns_present_but_wireguard_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("remove-no-wg")?;
+        let config = FabricLinuxConfig::new(&root);
+        let names = Names::new(config.name_prefix())?;
+        let ns = names.fabric_namespace();
+        let wg = names.wireguard_interface();
+        let plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&plan)?;
+
+        // The F-1 state: delete the WireGuard link from the kernel while
+        // the namespace (and the journals) survive.
+        {
+            let mut runner = provider.into_runner();
+            let out = runner.run(
+                "ip",
+                &[
+                    "netns",
+                    "exec",
+                    ns.as_str(),
+                    "ip",
+                    "link",
+                    "del",
+                    wg.as_str(),
+                ],
+            )?;
+            assert!(out.success, "seeding sanity: the wg link must be deletable");
+            assert!(
+                runner.has_netns(&ns),
+                "seeding sanity: the namespace must survive"
+            );
+            assert!(
+                !runner.has_link_in(&wg, Some(&ns)),
+                "seeding sanity: the wg link must be gone"
+            );
+            provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        }
+
+        // The convergence under test: removal must succeed end-to-end
+        // and leave no orphaned journals behind.
+        provider.remove_network("net-a")?;
+        assert!(
+            !config.plan_path("net-a").exists(),
+            "the plan journal must be gone"
+        );
+        let fabric_removed = provider.remove_fabric_if_unused()?;
+        let ns_kept = provider.runner().has_netns(&ns);
+        drop(provider);
+
+        let _unused = fs::remove_dir_all(&root);
+        assert!(
+            fabric_removed,
+            "with the network converged away, fabric removal must proceed — \
+             an orphaned ownership entry would block it"
+        );
+        assert!(!ns_kept, "the fabric namespace must be torn down");
         Ok(())
     }
 

@@ -44,8 +44,9 @@ attachment, VNI binding allocation, placement, FIPs, lifecycle.
    against a newer plan schema fails loudly instead of silently dropping
    fields; and **values are validated by `validate()`**, which must run
    before realization — including endpoint values (non-empty host, no
-   whitespace/control characters, nonzero port) on both the parsed and
-   the deserialized path. The peer list
+   whitespace/control characters, nonzero port) and public-key shape
+   (44 base64 characters: 43 alphabet characters plus one trailing `'='`
+   pad) on both the parsed and the deserialized path. The peer list
    must not contain duplicate public keys — peers are keyed by public key
    during realization, and a duplicate would silently drop a peer from the
    WireGuard set.
@@ -196,7 +197,12 @@ indicates the object does not exist — missing device, missing namespace,
 missing rule or entry, or a missing route (`RTNETLINK answers: No such
 process`) — counts as done; any other failure is a hard error). When the fabric namespace itself is absent, all ns-scoped
 deletions are skipped: a kernel that was rebooted while the journals
-survived must still tear down cleanly. The plan journal file and the
+survived must still tear down cleanly. The same holds when the namespace
+survives but the WireGuard link does not (module unload, operator
+deletion, a partial teardown): the peer-set reconciliation observes the
+link and skips its WireGuard/route commands rather than failing — there
+is nothing to program, and failing would wedge the removal after the
+journals were already dropped. The plan journal file and the
 ownership entry are removed **unconditionally** — regardless of which
 object deletions were tolerated — so an interrupted teardown always
 converges on retry instead of wedging the ownership entry forever. A kept
