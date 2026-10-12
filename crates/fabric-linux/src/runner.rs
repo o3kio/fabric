@@ -399,7 +399,17 @@ impl RecordingRunner {
                     continue;
                 }
                 for _ in 0..*count {
-                    stdout.push_str(&format!("{mac} dev {dev} dst {dst} self permanent\n"));
+                    // `bridge fdb show dev <name>` scopes the result but
+                    // iproute2 omits the device token from each filtered
+                    // row. The unfiltered form includes it. Keep this fake
+                    // output aligned with the real command because the
+                    // provider parses the filtered form during HER
+                    // reconciliation.
+                    if dev_filter.is_some() {
+                        stdout.push_str(&format!("{mac} dst {dst} self permanent\n"));
+                    } else {
+                        stdout.push_str(&format!("{mac} dev {dev} dst {dst} self permanent\n"));
+                    }
                 }
             }
             return CommandOutput {
@@ -1280,6 +1290,11 @@ mod tests {
         assert!(
             !out.stdout.contains("198.18.0.2"),
             "the dev filter must hide other devices' entries: {}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.split_whitespace().any(|field| field == "dev"),
+            "filtered bridge FDB output omits the already-filtered device name: {}",
             out.stdout
         );
         assert!(out.stdout.contains("198.18.0.9"));

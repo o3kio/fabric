@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.6] - 2026-10-12
+### Fixed
+- **HER shrink reconciliation parses device-filtered FDB output.** `bridge
+  fdb show dev <vxlan>` omits the device token from its rows on iproute2.
+  The provider previously ignored every row in that form and retained
+  departed peers' flood entries. The recording runner now models this real
+  output, and the observed-state regression proves stale flood entries are
+  removed.
+
 ## [0.1.5] - 2026-09-29
 ### Changed
 - **MSRV lowered to Rust 1.97.1** (from 1.98.0). The 1.98.0 floor was
