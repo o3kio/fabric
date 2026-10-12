@@ -1431,7 +1431,11 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             if tokens.first() != Some(&FLOOD_MAC) {
                 continue;
             }
-            if token_after("dev") != Some(vxlan) {
+            // `bridge fdb show dev <vxlan>` is already device-filtered and
+            // omits `dev <vxlan>` from each output row on iproute2. Some
+            // implementations include it, so validate it when present but
+            // do not discard rows where the filter removed the token.
+            if token_after("dev").is_some_and(|observed_dev| observed_dev != vxlan) {
                 continue;
             }
             if let Some(dst) = token_after("dst").and_then(|dst| dst.parse::<Ipv4Addr>().ok()) {

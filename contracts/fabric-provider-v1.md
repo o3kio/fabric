@@ -154,6 +154,11 @@ Reconciliation is append-missing / delete-unwanted — `replace` is never
 used (the kernel rejects it for non-unicast entries, and it would clobber
 the other remotes).
 
+The device-filtered `bridge fdb show dev <vxlan>` output may omit the `dev
+<vxlan>` fields from each row because the command has already applied that
+filter. The provider must still parse those rows as entries on the requested
+device; if a device field is present, it must match the requested device.
+
 Reconciling against observation, rather than blindly re-appending, is
 required because `bridge fdb append` is **not** guaranteed idempotent per
 (dev, mac, dst): bridge(8) documents `append` as adding a new entry
