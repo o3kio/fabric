@@ -274,7 +274,11 @@ RUN apt-get update \
       procps \
  && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
-"${DOCKER[@]}" build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
+# The image build only installs the evidence tools from Debian repositories.
+# Use host networking for those RUN steps so the build does not depend on a
+# daemon-wide default `bridge` network; runtime guests still use the dedicated
+# isolated $NET_NAME network created above.
+"${DOCKER[@]}" build --network host -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
 rm -rf "$BUILD_DIR"
 
 for h in "${HOSTS[@]}"; do
