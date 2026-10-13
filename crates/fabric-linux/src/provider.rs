@@ -1,6 +1,6 @@
 //! The Linux fabric provider: idempotent realization of stretched-L2 plans.
 //!
-//! Realization order (see `contracts/fabric-provider-v1.md`):
+//! Realization order (see `contracts/fabric-provider-v2.md`):
 //! validate plan -> journal plan -> ensure fabric (netns/WireGuard) ->
 //! configure peers (union over live plans) -> re-assert the WireGuard MTU
 //! (maximum fabric_mtu across live plans) -> ensure network (VXLAN +
@@ -1119,6 +1119,93 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         // reconciliation also catches entries the journal does not know
         // about.
         let desired: BTreeSet<Ipv4Addr> = plan.flood_list();
+        // Inspect unicast state before mutating the VXLAN FDB. A stale
+        // permanent or otherwise ambiguous row is foreign state: reject it
+        // without deleting it or first changing the flood list.
+        let observed_unicast = self.ns_fdb_show_unicast_peers(&ns, &vxlan)?;
+        if let Some(((mac, dst), count)) = observed_unicast
+            .protected
+            .iter()
+            .find(|((_, dst), _)| !desired.contains(dst))
+        {
+            return Err(FabricError::ForeignState {
+                object: format!("unicast FDB row {mac} on {vxlan}"),
+                expected: "a dynamic learned row directed to a current peer".to_string(),
+                observed: format!(
+                    "{count} permanent, externally managed, or ambiguous row(s) directed to departed peer {dst}"
+                ),
+            });
+        }
+        // Remove stale learned unicast rows as well as BUM destinations.
+        // Kernel learning can leave an endpoint MAC mapped to a peer that
+        // no longer belongs to the canonical plan. The verified VXLAN is
+        // network-scoped, so prune only exact observed (MAC, device, dst)
+        // rows whose remote transport is absent from the desired peer set.
+        // Re-read immediately before every delete: unlike the initial dump,
+        // this is the last point where a changed row can still be recognized
+        // as protected and preserved. Linux VXLAN netlink has no
+        // compare-and-delete request, so this narrows (but cannot remove) the
+        // kernel-level interval between classification and deletion.
+        let stale_unicast: Vec<((String, Ipv4Addr), usize)> = observed_unicast
+            .learned
+            .into_iter()
+            .filter(|((_, dst), _)| !desired.contains(dst))
+            .collect();
+        for ((mac, dst), count) in &stale_unicast {
+            for _ in 0..*count {
+                let current = self.ns_fdb_show_unicast_peers(&ns, &vxlan)?;
+                if let Some(((protected_mac, protected_dst), protected_count)) = current
+                    .protected
+                    .iter()
+                    .find(|((_, observed_dst), _)| !desired.contains(observed_dst))
+                {
+                    return Err(FabricError::ForeignState {
+                        object: format!("unicast FDB row {protected_mac} on {vxlan}"),
+                        expected: "a dynamic learned row directed to a current peer".to_string(),
+                        observed: format!(
+                            "{protected_count} permanent, externally managed, or ambiguous row(s) directed to departed peer {protected_dst} appeared before withdrawal"
+                        ),
+                    });
+                }
+                if current
+                    .learned
+                    .get(&(mac.clone(), *dst))
+                    .copied()
+                    .unwrap_or_default()
+                    == 0
+                {
+                    // The learned row aged out before the withdrawal.
+                    break;
+                }
+                self.ns_fdb_del_unicast_peer(&ns, &vxlan, mac, dst)?;
+            }
+        }
+        if !stale_unicast.is_empty() {
+            let remaining = self.ns_fdb_show_unicast_peers(&ns, &vxlan)?;
+            if let Some(((mac, dst), count)) = remaining
+                .learned
+                .into_iter()
+                .find(|((_, dst), _)| !desired.contains(dst))
+            {
+                return Err(FabricError::Command(format!(
+                    "stale learned FDB row {mac} to removed peer {dst} remains after withdrawing {count} observed instance(s)"
+                )));
+            }
+            if let Some(((mac, dst), count)) = remaining
+                .protected
+                .into_iter()
+                .find(|((_, dst), _)| !desired.contains(dst))
+            {
+                return Err(FabricError::ForeignState {
+                    object: format!("unicast FDB row {mac} on {vxlan}"),
+                    expected: "no row directed to a departed peer".to_string(),
+                    observed: format!(
+                        "{count} permanent, externally managed, or ambiguous row(s) directed to {dst} appeared during reconciliation"
+                    ),
+                });
+            }
+        }
+
         let observed = self.ns_fdb_show_flood(&ns, &vxlan)?;
         for ip in &desired {
             if !observed.contains_key(ip) {
@@ -1445,6 +1532,43 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
         Ok(observed)
     }
 
+    /// Observe unicast FDB entries with a remote destination on the verified,
+    /// network-scoped VXLAN. Only rows with kernel-learned flags are eligible
+    /// for departed-peer cleanup. Permanent, externally managed, and
+    /// ambiguous rows are reported separately and fail closed when stale.
+    fn ns_fdb_show_unicast_peers(
+        &mut self,
+        ns: &str,
+        vxlan: &str,
+    ) -> Result<ObservedUnicastPeers, FabricError> {
+        let output = self.ns_run(ns, "bridge", &["fdb", "show", "dev", vxlan])?;
+        if !output.success {
+            return Err(FabricError::Command(format!(
+                "ip netns exec {ns} bridge fdb show dev {vxlan} failed: {}",
+                output.stderr.trim()
+            )));
+        }
+        parse_unicast_fdb_peers(&output.stdout, vxlan)
+    }
+
+    /// Delete one exact observed learned unicast row. A row may age out
+    /// between observation and deletion, so an already-absent result is
+    /// treated as converged; a fresh read-back below proves final absence.
+    fn ns_fdb_del_unicast_peer(
+        &mut self,
+        ns: &str,
+        vxlan: &str,
+        mac: &str,
+        dst: &Ipv4Addr,
+    ) -> Result<(), FabricError> {
+        let dst = dst.to_string();
+        self.ns_run_tolerant(
+            ns,
+            "bridge",
+            &["fdb", "del", mac, "dev", vxlan, "dst", dst.as_str()],
+        )
+    }
+
     /// Append one HER flood entry. `append` (never `replace` — the
     /// kernel rejects replace on non-unicast MACs); the caller reconciles
     /// against observed state so a destination is only appended when it
@@ -1479,6 +1603,130 @@ impl<R: FabricCommand> LinuxFabricProvider<R> {
             &["fdb", "del", FLOOD_MAC, "dev", vxlan, "dst", dst.as_str()],
         )
     }
+}
+
+#[derive(Default)]
+struct ObservedUnicastPeers {
+    learned: BTreeMap<(String, Ipv4Addr), usize>,
+    protected: BTreeMap<(String, Ipv4Addr), usize>,
+}
+
+/// Parse the device-filtered `bridge fdb show` result used for departed-peer
+/// cleanup. Malformed remote rows and contradictory device identities fail
+/// closed so read-back cannot hide an unobserved stale destination.
+fn parse_unicast_fdb_peers(
+    stdout: &str,
+    expected_device: &str,
+) -> Result<ObservedUnicastPeers, FabricError> {
+    let mut observed = ObservedUnicastPeers::default();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let row = tokens.first().copied().unwrap_or_default();
+        let dst_positions: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| (*token == "dst").then_some(index))
+            .collect();
+        if dst_positions.is_empty() {
+            continue;
+        }
+        if dst_positions.len() != 1 || dst_positions[0] + 1 >= tokens.len() {
+            return Err(FabricError::Command(format!(
+                "malformed remote FDB observation on {expected_device}: invalid dst field"
+            )));
+        }
+
+        let dev_positions: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| (*token == "dev").then_some(index))
+            .collect();
+        if dev_positions.len() > 1
+            || dev_positions
+                .first()
+                .is_some_and(|index| *index + 1 >= tokens.len())
+        {
+            return Err(FabricError::Command(format!(
+                "malformed remote FDB observation on {expected_device}: invalid dev field"
+            )));
+        }
+        if dev_positions
+            .first()
+            .is_some_and(|index| tokens[*index + 1] != expected_device)
+        {
+            return Err(FabricError::Command(format!(
+                "contradictory remote FDB device identity while observing {expected_device}"
+            )));
+        }
+
+        let dst_token = tokens[dst_positions[0] + 1];
+        let dst = dst_token.parse::<Ipv4Addr>().map_err(|_| {
+            FabricError::Command(format!(
+                "malformed remote FDB observation on {expected_device}: invalid destination address"
+            ))
+        })?;
+        let parsed_mac = parse_observed_mac(row).ok_or_else(|| {
+            FabricError::Command(format!(
+                "malformed remote FDB observation on {expected_device}: invalid MAC address"
+            ))
+        })?;
+        // Multicast and all-zero rows are HER/flood entries handled by the
+        // separate reconciliation path, not learned unicast entries.
+        if !parsed_mac.is_unicast {
+            continue;
+        }
+        let key = (row.to_ascii_lowercase(), dst);
+        // The archived kernel output for dynamically learned VXLAN entries
+        // contains `self` without permanent/static ownership flags. Anything
+        // else is ambiguous or externally managed and must never be deleted.
+        let learned = tokens.contains(&"self")
+            && tokens.iter().all(|token| {
+                matches!(
+                    *token,
+                    "self"
+                        | "used"
+                        | "updated"
+                        | "added"
+                        | "dynamic"
+                        | "offload"
+                        | "offload_failed"
+                ) || *token == row
+                    || *token == "dst"
+                    || *token == dst_token
+                    || *token == "dev"
+                    || *token == expected_device
+            });
+        let target = if learned {
+            &mut observed.learned
+        } else {
+            &mut observed.protected
+        };
+        *target.entry(key).or_insert(0) += 1;
+    }
+    Ok(observed)
+}
+
+struct ParsedObservedMac {
+    is_unicast: bool,
+}
+
+/// Validate a kernel-observed Ethernet address before using it as an exact
+/// `bridge fdb del` argument.
+fn parse_observed_mac(mac: &str) -> Option<ParsedObservedMac> {
+    let octets: Vec<&str> = mac.split(':').collect();
+    if octets.len() != 6
+        || octets
+            .iter()
+            .any(|octet| octet.len() != 2 || !octet.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    let first = octets
+        .first()
+        .and_then(|octet| u8::from_str_radix(octet, 16).ok())?;
+    Some(ParsedObservedMac {
+        is_unicast: first & 0x01 == 0 && octets.iter().any(|octet| *octet != "00"),
+    })
 }
 
 fn config_names(config: &FabricLinuxConfig) -> Result<Names, FabricError> {
@@ -1728,6 +1976,113 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    #[test]
+    fn unicast_fdb_observation_separates_learned_from_permanent_rows() -> Result<(), FabricError> {
+        let rows = concat!(
+            "02:14:a1:9b:bb:02 dst 198.18.0.2 self\n",
+            "02:14:a1:9b:bb:03 dst 198.18.0.3 self permanent\n",
+            "00:00:00:00:00:00 dst 198.18.0.3 self permanent\n",
+        );
+        let observed = parse_unicast_fdb_peers(rows, "vxlan-test")?;
+        assert_eq!(
+            observed.learned.get(&(
+                "02:14:a1:9b:bb:02".to_string(),
+                Ipv4Addr::new(198, 18, 0, 2)
+            )),
+            Some(&1)
+        );
+        assert_eq!(
+            observed.protected.get(&(
+                "02:14:a1:9b:bb:03".to_string(),
+                Ipv4Addr::new(198, 18, 0, 3)
+            )),
+            Some(&1)
+        );
+        assert!(
+            observed
+                .learned
+                .keys()
+                .all(|(mac, _)| mac != "00:00:00:00:00:00")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_or_contradictory_remote_fdb_rows_fail_closed() {
+        for row in [
+            "02:14:a1:9b:bb:02 dst not-an-ip self\n",
+            "02:14:a1:9b:bb:02 dst self\n",
+            "not-a-mac dst 198.18.0.3 self\n",
+            "02:14:a1:9b:bb:02 dst 198.18.0.3 self dev vxlan-other\n",
+            "02:14:a1:9b:bb:02 dev dst 198.18.0.3 self\n",
+        ] {
+            assert!(
+                matches!(
+                    parse_unicast_fdb_peers(row, "vxlan-test"),
+                    Err(FabricError::Command(_))
+                ),
+                "malformed row must fail closed: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_learned_row_reclassified_as_permanent_before_withdrawal_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("fdb-learned-to-permanent")?;
+        let config = FabricLinuxConfig::new(&root);
+        let mut prior_plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        prior_plan.peers.push(peer_for("host-03", [198, 18, 0, 3])?);
+        let mut current_plan = test_plan("net-a", 100, 1380, 1440).map_err(plan_error)?;
+        current_plan.plan_generation = 2;
+        let names = Names::new(config.name_prefix())?;
+        let vxlan = names.vxlan(&current_plan.network_id);
+        let stale_mac = "02:14:a1:9b:bb:03";
+        let stale_dst = "198.18.0.3";
+
+        let mut provider = LinuxFabricProvider::open(config.clone(), RecordingRunner::new())?;
+        provider.apply_plan(&prior_plan)?;
+        let mut runner = provider.into_runner();
+        runner.seed_learned_fdb_entry(&vxlan, stale_mac, stale_dst);
+
+        // The prior apply performs two device-filtered FDB dumps. During
+        // the successor apply, ordinal three is the initial unicast
+        // observation and ordinal four is the fresh classification
+        // immediately before the exact stale-row delete.
+        runner.convert_learned_fdb_to_permanent_on_show(&vxlan, stale_mac, stale_dst, 4);
+        let before = runner.calls().len();
+        let mut provider = LinuxFabricProvider::open(config.clone(), runner)?;
+        let result = provider.apply_plan(&current_plan);
+        let calls: Vec<String> = provider
+            .runner()
+            .calls()
+            .iter()
+            .skip(before)
+            .map(|call| call.joined())
+            .collect();
+        let preserved_count = provider
+            .runner()
+            .fdb_entry_count(&vxlan, stale_mac, stale_dst);
+        drop(provider);
+        let _unused = fs::remove_dir_all(&root);
+
+        assert!(
+            matches!(result, Err(FabricError::ForeignState { .. })),
+            "a row reclassified as permanent before withdrawal must fail closed: {result:?}"
+        );
+        assert_eq!(preserved_count, 1, "the protected row must remain intact");
+        assert!(
+            !calls.iter().any(|line| {
+                line == &format!(
+                    "ip netns exec {} bridge fdb del {stale_mac} dev {vxlan} dst {stale_dst}",
+                    names.fabric_namespace()
+                )
+            }),
+            "provider must not issue the stale-row delete after reclassification: {calls:?}"
+        );
+        Ok(())
     }
 
     fn plan_error(e: PlanError) -> FabricError {

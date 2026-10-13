@@ -3,7 +3,7 @@
 Provider-level architecture decision records for the shared stretched-L2
 fabric. These record decisions that outlive a CHANGELOG entry: why the
 underlay is NAT-free, why ambiguity fails closed, and so on. They are
-referenced by the [contract](../../contracts/fabric-provider-v1.md) and
+referenced by the [contract](../../contracts/fabric-provider-v2.md) and
 [`docs/design.md`](../design.md), and governed by
 [`docs/change-control.md`](../change-control.md) (Class A changes require an
 ADR here).

@@ -3,7 +3,7 @@
 //! This crate is the anti-drift weapon between the fabric's consumers (O3K
 //! `o3k-network`, CHV `chv-nwd`, and any future host): one suite that proves
 //! the provider satisfies the fabric provider contract
-//! (`contracts/fabric-provider-v1.md`).
+//! (`contracts/fabric-provider-v2.md`).
 //!
 //! The suite runs against the reference in-memory fake kernel
 //! ([`fabric_linux::RecordingRunner`]) and proves provider behavior

@@ -77,6 +77,9 @@ no tenant packets for the wrong reason.
   when the script is started via `sudo`).
 - Internet access to pull `debian:bookworm-slim` and its packages on first
   run (the image is built on the fly and cached as `fabric-ev-image`).
+- Image package installation uses host networking during the Docker build,
+  so it does not require the daemon's default `bridge` network. The actual
+  evidence containers use the dedicated `fabric-ev` bridge network.
 
 ## Interpretation
 

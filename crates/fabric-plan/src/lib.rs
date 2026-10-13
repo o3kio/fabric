@@ -10,7 +10,7 @@
 //!
 //! - O3K [ADR-0186](https://github.com/o3kio/o3k/blob/main/docs/adr/ADR-0186-stretched-l2-edge-fabric-vxlan-her.md)
 //!   and [SPEC-0049](https://github.com/o3kio/o3k/blob/main/docs/specs/SPEC-0049-stretched-l2-edge-fabric-v3.md)
-//! - the [fabric provider contract](../../contracts/fabric-provider-v1.md) in
+//! - the [fabric provider contract](../../contracts/fabric-provider-v2.md) in
 //!   this repository;
 //! - CHV [ADR-021](https://github.com/kubedoio/chv/blob/main/docs/specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md)
 //!   (aligned decision).

@@ -8,7 +8,8 @@ The shared **provider layer** of the Kubedo stretched-L2 edge fabric,
 consumed by both `o3kio/o3k` and `kubedoio/chv`. The decision trail lives in
 the product repos; the executable contract lives here:
 
-- `contracts/fabric-provider-v1.md` — normative behavioral invariants. Read
+- `contracts/fabric-provider-v2.md` — current normative behavioral
+  invariants. Read
   it before changing provider behavior. Changes require a new contract
   version.
 - `crates/fabric-plan` — portable input types. No I/O, ever.
