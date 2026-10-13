@@ -1,6 +1,6 @@
 # The Kubedo Stretched-L2 Fabric — Design Document
 
-Status: Accepted · Applies to: fabric v0.1.4 (`fabric-plan`/`fabric-linux`/`fabric-conformance`) · Maintained in this repository
+Status: Accepted · Applies to: fabric v0.2.0 (`fabric-plan`/`fabric-linux`/`fabric-conformance`) · Maintained in this repository
 
 This document is the consolidated **engineering design** of the shared
 stretched-L2 fabric: what it builds in the host kernel, why it is built that
@@ -12,7 +12,7 @@ explanatory* — the **normative** sources remain, in order:
    — the product-level decision and specification.
 2. CHV [ADR-021](https://github.com/kubedoio/chv/blob/main/docs/specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md)
    — the aligned consumer decision (including its postmortem addendum).
-3. [`contracts/fabric-provider-v1.md`](../contracts/fabric-provider-v1.md) —
+3. [`contracts/fabric-provider-v2.md`](../contracts/fabric-provider-v2.md) —
    the provider contract: the behavioral invariants every implementation and
    both consumers (O3K `o3k-network`, CHV `chv-nwd`) are held to.
 4. `crates/fabric-conformance` — the contract's executable expression.

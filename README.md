@@ -27,7 +27,7 @@ realizes compiled plans idempotently with journal-before-mutate discipline,
 ownership fencing, fail-closed foreign-state rejection, and strict key
 hygiene. Normative sources:
 
-- [contracts/fabric-provider-v1.md](contracts/fabric-provider-v1.md) — the provider contract (this repo)
+- [contracts/fabric-provider-v2.md](contracts/fabric-provider-v2.md) — the current provider contract (this repo)
 - [docs/change-control.md](docs/change-control.md) — cross-implementation alignment: how this repo and its two consumers (O3K, CHV) change without drifting
 - [docs/design.md](docs/design.md) — the consolidated engineering design (explanatory; the contract wins on disagreement)
 - O3K [ADR-0186](https://github.com/o3kio/o3k/blob/main/docs/adr/ADR-0186-stretched-l2-edge-fabric-vxlan-her.md) / [SPEC-0049](https://github.com/o3kio/o3k/blob/main/docs/specs/SPEC-0049-stretched-l2-edge-fabric-v3.md)
@@ -46,7 +46,8 @@ hygiene. Normative sources:
 
 | Document | What it is |
 |---|---|
-| [`contracts/fabric-provider-v1.md`](contracts/fabric-provider-v1.md) | **Normative** provider contract (behavioral invariants) |
+| [`contracts/fabric-provider-v2.md`](contracts/fabric-provider-v2.md) | **Normative** current provider contract (behavioral invariants) |
+| [`contracts/fabric-provider-v1.md`](contracts/fabric-provider-v1.md) | Historical provider contract superseded by v2 |
 | [`docs/design.md`](docs/design.md) | The consolidated engineering design: kernel shape, datapath, underlay (ADR-0001), lifecycle state machines, journals, migration, security model, failure-mode runbook, limits, evidence scope |
 | [`docs/change-control.md`](docs/change-control.md) | **Normative** cross-implementation alignment: the doc hierarchy, change classes A–D, hard rules for O3K and CHV, versioning/skew, escalation |
 | [`docs/adr/`](docs/adr/README.md) | Fabric decision records (ADR-0001 underlay redesign, ADR-0002 socket-placement verification) |

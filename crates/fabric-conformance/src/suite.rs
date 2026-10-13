@@ -180,6 +180,14 @@ fn cases() -> Vec<(String, Case)> {
         ),
         ("flood_list_shrinks".to_string(), case_flood_list_shrinks),
         (
+            "learned_unicast_entries_for_removed_peer_are_withdrawn".to_string(),
+            case_learned_unicast_entries_for_removed_peer_are_withdrawn,
+        ),
+        (
+            "stale_static_unicast_fdb_fails_closed".to_string(),
+            case_stale_static_unicast_fdb_fails_closed,
+        ),
+        (
             "foreign_state_rejects_prefix_vni".to_string(),
             case_foreign_state_rejects_prefix_vni,
         ),
@@ -1527,6 +1535,193 @@ fn case_flood_list_shrinks() -> Result<(), FabricError> {
         ));
     }
     Ok(())
+}
+
+/// Shrinking a plan's peer set must withdraw learned unicast rows directed
+/// at the departed peer, without deleting current-peer rows or rows on a
+/// different provider-owned VXLAN.
+fn case_learned_unicast_entries_for_removed_peer_are_withdrawn() -> Result<(), FabricError> {
+    const SURVIVOR_MAC: &str = "02:14:a1:9b:bb:02";
+    const DEPARTED_MAC: &str = "02:14:a1:9b:bb:03";
+    const SURVIVOR_IP: &str = "198.18.0.2";
+    const DEPARTED_IP: &str = "198.18.0.3";
+
+    let mut env = CaseEnv::new("learned-fdb-shrink")?;
+    let two_peers = plan_for(
+        100,
+        &[("host-02", [198, 18, 0, 2]), ("host-03", [198, 18, 0, 3])],
+    )
+    .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let one_peer = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let other_network = plan_for(
+        101,
+        &[("host-02", [198, 18, 0, 2]), ("host-03", [198, 18, 0, 3])],
+    )
+    .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let vxlan = names.vxlan(&two_peers.network_id);
+    let other_vxlan = names.vxlan(&other_network.network_id);
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&two_peers)?;
+    provider.apply_plan(&other_network)?;
+    let mut runner = provider.into_runner();
+    for (device, mac, dst) in [
+        (vxlan.as_str(), SURVIVOR_MAC, SURVIVOR_IP),
+        (vxlan.as_str(), DEPARTED_MAC, DEPARTED_IP),
+        (other_vxlan.as_str(), DEPARTED_MAC, DEPARTED_IP),
+    ] {
+        runner.seed_learned_fdb_entry(device, mac, dst);
+    }
+    // A duplicate stale row must also converge because `bridge fdb del`
+    // removes exactly one matching instance per invocation.
+    runner.seed_learned_fdb_entry(&vxlan, DEPARTED_MAC, DEPARTED_IP);
+
+    let mut provider = LinuxFabricProvider::open(env.config.clone(), runner)?;
+    provider.apply_plan(&one_peer)?;
+    let departed_removed = !provider
+        .runner()
+        .has_fdb_entry(&vxlan, DEPARTED_MAC, DEPARTED_IP);
+    let survivor_kept = provider
+        .runner()
+        .has_fdb_entry(&vxlan, SURVIVOR_MAC, SURVIVOR_IP);
+    let other_network_kept =
+        provider
+            .runner()
+            .has_fdb_entry(&other_vxlan, DEPARTED_MAC, DEPARTED_IP);
+    let calls_after_shrink = provider.runner().calls().len();
+    provider.apply_plan(&one_peer)?;
+    let replay_deletes = provider
+        .runner()
+        .calls()
+        .iter()
+        .skip(calls_after_shrink)
+        .filter(|call| call.joined().contains("bridge fdb del"))
+        .count();
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if !departed_removed {
+        return Err(FabricError::Invalid(
+            "learned unicast rows to the removed peer must be withdrawn from the owned VXLAN"
+                .to_string(),
+        ));
+    }
+    if !survivor_kept {
+        return Err(FabricError::Invalid(
+            "learned unicast rows to a current peer must be preserved".to_string(),
+        ));
+    }
+    if !other_network_kept {
+        return Err(FabricError::Invalid(
+            "reconciliation must not delete rows on another owned VXLAN".to_string(),
+        ));
+    }
+    if replay_deletes != 0 {
+        return Err(FabricError::Invalid(format!(
+            "re-applying the reduced plan must not delete FDB rows again, got {replay_deletes} deletes"
+        )));
+    }
+    let exact_deletes: Vec<String> = provider_delete_calls(&env.runner, DEPARTED_MAC);
+    if exact_deletes.len() != 2
+        || exact_deletes
+            .iter()
+            .any(|call| !call.contains(&format!("dev {vxlan} dst {DEPARTED_IP}")))
+    {
+        return Err(FabricError::Invalid(format!(
+            "learned-row withdrawals must delete only the exact observed MAC/device/destination; got {exact_deletes:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// A permanent unicast mapping to a departed peer is ambiguous/externally
+/// managed state. The provider must preserve it and fail closed before
+/// changing the flood list.
+fn case_stale_static_unicast_fdb_fails_closed() -> Result<(), FabricError> {
+    const STATIC_MAC: &str = "02:14:a1:9b:bb:33";
+    const DEPARTED_IP: &str = "198.18.0.3";
+    let mut env = CaseEnv::new("static-fdb-stale")?;
+    let two_peers = plan_for(
+        100,
+        &[("host-02", [198, 18, 0, 2]), ("host-03", [198, 18, 0, 3])],
+    )
+    .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let one_peer = plan_for(100, &[("host-02", [198, 18, 0, 2])])
+        .map_err(|e| FabricError::Invalid(e.to_string()))?;
+    let names = fabric_linux::Names::new(env.config.name_prefix())?;
+    let ns = names.fabric_namespace();
+    let vxlan = names.vxlan(&two_peers.network_id);
+
+    let mut provider = env.provider()?;
+    provider.apply_plan(&two_peers)?;
+    let mut runner = provider.into_runner();
+    let seeded = runner.run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &ns,
+            "bridge",
+            "fdb",
+            "add",
+            STATIC_MAC,
+            "dev",
+            &vxlan,
+            "dst",
+            DEPARTED_IP,
+        ],
+    )?;
+    if !seeded.success {
+        env.cleanup();
+        return Err(FabricError::Command(format!(
+            "could not seed permanent FDB row: {}",
+            seeded.stderr.trim()
+        )));
+    }
+    let mut provider = LinuxFabricProvider::open(env.config.clone(), runner)?;
+    let call_start = provider.runner().calls().len();
+    let result = provider.apply_plan(&one_peer);
+    let retained = provider
+        .runner()
+        .has_fdb_entry(&vxlan, STATIC_MAC, DEPARTED_IP);
+    let fdb_deletes: Vec<String> = provider
+        .runner()
+        .calls()
+        .iter()
+        .skip(call_start)
+        .filter(|call| call.joined().contains("bridge fdb del"))
+        .map(|call| call.joined())
+        .collect();
+    env.take_runner_back(provider);
+    env.cleanup();
+
+    if !matches!(&result, Err(FabricError::ForeignState { .. })) {
+        return Err(FabricError::Invalid(format!(
+            "stale permanent unicast row must fail closed as foreign state, got {result:?}"
+        )));
+    }
+    if !retained {
+        return Err(FabricError::Invalid(
+            "the stale permanent unicast row must remain untouched".to_string(),
+        ));
+    }
+    if !fdb_deletes.is_empty() {
+        return Err(FabricError::Invalid(format!(
+            "the provider must fail before mutating FDB state, got deletes {fdb_deletes:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn provider_delete_calls(runner: &RecordingRunner, mac: &str) -> Vec<String> {
+    runner
+        .calls()
+        .iter()
+        .filter(|call| call.joined().contains("bridge fdb del") && call.joined().contains(mac))
+        .map(|call| call.joined())
+        .collect()
 }
 
 /// A foreign VXLAN whose VNI merely extends the plan's VNI as a string

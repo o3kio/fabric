@@ -5,7 +5,7 @@
 //! fake kernel plus a call journal used by the conformance suite to prove
 //! command sequences, idempotency, and key hygiene.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 use crate::error::FabricError;
@@ -205,6 +205,14 @@ pub struct RecordingRunner {
     /// appends are visible to tests. `del` removes exactly ONE instance
     /// per call (one RTM_DELNEIGH), like the real kernel.
     fdb: BTreeMap<(String, String, String), usize>,
+    /// Entries injected as kernel-learned cache, distinguished from explicit
+    /// `bridge fdb add/append` rows, which the fake reports as permanent.
+    learned_fdb: BTreeMap<(String, String, String), usize>,
+    /// Deterministic external-state transition used to prove that the
+    /// provider reclassifies learned rows immediately before withdrawing
+    /// them. Keyed by `(device, show ordinal, MAC, destination)`.
+    fdb_learned_to_permanent_on_show: BTreeSet<(String, usize, String, String)>,
+    fdb_show_count: BTreeMap<String, usize>,
     failures: Vec<String>,
     /// Failures matched against the FULL joined command line (equality,
     /// not substring). Needed where a target command line is a strict
@@ -227,6 +235,9 @@ impl RecordingRunner {
             routes: std::collections::BTreeSet::new(),
             iptables: BTreeMap::new(),
             fdb: BTreeMap::new(),
+            learned_fdb: BTreeMap::new(),
+            fdb_learned_to_permanent_on_show: BTreeSet::new(),
+            fdb_show_count: BTreeMap::new(),
             failures: Vec::new(),
             exact_failures: Vec::new(),
         }
@@ -363,6 +374,34 @@ impl RecordingRunner {
             .unwrap_or(0)
     }
 
+    /// Seed an FDB row as if the kernel learned this MAC-to-peer mapping
+    /// from tenant traffic. This is fake-kernel setup for tests; it does not
+    /// execute a bridge command or model an administrative static entry.
+    pub fn seed_learned_fdb_entry(&mut self, dev: &str, mac: &str, dst: &str) {
+        let key = (dev.to_string(), mac.to_string(), dst.to_string());
+        *self.fdb.entry(key.clone()).or_insert(0) += 1;
+        *self.learned_fdb.entry(key).or_insert(0) += 1;
+    }
+
+    /// Convert a seeded learned entry into an externally managed permanent
+    /// row immediately before the selected device-filtered FDB show. This
+    /// models another netlink writer changing the row between provider
+    /// observations; tests use it to verify fail-closed reclassification.
+    pub fn convert_learned_fdb_to_permanent_on_show(
+        &mut self,
+        dev: &str,
+        mac: &str,
+        dst: &str,
+        show_ordinal: usize,
+    ) {
+        self.fdb_learned_to_permanent_on_show.insert((
+            dev.to_string(),
+            show_ordinal,
+            mac.to_string(),
+            dst.to_string(),
+        ));
+    }
+
     /// Interpret `bridge` arguments starting at `rest` (after any
     /// `netns exec NS` prefix already stripped); `ns` is the namespace
     /// the command executes in, which decides which link table the
@@ -390,6 +429,27 @@ impl RecordingRunner {
             // entry; with one, only that device's entries (the real
             // command filters the same way).
             let dev_filter = arg_after(rest, "dev").map(str::to_string);
+            if let Some(dev) = dev_filter.as_deref() {
+                let show_ordinal = {
+                    let count = self.fdb_show_count.entry(dev.to_string()).or_default();
+                    *count += 1;
+                    *count
+                };
+                let mutation = self
+                    .fdb_learned_to_permanent_on_show
+                    .iter()
+                    .find(|(entry_dev, ordinal, _, _)| entry_dev == dev && *ordinal == show_ordinal)
+                    .cloned();
+                if let Some((entry_dev, ordinal, mac, dst)) = mutation {
+                    self.fdb_learned_to_permanent_on_show.remove(&(
+                        entry_dev.clone(),
+                        ordinal,
+                        mac.clone(),
+                        dst.clone(),
+                    ));
+                    self.learned_fdb.remove(&(entry_dev, mac, dst));
+                }
+            }
             let mut stdout = String::new();
             for ((dev, mac, dst), count) in &self.fdb {
                 if dev_filter
@@ -398,7 +458,22 @@ impl RecordingRunner {
                 {
                     continue;
                 }
-                for _ in 0..*count {
+                let learned_count = self
+                    .learned_fdb
+                    .get(&(dev.clone(), mac.clone(), dst.clone()))
+                    .copied()
+                    .unwrap_or(0)
+                    .min(*count);
+                for _ in 0..learned_count {
+                    // Dynamically learned VXLAN rows have no permanent
+                    // lifetime flag in bridge output.
+                    if dev_filter.is_some() {
+                        stdout.push_str(&format!("{mac} dst {dst} self\n"));
+                    } else {
+                        stdout.push_str(&format!("{mac} dev {dev} dst {dst} self\n"));
+                    }
+                }
+                for _ in learned_count..*count {
                     // `bridge fdb show dev <name>` scopes the result but
                     // iproute2 omits the device token from each filtered
                     // row. The unfiltered form includes it. Keep this fake
@@ -463,10 +538,12 @@ impl RecordingRunner {
                 match self.fdb.get_mut(&entry) {
                     Some(count) if *count > 1 => {
                         *count -= 1;
+                        decrement_instance(&mut self.learned_fdb, &entry);
                         CommandOutput::ok()
                     }
                     Some(_) => {
                         self.fdb.remove(&entry);
+                        self.learned_fdb.remove(&entry);
                         CommandOutput::ok()
                     }
                     None => command_error("RTNETLINK answers: No such file or directory"),
@@ -475,6 +552,8 @@ impl RecordingRunner {
             "replace" => {
                 let mac_owned = mac.to_string();
                 self.fdb
+                    .retain(|(d, m, _), _| !(d == dev && *m == mac_owned));
+                self.learned_fdb
                     .retain(|(d, m, _), _| !(d == dev && *m == mac_owned));
                 self.fdb.insert(entry, 1);
                 CommandOutput::ok()
@@ -761,6 +840,7 @@ impl RecordingRunner {
     /// Drop the forwarding-table entries of a deleted device.
     fn drop_link_state(&mut self, name: &str) {
         self.fdb.retain(|(dev, _, _), _| dev != name);
+        self.learned_fdb.retain(|(dev, _, _), _| dev != name);
     }
 
     /// Interpret `iptables` arguments: `[-t TABLE] OP CHAIN SPEC...`.
@@ -928,6 +1008,20 @@ fn arg_after<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
     args.iter()
         .position(|a| *a == flag)
         .and_then(|i| args.get(i + 1).copied())
+}
+
+fn decrement_instance<K: Ord>(entries: &mut BTreeMap<K, usize>, key: &K) {
+    let remove = match entries.get_mut(key) {
+        Some(count) if *count > 1 => {
+            *count -= 1;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if remove {
+        entries.remove(key);
+    }
 }
 
 /// True for a unicast MAC: not all-zeros, not broadcast, and without the

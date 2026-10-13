@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0] - 2026-10-13
+### Fixed
+- **Withdraw stale learned unicast FDB rows when a peer leaves a Realm.**
+  Each apply now removes exact unicast MAC/VXLAN/destination rows whose
+  transport destination is no longer in the validated plan's peer set,
+  then reads back the owned VXLAN to prove those rows are absent. Current
+  peer rows and other VXLAN devices are preserved. The new conformance case
+  covers peer-set shrink, duplicate stale rows, survivor preservation,
+  unrelated-network preservation, and idempotent replay.
+- Provider contract v2 records this peer-withdrawal behavior. Plan and
+  journal formats are unchanged; no persisted-state migration is required.
+
 ## [0.1.6] - 2026-10-12
 ### Fixed
 - **HER shrink reconciliation parses device-filtered FDB output.** `bridge

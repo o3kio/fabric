@@ -7,7 +7,7 @@
 //! VXLAN with head-end replication and kernel MAC learning (per-network
 //! stretched L2), network namespaces, and veth pairs.
 //!
-//! Design properties (normative: `contracts/fabric-provider-v1.md`):
+//! Design properties (normative: `contracts/fabric-provider-v2.md`):
 //!
 //! - **Journal before mutate**: the plan is persisted under the state root
 //!   before any kernel object is created.

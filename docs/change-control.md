@@ -33,7 +33,7 @@ one that owns it — and is referenced, never re-decided, above it.
 |---|---|---|---|
 | 1. Product decision | O3K ADR-0186, CHV ADR-021 | *Whether and why* a stretched-L2 fabric exists; product scope, trust model, phased rollout | product repos |
 | 2. Specification | O3K SPEC-0049 | The fabric's external behavior: topology, VXLAN/HER/WG model, key management, VNI allocation, evidence requirements | o3k repo (CHV ADR-021 records the aligned decision) |
-| 3. Provider contract | `contracts/fabric-provider-v1.md` | The provider's behavioral invariants: input rules, idempotency, fail-closed semantics, key hygiene, teardown, migration | **this repo** |
+| 3. Provider contract | `contracts/fabric-provider-v2.md` | The provider's behavioral invariants: input rules, idempotency, fail-closed semantics, key hygiene, teardown, migration | **this repo** |
 | 4. Executable contract | `crates/fabric-conformance` | The contract as a suite, run against the pinned provider tag | this repo |
 | 5. Reference implementation | `crates/fabric-linux` (+ `fabric-plan`) | How the invariants are realized on Linux; naming, journals, exact kernel commands | this repo |
 | 6. Consumers | `o3k-network`, `chv-nwd` | Plan compilation, lifecycle orchestration, their own host state | product repos |
@@ -150,7 +150,7 @@ the conformance suite in each product's CI.
   (`v0.1.3`, …) at merge commits on `main`; the tag's `Cargo.toml` version
   matches the tag, and the version bump + CHANGELOG entry land in the same
   PR as the change. Consumers pin exact tags, never branches.
-- **Contract version** (`fabric-provider-v1.md`): vN identifies the
+- **Contract version** (`fabric-provider-v2.md` is current; v1 is historical): vN identifies the
   invariant set. Incompatible invariant changes bump to vN+1 with a
   migration section; provably compatible amendments stay in-place with a
   CHANGELOG entry.
